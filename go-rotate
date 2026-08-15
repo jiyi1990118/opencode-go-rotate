@@ -84,7 +84,13 @@ def do_status(cfg):
     print("-" * 60)
     for k in cfg["keys"]:
         mark = " > " if k["name"] == cur else "   "
-        print(f"{mark}{k['name']:<12} {k['key'][:16]}...  {fmt_until(k.get('cooldown_until'))}")
+        st = k.get("last_status")
+        if st and st != "ok":
+            labels = {"invalid": "key 无效", "nobalance": "余额不足", "limited": "限流", "error": "异常"}
+            stshow = f"  [{labels.get(st, st)}]"
+        else:
+            stshow = ""
+        print(f"{mark}{k['name']:<12} {k['key'][:16]}...{stshow}  {fmt_until(k.get('cooldown_until'))}")
 
 
 def do_set(cfg, name):
@@ -265,9 +271,16 @@ def do_check(cfg, name=None):
     print(f"探测 {len(targets)} 个 key（每次消耗约 1 token）…")
     labels = {"ok": "✅ 可用", "invalid": "⚠️  key 无效", "nobalance": "⚠️  余额不足",
               "limited": "⚠️  限流", "error": "❌ 异常"}
+    changed = False
     for k in targets:
         status, detail = probe_key(k["key"])
         print(f"  {k['name']:<12} {labels.get(status, status)}: {detail}")
+        if k.get("last_status") != status:
+            k["last_status"] = status
+            changed = True
+    if changed:
+        save(cfg)
+        print("已更新各 key 状态。")
 
 
 def do_uninstall(force=False):
