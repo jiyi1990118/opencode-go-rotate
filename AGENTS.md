@@ -41,7 +41,7 @@ opencode 每次调用 LLM 前都会触发插件钩子，我们的方案绕开了
 | 路径 | 说明 |
 |---|---|
 | `~/.config/opencode/go-keys.json` | **唯一配置**（插件/CLI/Web 共用） |
-| `~/.local/share/opencode/auth.json` | opencode 凭据，`opencode-go.key` 被我们同步 |
+| `~/.local/share/opencode/auth.json` | opencode 凭据，`opencode-go.key` 被我们同步（**卸载时不动它**） |
 | `/tmp/opencode-go-rotate.log` | 运行日志 |
 | `go-keys.json.lock` | 跨进程写锁（`/tmp/...` 旁的锁文件） |
 
@@ -108,9 +108,10 @@ session.error 事件
 
 ## CLI 命令
 
-`status` / `list` / `init`(交互式) / `web`(独立启动 Web，无需 opencode) / `add <name> <key>` / `set <name>` / `next [min]` / `cooldown <name> [min]`
+`status` / `list` / `init`(交互式) / `web`(独立启动 Web，无需 opencode) / `add <name> <key>` / `set <name>` / `next [min]` / `cooldown <name> [min]` / `uninstall [-y]`
 
 > `go-rotate web` 通过 `bun -e` 加载插件模块并调用 `GoRotate()` 起 Web，复用插件同一套逻辑（不复制代码）。端口仍固定 8899，若已有 go-rotate web 在跑会自动跳过（只启一个）。
+> `uninstall` 删除插件、CLI 自身、`go-keys.json`；**不碰 auth.json**。install.sh 也支持 `bash install.sh uninstall [-y]`。
 
 ## 验证方法（重要：改完必测）
 

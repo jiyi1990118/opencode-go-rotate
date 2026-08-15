@@ -48,6 +48,37 @@ pick_bin_dir() {
 }
 BIN_DIR="$(pick_bin_dir)"
 
+# ================== 卸载模式 ==================
+# 用法: bash install.sh uninstall  或  bash install.sh -u
+if [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "-u" ]; then
+  echo ""
+  warn "正在卸载 go-rotate ..."
+  PLUGIN="$PLUGIN_DIR/go-rotate.ts"
+  CLI="$BIN_DIR/go-rotate"
+  CONFIG="$DATA_DIR/go-keys.json"
+  echo "  将删除:"
+  [ -f "$PLUGIN" ] && echo "    $PLUGIN"
+  [ -f "$CLI" ] && echo "    $CLI"
+  [ -f "$CONFIG" ] && echo "    $CONFIG"
+  ans=""
+  if [ "${2:-}" != "-y" ]; then
+    printf "确认卸载？删除配置会丢失 key 列表 [y/N]: "
+    read -r ans
+  else
+    ans="y"
+  fi
+  if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
+    [ -f "$PLUGIN" ] && rm -f "$PLUGIN" && ok "已删除插件 $PLUGIN"
+    [ -f "$CLI" ] && rm -f "$CLI" && ok "已删除 CLI $CLI"
+    [ -f "$CONFIG" ] && rm -f "$CONFIG" && ok "已删除配置 $CONFIG"
+    ok "卸载完成。auth.json 未改动（保留你的 opencode-go 凭据）。"
+  else
+    warn "已取消卸载。"
+  fi
+  exit 0
+fi
+# ==================================================
+
 # 判断是"本地运行"还是"curl|bash"
 THIS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 

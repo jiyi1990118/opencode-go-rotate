@@ -63,6 +63,7 @@ go-rotate status            # 查看状态
 | `go-rotate set <name>` | 启用指定 key |
 | `go-rotate next [分钟]` | 切到下一个可用 key |
 | `go-rotate cooldown <name> [分钟]` | 手动设置/清除冷却 |
+| `go-rotate uninstall [-y]` | 卸载（删插件、CLI、配置） |
 
 ## 文件
 
@@ -80,6 +81,17 @@ rm -f ~/.config/opencode/plugins/go-rotate.ts ~/.local/bin/go-rotate
 # 可选：删除配置
 rm -f ~/.config/opencode/go-keys.json
 ```
+
+## 卸载
+
+```bash
+go-rotate uninstall            # 交互确认
+go-rotate uninstall -y         # 跳过确认
+# 或
+bash install.sh uninstall      # 通过安装脚本卸载（-y 跳过确认）
+```
+
+会删除：插件、CLI、`go-keys.json` 配置。**不会**改动 `auth.json`（保留你的 opencode-go 凭据）。
 
 ## FAQ
 

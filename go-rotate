@@ -11,6 +11,7 @@ Usage:
   go-rotate next [minutes]   rotate to next available key (optional cooldown minutes)
   go-rotate add <name> <key> add a key
   go-rotate cooldown <name> [minutes]  manually put a key into cooldown
+  go-rotate uninstall [-y]   uninstall (remove plugin, CLI, config)
 
 Config:      ~/.config/opencode/go-keys.json
 Sync target: ~/.local/share/opencode/auth.json -> opencode-go.key
@@ -201,6 +202,58 @@ def do_web():
     os.execv(bun, [bun, "-e", code])
 
 
+def do_uninstall(force=False):
+    """卸载：删除插件、CLI 本身、配置（可选）"""
+    import shutil
+    plugin = os.path.join(os.path.expanduser("~"), ".config", "opencode", "plugins", "go-rotate.ts")
+
+    # 定位 CLI 自身真实路径
+    self_path = os.path.abspath(os.path.realpath(sys.argv[0]))
+    cli_path = self_path if os.path.exists(self_path) and os.path.basename(self_path) == "go-rotate" else None
+    if not cli_path:
+        w = shutil.which("go-rotate")
+        if w:
+            cli_path = os.path.realpath(w)
+
+    targets = []
+    if os.path.exists(plugin):
+        targets.append(("插件", plugin))
+    if cli_path and os.path.exists(cli_path):
+        targets.append(("CLI", cli_path))
+
+    if not targets:
+        print("未检测到 go-rotate 安装文件，无需卸载。")
+        return
+
+    print("将删除：")
+    for _, p in targets:
+        print(f"  - {p}")
+    if os.path.exists(CONFIG_FILE):
+        print(f"  - 配置 {CONFIG_FILE}")
+
+    if not force:
+        ans = input("确认卸载？删除配置会丢失 key 列表 [y/N]: ").strip().lower()
+        if ans not in ("y", "yes"):
+            print("已取消。")
+            return
+
+    for label, p in targets:
+        try:
+            os.remove(p)
+            print(f"  ✓ 已删除 {label}: {p}")
+        except Exception as e:
+            print(f"  ✗ 删除失败 {label} {p}: {e}")
+
+    if os.path.exists(CONFIG_FILE):
+        try:
+            os.remove(CONFIG_FILE)
+            print(f"  ✓ 已删除配置: {CONFIG_FILE}")
+        except Exception as e:
+            print(f"  ✗ 配置删除失败: {e}")
+
+    print("\n卸载完成。auth.json 未改动（保留你的 opencode-go 凭据）。")
+
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -212,6 +265,9 @@ def main():
         return
     if cmd == "web":
         do_web()
+        return
+    if cmd == "uninstall":
+        do_uninstall(force=("-y" in args or "--yes" in args))
         return
     cfg = load()
     if cmd in ("status", "list"):
