@@ -376,6 +376,21 @@ function logTail(n = 200): string {
   }
 }
 
+/** 清空当前日志并删除归档（web 手动清理用） */
+function clearLog() {
+  try {
+    if (existsSync(LOG_FILE)) writeFileSync(LOG_FILE, "")
+    for (let i = 1; i <= LOG_KEEP; i++) {
+      const f = `${LOG_FILE}.${i}`
+      if (existsSync(f)) unlinkSync(f)
+    }
+    log("🧹 日志已手动清空")
+    return true
+  } catch {
+    return false
+  }
+}
+
 /* ---------------- Web 管理界面 ---------------- */
 
 const json = (obj: any, status = 200) =>
@@ -397,7 +412,10 @@ async function handleWeb(req: any): Promise<Response> {
   }
   if (method === "POST") {
     try {
-      const body = await req.json()
+      let body: any = {}
+      try {
+        body = await req.json()
+      } catch {}
       const run = () => {
         if (route === "/api/keys/add") return addKey(String(body.name), String(body.key))
         if (route === "/api/keys/update") return updateKey(String(body.name), body.patch ?? {})
@@ -406,11 +424,12 @@ async function handleWeb(req: any): Promise<Response> {
         if (route === "/api/cooldown")
           return setCooldown(String(body.name), body.minutes === null ? null : Number(body.minutes))
         if (route === "/api/rotate") return manualRotate()
+        if (route === "/api/log/clear") return clearLog()
         return null
       }
       const res = run()
       if (res === null) return json({ error: "unknown route" }, 404)
-      return json({ ok: true, status: statusPayload() })
+      return json({ ok: res === true || !!res, status: statusPayload() })
     } catch (e: any) {
       return json({ error: e.message }, 400)
     }
@@ -556,7 +575,10 @@ const WEB_HTML = `<!doctype html>
   </div>
 
   <div class="card">
-    <div style="margin-bottom:8px"><b>运行日志</b></div>
+    <div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between">
+      <b>运行日志</b>
+      <button class="danger" id="clear-log-btn" onclick="clearLog()">清空日志</button>
+    </div>
     <pre id="logview"></pre>
   </div>
 </div>
@@ -613,6 +635,11 @@ function showErr(m) { const el = document.getElementById("msg"); el.textContent 
 function showMsg(m) { const el = document.getElementById("msg"); el.textContent = m; el.className = "msg" }
 async function refreshLog() {
   try { const r = await fetch("/api/log"); document.getElementById("logview").textContent = await r.text() } catch {}
+}
+async function clearLog() {
+  if (!confirm("确认清空日志？")) return
+  try { await api("/api/log/clear", {}); refreshLog(); showMsg("日志已清空") }
+  catch (e) { showErr(e.message) }
 }
 refresh(); refreshLog(); setInterval(refresh, 5000); setInterval(refreshLog, 8000);
 </script>
