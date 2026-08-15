@@ -146,8 +146,10 @@ session.error 事件
 ```bash
 cd /Users/jary/serverTools/go-rotate
 git add -A && git commit -m "..." && git push origin main
+git tag -a vX.Y.Z -m "go-rotate vX.Y.Z" && git push origin vX.Y.Z
+gh release create vX.Y.Z --title "go-rotate vX.Y.Z" --notes "..."
 ```
-推送后 `curl | bash` 一行安装立即用新版本。
+推送后 `curl | bash` 一行安装立即用新版本；发小版本可固定到某个 tag（如 `.../v1.0.0/install.sh`）。
 
 ## 待办 / 可扩展方向
 
