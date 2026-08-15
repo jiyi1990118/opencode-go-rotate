@@ -630,6 +630,7 @@ const WEB_HTML = `<!doctype html>
   .err { color: #f87171; }
   pre { background: #0c0e12; border: 1px solid #242a33; border-radius: 8px; padding: 12px; font-size: 12px; overflow: auto; max-height: 260px; color: #9ceba8; }
   .muted { color: #6b7280; font-size: 12px; }
+  .gr-tip { cursor: help; border-bottom: 1px dotted #7a8494; }
 </style>
 </head>
 <body>
@@ -685,10 +686,12 @@ async function refresh() {
     for (const k of st.keys) {
       const tr = document.createElement("tr")
       // 状态徽章：优先显示健康状态（余额不足/无效/限流），其次冷却/可用
-      const statusMap = { ok:'<span class="badge b-available">可用</span>', invalid:'<span class="badge b-cooling">key 无效</span>', nobalance:'<span class="badge b-cooling">余额不足</span>', limited:'<span class="badge b-cooling">限流</span>', error:'<span class="badge b-cooling">异常</span>' }
+      const statusLabel = { ok:'可用', invalid:'key 无效', nobalance:'余额不足', limited:'限流', error:'异常' }
+      const statusHint = { invalid:'该 key 无效', nobalance:'余额不足，需充值', limited:'请求被限流', error:'探测异常' }
+      const tip = (text, hint) => hint ? '<span class="badge b-cooling gr-tip" title="' + hint + '">' + text + '</span>' : '<span class="badge b-cooling">' + text + '</span>'
       let badge
       if (k.last_status && k.last_status !== "ok") {
-        badge = statusMap[k.last_status] || '<span class="badge b-cooling">'+k.last_status+'</span>'
+        badge = tip(statusLabel[k.last_status] || k.last_status, statusHint[k.last_status] || k.last_status)
         if (k.state === "cooling") badge += '<span class="badge b-cooling">冷却 ' + k.remainMin + 'min</span>'
       } else {
         badge = k.state === "cooling" ? '<span class="badge b-cooling">冷却 ' + k.remainMin + 'min</span>' : '<span class="badge b-available">可用</span>'
@@ -697,7 +700,8 @@ async function refresh() {
       const h = health[k.name]
       let hcell = '<span class="muted">-</span>'
       if (h) {
-        hcell = (statusMap[h.status] || '<span class="badge b-cooling">'+h.status+'</span>') + '<div class="muted" style="font-size:11px">' + h.detail + '</div>'
+        // 详情只作为 hover 浮窗展示，不直接内联
+        hcell = tip(statusLabel[h.status] || h.status, h.detail.replace(/"/g, "&quot;"))
       }
       tr.innerHTML =
         '<td>' + k.name + '</td>' +
@@ -730,7 +734,7 @@ async function addKey() {
     if (j.health) {
       const map = { ok:'可用', invalid:'key 无效', nobalance:'余额不足', limited:'限流', error:'异常' }
       const label = map[j.health.status] || j.health.status
-      showMsg('已添加 "' + name + '" → ' + label + (label==='可用' ? '' : '：' + j.health.detail))
+      showMsg('已添加 "' + name + '" → ' + label + (label==='可用' ? '' : '（详情 hover 查看）'))
     } else { showMsg('已添加 "' + name + '"') }
     refresh()
   } catch (e) { showErr(e.message) }
