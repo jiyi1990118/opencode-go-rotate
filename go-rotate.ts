@@ -47,7 +47,13 @@ const LOG_KEEP = 3
 const LOCK_TIMEOUT_MS = 5000
 const LOCK_STALE_MS = 15000
 
-type KeyEntry = { name: string; key: string; cooldown_until: string | null }
+type KeyEntry = {
+  name: string
+  key: string
+  cooldown_until: string | null
+  /** 最近一次探测/轮换得到的健康状态：ok | invalid | nobalance | limited | error | null */
+  last_status?: string | null
+}
 type Config = {
   provider_id: string
   cooldown_minutes: number
@@ -210,6 +216,15 @@ function isQuotaError(err: any): boolean {
   return quotaStatus || quotaWords.test(msg)
 }
 
+/** 把 opencode-go 错误分类为健康状态：ok | invalid | nobalance | limited | error */
+function classifyGoError(msg: string, statusCode?: number): string {
+  const s = String(msg).toLowerCase()
+  if (statusCode === 401 && /invalid api key/i.test(s)) return "invalid"
+  if (statusCode === 401 || statusCode === 402 || /insufficient|balance/i.test(s)) return "nobalance"
+  if (statusCode === 429 || /quota|rate|limit|exceeded/i.test(s)) return "limited"
+  return "error"
+}
+
 /** 判断错误是否来自 opencode-go 端点（避免误伤其它 provider） */
 function isGoError(err: any): boolean {
   if (!err) return false
@@ -235,12 +250,13 @@ function pickNext(cfg: Config): KeyEntry | undefined {
 }
 
 /** 轮换（锁内执行）：当前 key 进冷却，切换到下一个可用 key */
-function rotate(errMsg: string): Config {
+function rotate(errMsg: string, err?: any): Config {
   return mutateConfig((cfg) => {
     const cur = currentKey(cfg)
     if (cur) {
       cur.cooldown_until = parseResetTime(errMsg) ?? cooldownUntilDefault(cfg)
-      log(`⚠️  key "${cur.name}" 配额耗尽，进入冷却 until=${cur.cooldown_until}`)
+      cur.last_status = classifyGoError(errMsg, err?.data?.statusCode)
+      log(`⚠️  key "${cur.name}" 配额耗尽（${cur.last_status}），进入冷却 until=${cur.cooldown_until}`)
     }
     const next = pickNext(cfg)
     if (!next) {
@@ -248,6 +264,8 @@ function rotate(errMsg: string): Config {
       return
     }
     cfg.current = next.name
+    const nk = currentKey(cfg)
+    if (nk) nk.last_status = null
     syncAuth(next.key)
     log(`✅  轮换到 key "${next.name}"，已同步 auth.json`)
   })
@@ -354,6 +372,7 @@ function statusPayload() {
       state,
       remainMin,
       cooldown_until: k.cooldown_until,
+      last_status: k.last_status ?? null,
       isCurrent: k.name === cfg.current,
     }
   })
@@ -435,6 +454,13 @@ async function checkAllKeys() {
   for (const k of cfg.keys) {
     results[k.name] = await probeKey(k.key)
   }
+  // 持久化探测结果到 last_status，便于状态列展示
+  mutateConfig((c) => {
+    for (const k of c.keys) {
+      const r = results[k.name]
+      if (r) k.last_status = r.status
+    }
+  })
   return results
 }
 
@@ -560,7 +586,7 @@ export const GoRotate = async (ctx: any) => {
       const msg = err.data?.message ?? err.message ?? ""
       log(`🔁  检测到配额/鉴权错误: ${String(msg).slice(0, 200)}`)
       log(`    sessionID=${sid ?? "?"} statusCode=${err.data?.statusCode ?? "?"}`)
-      const cfg = rotate(String(msg))
+      const cfg = rotate(String(msg), err)
       log(`    now current=${cfg.current}`)
     },
   }
@@ -658,13 +684,20 @@ async function refresh() {
     tb.innerHTML = ""
     for (const k of st.keys) {
       const tr = document.createElement("tr")
-      let badge = k.state === "cooling" ? '<span class="badge b-cooling">冷却 ' + k.remainMin + 'min</span>' : '<span class="badge b-available">可用</span>'
+      // 状态徽章：优先显示健康状态（余额不足/无效/限流），其次冷却/可用
+      const statusMap = { ok:'<span class="badge b-available">可用</span>', invalid:'<span class="badge b-cooling">key 无效</span>', nobalance:'<span class="badge b-cooling">余额不足</span>', limited:'<span class="badge b-cooling">限流</span>', error:'<span class="badge b-cooling">异常</span>' }
+      let badge
+      if (k.last_status && k.last_status !== "ok") {
+        badge = statusMap[k.last_status] || '<span class="badge b-cooling">'+k.last_status+'</span>'
+        if (k.state === "cooling") badge += '<span class="badge b-cooling">冷却 ' + k.remainMin + 'min</span>'
+      } else {
+        badge = k.state === "cooling" ? '<span class="badge b-cooling">冷却 ' + k.remainMin + 'min</span>' : '<span class="badge b-available">可用</span>'
+      }
       if (k.isCurrent) badge += '<span class="badge b-current">当前</span>'
       const h = health[k.name]
       let hcell = '<span class="muted">-</span>'
       if (h) {
-        const map = { ok:'<span class="badge b-available">可用</span>', invalid:'<span class="badge b-cooling">key 无效</span>', nobalance:'<span class="badge b-cooling">余额不足</span>', limited:'<span class="badge b-cooling">限流</span>', error:'<span class="badge b-cooling">异常</span>' }
-        hcell = (map[h.status] || '<span class="badge b-cooling">'+h.status+'</span>') + '<div class="muted" style="font-size:11px">' + h.detail + '</div>'
+        hcell = (statusMap[h.status] || '<span class="badge b-cooling">'+h.status+'</span>') + '<div class="muted" style="font-size:11px">' + h.detail + '</div>'
       }
       tr.innerHTML =
         '<td>' + k.name + '</td>' +
