@@ -41,6 +41,9 @@ const LOCK_FILE = CONFIG_FILE + ".lock"
 const WEB_PORT = 8899
 const WEB_BASE = `http://127.0.0.1:${WEB_PORT}`
 const DEFAULT_COOLDOWN_MIN = 300
+// 日志轮转：超过该大小即归档，最多保留 RETENTION 份，旧档删除（防止 /tmp 无限增长）
+const LOG_MAX_BYTES = 1024 * 1024 // 1MB
+const LOG_KEEP = 3
 const LOCK_TIMEOUT_MS = 5000
 const LOCK_STALE_MS = 15000
 
@@ -54,8 +57,27 @@ type Config = {
 
 /* ---------------- 日志 ---------------- */
 
+/** 超大小则轮转归档，保留最近 LOG_KEEP 份，删除最旧的 */
+function rotateLogIfNeeded() {
+  try {
+    if (!existsSync(LOG_FILE)) return
+    if (statSync(LOG_FILE).size < LOG_MAX_BYTES) return
+    // 移位归档：.log.2 -> .log.3 ... 删除超出保留份数的
+    for (let i = LOG_KEEP; i >= 1; i--) {
+      const from = i === 1 ? LOG_FILE : `${LOG_FILE}.${i - 1}`
+      const to = `${LOG_FILE}.${i}`
+      if (i === LOG_KEEP) {
+        if (existsSync(to)) unlinkSync(to)
+      } else if (existsSync(from)) {
+        renameSync(from, to)
+      }
+    }
+  } catch {}
+}
+
 const log = (m: string) => {
   try {
+    rotateLogIfNeeded()
     appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${m}\n`)
   } catch {}
 }
