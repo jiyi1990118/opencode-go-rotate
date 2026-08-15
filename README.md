@@ -63,6 +63,7 @@ go-rotate status            # 查看状态
 | `go-rotate set <name>` | 启用指定 key |
 | `go-rotate next [分钟]` | 切到下一个可用 key |
 | `go-rotate cooldown <name> [分钟]` | 手动设置/清除冷却 |
+| `go-rotate check [name]` | 探测 key 健康（可用/无效/余额不足/限流） |
 | `go-rotate uninstall [-y]` | 卸载（删插件、CLI、配置） |
 
 ## 文件
@@ -100,6 +101,9 @@ bash install.sh uninstall      # 通过安装脚本卸载（-y 跳过确认）
 
 **为什么要有多个 key？**
 opencode-go 是订阅套餐，配额按时间窗口重置。多账号轮换可提升可用时长。
+
+**能查每个 key 的额度吗？**
+opencode-go 没有公开的额度/余额查询 API，**无法主动查额度**。但可以用 `go-rotate check`（或 Web 里的"检测所有 key"）发一个最小请求探测每个 key 当前是否可用——能区分「可用 / key 无效 / 余额不足 / 限流」。注意每次探测消耗约 1 token。
 
 **对我的其它 provider（codeplan/fox-aws 等）有影响吗？**
 没有。插件只在 `providerID` 命中的 opencode-go 请求上注入 key，只处理 opencode-go 的配额错误。

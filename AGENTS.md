@@ -108,7 +108,7 @@ session.error 事件
 
 ## CLI 命令
 
-`status` / `list` / `init`(交互式) / `web`(独立启动 Web，无需 opencode) / `add <name> <key>` / `set <name>` / `next [min]` / `cooldown <name> [min]` / `uninstall [-y]`
+`status` / `list` / `init`(交互式) / `web`(独立启动 Web，无需 opencode) / `add <name> <key>` / `set <name>` / `next [min]` / `cooldown <name> [min]` / `check [name]` / `uninstall [-y]`
 
 > `go-rotate web` 通过 `bun -e` 加载插件模块并调用 `GoRotate()` 起 Web，复用插件同一套逻辑（不复制代码）。端口仍固定 8899，若已有 go-rotate web 在跑会自动跳过（只启一个）。
 > `uninstall` 删除插件、CLI 自身、`go-keys.json`；**不碰 auth.json**。install.sh 也支持 `bash install.sh uninstall [-y]`。
@@ -152,7 +152,10 @@ git add -A && git commit -m "..." && git push origin main
 ## 待办 / 可扩展方向
 
 - [ ] 通知机制（切换后通过系统通知 / 日志高亮提示用户）
-- [ ] 配额主动探测（目前是反应式，等报错才切；opencode-go 无公开配额 API）
+- [ ] 配额**主动**探测（opencode-go 无公开配额 API；目前已有 `check` 手动探测，无自动轮询）
 - [ ] CLI 增加文件锁（当前 CLI 写入未加跨进程锁，与插件并发时理论上有竞态）
 - [ ] 冷却 window 每 key 独立（当前是全局 `cooldown_minutes`）
 - [ ] 使用量统计 / 每个 key 的切换次数趋势
+
+> 健康探测注意：`probeKey`/CLI `check` 用模型 `hy3` + `max_tokens:1` 发最小请求判断 key 状态。
+> 关键坑：**CLI 用 urllib 必须伪装浏览器 UA**（opencode.ai 会 403 拦截 `Python-urllib`）；插件用 bun `fetch` 无此问题。
