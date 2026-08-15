@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""
+go-rotate: opencode-go multi-key manager CLI (shares go-keys.json with go-rotate.ts plugin)
+
+Usage:
+  go-rotate status           show current key and cooldown status
+  go-rotate list             alias of status
+  go-rotate set <name>       switch to a named key (and sync auth.json)
+  go-rotate next [minutes]   rotate to next available key (optional cooldown minutes)
+  go-rotate add <name> <key> add a key
+  go-rotate cooldown <name> [minutes]  manually put a key into cooldown
+
+Config:      ~/.config/opencode/go-keys.json
+Sync target: ~/.local/share/opencode/auth.json -> opencode-go.key
+"""
+import json
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+
+DATA_DIR = os.path.join(os.path.expanduser("~"), ".config", "opencode")
+CONFIG_FILE = os.path.join(DATA_DIR, "go-keys.json")
+AUTH_FILE = os.path.join(os.path.expanduser("~"), ".local", "share", "opencode", "auth.json")
+DEFAULT_COOLDOWN_MIN = 300
+
+
+def load() -> dict:
+    if not os.path.exists(CONFIG_FILE):
+        sys.exit(f"config not found: {CONFIG_FILE}")
+    with open(CONFIG_FILE) as f:
+        cfg = json.load(f)
+    cfg.setdefault("provider_id", "opencode-go")
+    cfg.setdefault("cooldown_minutes", DEFAULT_COOLDOWN_MIN)
+    cfg.setdefault("current", "")
+    cfg.setdefault("keys", [])
+    return cfg
+
+
+def save(cfg: dict):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def sync_auth(key: str):
+    os.makedirs(os.path.dirname(AUTH_FILE), exist_ok=True)
+    data = {}
+    if os.path.exists(AUTH_FILE):
+        with open(AUTH_FILE) as f:
+            data = json.load(f)
+    auth = data.get("opencode-go")
+    if isinstance(auth, dict):
+        auth["key"] = key
+    else:
+        data["opencode-go"] = {"type": "api", "key": key}
+    with open(AUTH_FILE, "w") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.chmod(AUTH_FILE, 0o600)
+
+
+def fmt_until(iso: str) -> str:
+    if not iso:
+        return "available"
+    try:
+        t = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        remain = t - datetime.now(timezone.utc)
+        if remain.total_seconds() <= 0:
+            return "available (expired)"
+        mins = int(remain.total_seconds() // 60)
+        return f"cooling, ~{mins}min left"
+    except Exception:
+        return f"cooling until={iso}"
+
+
+def do_status(cfg):
+    cur = cfg["current"]
+    print(f"provider_id: {cfg.get('provider_id')}")
+    print(f"current key: {cur or '(not set)'}")
+    print(f"cooldown:    {cfg.get('cooldown_minutes')} min")
+    print("-" * 60)
+    for k in cfg["keys"]:
+        mark = " > " if k["name"] == cur else "   "
+        print(f"{mark}{k['name']:<12} {k['key'][:16]}...  {fmt_until(k.get('cooldown_until'))}")
+
+
+def do_set(cfg, name):
+    for k in cfg["keys"]:
+        if k["name"] == name:
+            cfg["current"] = name
+            save(cfg)
+            sync_auth(k["key"])
+            print(f'switched to key "{name}" and synced auth.json')
+            return
+    sys.exit(f'key "{name}" not found')
+
+
+def do_next(cfg, minutes):
+    now = datetime.now(timezone.utc).timestamp()
+    dst_min = minutes if minutes else cfg.get("cooldown_minutes", DEFAULT_COOLDOWN_MIN)
+    ordered = cfg["keys"]
+    start = next((i for i, k in enumerate(ordered) if k["name"] == cfg["current"]), -1)
+    for i in range(1, len(ordered) + 1):
+        k = ordered[(start + i) % len(ordered)]
+        cu = k.get("cooldown_until")
+        if not cu or datetime.fromisoformat(cu.replace("Z", "+00:00")).timestamp() <= now:
+            cfg["current"] = k["name"]
+            save(cfg)
+            sync_auth(k["key"])
+            print(f'rotated to key "{k["name"]}" and synced auth.json')
+            return
+    print("no available key (all cooling), keeping current")
+
+
+def do_add(cfg, name, key):
+    if any(k["name"] == name for k in cfg["keys"]):
+        sys.exit(f'key "{name}" already exists')
+    cfg["keys"].append({"name": name, "key": key, "cooldown_until": None})
+    if not cfg["current"]:
+        cfg["current"] = name
+    save(cfg)
+    print(f'added key "{name}"')
+
+
+def do_cooldown(cfg, name, minutes):
+    for k in cfg["keys"]:
+        if k["name"] == name:
+            mins = minutes if minutes else cfg.get("cooldown_minutes", DEFAULT_COOLDOWN_MIN)
+            k["cooldown_until"] = (datetime.now(timezone.utc) + timedelta(minutes=mins)).isoformat()
+            save(cfg)
+            print(f'key "{name}" cooling for {mins} min')
+            return
+    sys.exit(f'key "{name}" not found')
+
+
+def do_init():
+    """傻瓜式首次配置：交互式引导添加 key"""
+    if not os.path.exists(CONFIG_FILE):
+        cfg = {"provider_id": "opencode-go", "cooldown_minutes": DEFAULT_COOLDOWN_MIN, "current": "", "keys": []}
+    else:
+        cfg = load()
+    print("=" * 60)
+    print(" go-rotate 首次配置")
+    print("=" * 60)
+    print("粘贴你的 opencode-go API key（sk- 开头）。")
+    print("可以添加多个 key，配额用尽会自动轮换。")
+    print("输入空名称结束。\n")
+    while True:
+        name = input("名称 (如 act1) [回车结束]: ").strip()
+        if not name:
+            break
+        if any(k["name"] == name for k in cfg["keys"]):
+            print(f'  ⚠️  "{name}" 已存在，跳过')
+            continue
+        key = input("API key (sk-...): ").strip()
+        if not key:
+            print("  ⚠️  未输入 key，跳过")
+            continue
+        cfg["keys"].append({"name": name, "key": key, "cooldown_until": None})
+        if not cfg["current"]:
+            cfg["current"] = name
+        print(f"  ✅ 已添加 \"{name}\"")
+    if not cfg["keys"]:
+        print("\n未添加任何 key。可稍后用 `go-rotate add <name> <key>` 添加。")
+    else:
+        reconcile(cfg)
+        save(cfg)
+        cur = next((k for k in cfg["keys"] if k["name"] == cfg["current"]), cfg["keys"][0])
+        sync_auth(cur["key"])
+        print(f"\n✅ 配置完成！当前 key: \"{cur['name']}\"")
+        print("   已同步到 auth.json。启动 opencode 即可生效。")
+        print(f"   Web 管理界面: http://localhost:8899 (启动 opencode 后访问)")
+
+
+def reconcile(cfg):
+    if not cfg.get("keys"):
+        cfg["current"] = ""
+        return
+    if not any(k["name"] == cfg.get("current") for k in cfg["keys"]):
+        cfg["current"] = cfg["keys"][0]["name"]
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        print(__doc__)
+        return
+    cmd = args[0]
+    if cmd == "init":
+        do_init()
+        return
+    cfg = load()
+    if cmd in ("status", "list"):
+        do_status(cfg)
+    elif cmd == "set" and len(args) >= 2:
+        do_set(cfg, args[1])
+    elif cmd == "next":
+        do_next(cfg, int(args[1]) if len(args) > 1 else None)
+    elif cmd == "add" and len(args) >= 3:
+        do_add(cfg, args[1], args[2])
+    elif cmd == "cooldown" and len(args) >= 2:
+        do_cooldown(cfg, args[1], int(args[2]) if len(args) > 2 else None)
+    else:
+        print(__doc__)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
