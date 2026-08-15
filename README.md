@@ -51,6 +51,10 @@ go-rotate status            # 查看状态
 > **不想开 opencode 也能用 Web 界面**：直接运行 `go-rotate web` 即可独立启动
 > Web 管理界面（http://localhost:8899），Ctrl+C 停止。
 > 若已有 go-rotate web 在运行（如 opencode 已开着），会自动复用，不会重复启动。
+>
+> **不想让 opencode 自动占用 8899 端口**：`go-rotate web off`。之后 opencode 启动时
+> 不再自动起 Web，但**自动轮换功能不受影响**；需要 Web 时再 `go-rotate web` 手动起，
+> 或 `go-rotate web on` 恢复自动启动。
 
 ## CLI 命令
 
@@ -58,6 +62,7 @@ go-rotate status            # 查看状态
 |---|---|
 | `go-rotate init` | 交互式首次配置 |
 | `go-rotate web` | 独立启动 Web 界面（无需 opencode 运行） |
+| `go-rotate web on\|off\|status` | 控制 opencode 启动时是否自动起 Web（off = 不占用端口，轮换仍可用） |
 | `go-rotate status` / `list` | 查看当前 key 与冷却状态 |
 | `go-rotate add <name> <key>` | 新增 key |
 | `go-rotate set <name>` | 启用指定 key |

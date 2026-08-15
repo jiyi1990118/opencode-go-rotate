@@ -111,6 +111,8 @@ session.error 事件
 `status` / `list` / `init`(交互式) / `web`(独立启动 Web，无需 opencode) / `add <name> <key>` / `set <name>` / `next [min]` / `cooldown <name> [min]` / `check [name]` / `uninstall [-y]`
 
 > `go-rotate web` 通过 `bun -e` 加载插件模块并调用 `GoRotate()` 起 Web，复用插件同一套逻辑（不复制代码）。端口仍固定 8899，若已有 go-rotate web 在跑会自动跳过（只启一个）。
+> Web 自动启动由配置 `auto_web`（默认 true）控制：`go-rotate web off` 关闭、`on` 开启、`status` 查看。
+> 关闭后 opencode 启动不占 8899 端口，轮换功能不受影响；`go-rotate web` 独立启动会通过 `GOROTATE_FORCE_WEB=1` 强制起 Web。
 > `uninstall` 删除插件、CLI 自身、`go-keys.json`；**不碰 auth.json**。install.sh 也支持 `bash install.sh uninstall [-y]`。
 
 ## 验证方法（重要：改完必测）
