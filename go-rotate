@@ -11,6 +11,7 @@ Usage:
   go-rotate next [minutes]   rotate to next available key (optional cooldown minutes)
   go-rotate add <name> <key> add a key
   go-rotate cooldown <name> [minutes]  manually put a key into cooldown
+  go-rotate check [name]     probe key health (valid/balance/limited)
   go-rotate uninstall [-y]   uninstall (remove plugin, CLI, config)
 
 Config:      ~/.config/opencode/go-keys.json
@@ -202,6 +203,50 @@ def do_web():
     os.execv(bun, [bun, "-e", code])
 
 
+def do_check(cfg, name=None):
+    """探测指定 key（或全部）健康状态：发 1-token 请求判断是否可用"""
+    import urllib.request
+    targets = [k for k in cfg["keys"] if name is None or k["name"] == name]
+    if not targets:
+        sys.exit("没有可检测的 key")
+    print(f"探测 {len(targets)} 个 key（每次消耗约 1 token）…")
+    for k in targets:
+        req = urllib.request.Request(
+            "https://opencode.ai/zen/go/v1/chat/completions",
+            data=json.dumps({
+                "model": "hy3",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 1,
+                "stream": False,
+            }).encode(),
+            headers={
+                "content-type": "application/json",
+                "authorization": f"Bearer {k['key']}",
+                # opencode.ai 会拦截 Python-urllib 默认 UA，需伪装成浏览器
+                "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                print(f"  {k['name']:<12} ✅ 可用")
+        except urllib.error.HTTPError as e:
+            try:
+                msg = json.loads(e.read())["error"]["message"]
+            except Exception:
+                msg = f"HTTP {e.code}"
+            s = msg.lower()
+            if "invalid api key" in s:
+                print(f"  {k['name']:<12} ⚠️  key 无效: {msg}")
+            elif "insufficient" in s or "balance" in s:
+                print(f"  {k['name']:<12} ⚠️  余额不足: {msg}")
+            elif "quota" in s or "rate" in s or "limit" in s:
+                print(f"  {k['name']:<12} ⚠️  限流: {msg}")
+            else:
+                print(f"  {k['name']:<12} ⚠️  HTTP {e.code}: {msg}")
+        except Exception as e:
+            print(f"  {k['name']:<12} ❌ 网络错误: {e}")
+
+
 def do_uninstall(force=False):
     """卸载：删除插件、CLI 本身、配置（可选）"""
     import shutil
@@ -270,6 +315,9 @@ def main():
         do_uninstall(force=("-y" in args or "--yes" in args))
         return
     cfg = load()
+    if cmd == "check":
+        do_check(cfg, args[1] if len(args) > 1 else None)
+        return
     if cmd in ("status", "list"):
         do_status(cfg)
     elif cmd == "set" and len(args) >= 2:

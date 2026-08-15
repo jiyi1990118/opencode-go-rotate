@@ -391,6 +391,53 @@ function clearLog() {
   }
 }
 
+/* ---------------- 每 key 健康探测 ----------------
+ * opencode-go 无公开额度查询 API，只能通过发一个最小请求判断 key 是否可用。
+ * 注意：每次探测会消耗极少量额度（1 token）。
+ */
+
+const GO_API = "https://opencode.ai/zen/go/v1/chat/completions"
+
+async function probeKey(key: string): Promise<{ status: string; detail: string }> {
+  try {
+    const res = await fetch(GO_API, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+      body: JSON.stringify({
+        model: "hy3",
+        messages: [{ role: "user", content: "hi" }],
+        max_tokens: 1,
+        stream: false,
+      }),
+      signal: AbortSignal.timeout(15000),
+    })
+    const text = await res.text()
+    if (res.ok) return { status: "ok", detail: "可用" }
+    let msg = text
+    try {
+      msg = JSON.parse(text)?.error?.message ?? text
+    } catch {}
+    const s = String(msg).toLowerCase()
+    if (res.status === 401 && /invalid api key/i.test(s)) return { status: "invalid", detail: msg }
+    if (res.status === 401 || res.status === 402 || /insufficient|balance/i.test(s))
+      return { status: "nobalance", detail: msg }
+    if (res.status === 429 || /quota|rate|limit|exceeded/i.test(s)) return { status: "limited", detail: msg }
+    return { status: "error", detail: `${res.status}: ${msg}` }
+  } catch (e: any) {
+    return { status: "error", detail: `网络错误: ${e.message}` }
+  }
+}
+
+/** 探测所有 key 的健康状态（只读，不写配置） */
+async function checkAllKeys() {
+  const cfg = loadConfig()
+  const results: Record<string, { status: string; detail: string }> = {}
+  for (const k of cfg.keys) {
+    results[k.name] = await probeKey(k.key)
+  }
+  return results
+}
+
 /* ---------------- Web 管理界面 ---------------- */
 
 const json = (obj: any, status = 200) =>
@@ -409,6 +456,9 @@ async function handleWeb(req: any): Promise<Response> {
   if (method === "GET" && route === "/api/status") return json(statusPayload())
   if (method === "GET" && route === "/api/log") {
     return new Response(logTail(300), { headers: { "content-type": "text/plain; charset=utf-8" } })
+  }
+  if (route === "/api/keys/check") {
+    return json({ results: await checkAllKeys() })
   }
   if (method === "POST") {
     try {
@@ -566,9 +616,9 @@ const WEB_HTML = `<!doctype html>
 
   <div class="card">
     <div class="row" style="margin-bottom:10px"><input id="new-name" placeholder="名称，如 act2">&nbsp;<input id="new-key" placeholder="sk-xxxx 完整的 API key"><button class="primary" onclick="addKey()">新增 key</button></div>
-    <div class="row" style="margin-bottom:10px"><span class="muted">手动轮换到下一个可用 key：</span><button onclick="rotate()">轮换</button></div>
+    <div class="row" style="margin-bottom:10px"><span class="muted">手动操作：</span><button onclick="rotate()">轮换</button><button onclick="checkKeys()">检测所有 key</button><span class="muted" id="check-hint"></span></div>
     <table>
-      <thead><tr><th>名称</th><th>Key</th><th>状态</th><th>操作</th></tr></thead>
+      <thead><tr><th>名称</th><th>Key</th><th>状态</th><th>健康</th><th>操作</th></tr></thead>
       <tbody id="tbody"></tbody>
     </table>
     <div class="msg" id="msg"></div>
@@ -591,6 +641,7 @@ async function api(path, body) {
   if (!r.ok) throw new Error(j.error || r.statusText)
   return j
 }
+var health = {}
 async function refresh() {
   try {
     const st = await api("/api/status")
@@ -604,10 +655,17 @@ async function refresh() {
       const tr = document.createElement("tr")
       let badge = k.state === "cooling" ? '<span class="badge b-cooling">冷却 ' + k.remainMin + 'min</span>' : '<span class="badge b-available">可用</span>'
       if (k.isCurrent) badge += '<span class="badge b-current">当前</span>'
+      const h = health[k.name]
+      let hcell = '<span class="muted">-</span>'
+      if (h) {
+        const map = { ok:'<span class="badge b-available">可用</span>', invalid:'<span class="badge b-cooling">key 无效</span>', nobalance:'<span class="badge b-cooling">余额不足</span>', limited:'<span class="badge b-cooling">限流</span>', error:'<span class="badge b-cooling">异常</span>' }
+        hcell = (map[h.status] || '<span class="badge b-cooling">'+h.status+'</span>') + '<div class="muted" style="font-size:11px">' + h.detail + '</div>'
+      }
       tr.innerHTML =
         '<td>' + k.name + '</td>' +
         '<td class="muted" title="' + k.key + '">' + k.masked + '</td>' +
         '<td>' + badge + '</td>' +
+        '<td>' + hcell + '</td>' +
         '<td><div class="actions">' +
           (k.isCurrent ? '' : '<button data-set="' + k.name + '">启用</button>') +
           (k.state === "cooling"
@@ -630,6 +688,17 @@ async function addKey() {
   catch (e) { showErr(e.message) }
 }
 async function rotate() { try { await api("/api/rotate", {}); refresh() } catch (e) { showErr(e.message) } }
+async function checkKeys() {
+  const hint = document.getElementById("check-hint")
+  hint.textContent = "检测中…"
+  try {
+    const r = await fetch("/api/keys/check")
+    const j = await r.json()
+    health = j.results || {}
+    hint.textContent = "检测完成（每次消耗约 1 token）"
+    refresh()
+  } catch (e) { hint.textContent = ""; showErr(e.message) }
+}
 async function doOp(p) { try { await p(); refresh() } catch (e) { showErr(e.message) } }
 function showErr(m) { const el = document.getElementById("msg"); el.textContent = m; el.className = "msg err"; setTimeout(() => showMsg(""), 3000) }
 function showMsg(m) { const el = document.getElementById("msg"); el.textContent = m; el.className = "msg" }
