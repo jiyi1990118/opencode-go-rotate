@@ -72,6 +72,60 @@ data_source = 'opencode_session'
 | `proxy_request_logs` 中 opencode 行 | 65253 行，全部 `data_source='opencode_session'`、`provider_id='_opencode_session'` |
 | `usage_daily_rollups` 中 opencode 汇总 | 63 条日汇总，合计约 2.3 亿 tokens |
 
+## Claude Code 的读取机制（已本机验证）
+
+Claude Code 走**会话日志导入**（与 opencode 同思路，文件格式不同），本机叠加代理路径。
+
+### 两条路径（本机 `proxy_request_logs` 实测）
+- `data_source='proxy'`（114 行）—— 走了本地代理拦截
+- `data_source='session_log'`（11 行）—— 会话日志导入
+
+### 会话日志
+- 路径：`~/.claude/projects/<项目路径转义>/<session-id>.jsonl`
+- 每个 assistant message 行自带 `usage` 字段：
+  ```json
+  "usage": {
+    "input_tokens": 32255,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "output_tokens": 73,
+    "server_tool_use": { ... }
+  },
+  "model": "deepseek-v4-pro"
+  ```
+- 模型名取自每行 `model` 字段（三方供应商如 deepseek-v4-pro 也能读到）。
+- 增量同步：`session_log_sync` 记录文件 + `last_line_offset`（行偏移），只追新增行。
+
+### 本机验证证据
+| 检查项 | 结果 |
+| --- | --- |
+| 磁盘 Claude 会话文件 | ✅ `~/.claude/projects/` 21 项目、20 个 jsonl，usage/model 字段真实存在 |
+| `session_log_sync` 记录 `.claude/projects/*.jsonl` | ✅ 681 条，含真实行偏移（17/29/16/967/259） |
+| `proxy_request_logs` 有 `claude + session_log` | ✅ request_id=`session:msg_xxx`，provider_id=`_session` |
+| 模型名对得上 | ✅ DB 里 `deepseek-v4-pro` 与磁盘 jsonl 的 `model` 一致 |
+| 用量对得上 | ✅ DB 里 input/output 与磁盘 jsonl 的 `usage` 值一致（32255/73） |
+
+## Codex 的读取机制（已调查）
+
+- 路径：`~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<时间戳>-<uuid>.jsonl`
+- 读 `type:"message"`、`role:"assistant"`（agent_message 事件）的 `info.total_token_usage`：
+  ```json
+  "info": {
+    "total_token_usage": {
+      "input_tokens": 10650,
+      "cached_input_tokens": 9856,       // 缓存读
+      "cache_write_input_tokens": 0,     // 缓存写
+      "output_tokens": 75,
+      "reasoning_output_tokens": 0,
+      "total_tokens": 10725
+    },
+    "last_token_usage": { ... }
+  }
+  ```
+- 模型名从 `session_meta` / `model` 字段取。
+- 本机 `session_log_sync` 有 `.codex/sessions/**/rollout-*.jsonl`（19 条）；`proxy_request_logs` 有 `codex + proxy`（62 行，因 proxy_config 里 codex 接管开启）。
+- 新版本还兼容从 `updates.jsonl` 的 `turn_completed` 事件导入。
+
 ## 与 go-rotate 的启示
 
 - opencode 的 Node 插件 hook（`chat.params.tokens` / `event.message.part.usage`）能拿到**更实时、同一份**的 token 数据，无需读库。
