@@ -479,6 +479,11 @@ async function handleWeb(req: any): Promise<Response> {
       }
       const res = run()
       if (res === null) return json({ error: "unknown route" }, 404)
+      // 添加 key 后立即探测其状态，返回给前端
+      if (route === "/api/keys/add") {
+        const health = await probeKey(String(body.key))
+        return json({ ok: true, health, status: statusPayload() })
+      }
       return json({ ok: res === true || !!res, status: statusPayload() })
     } catch (e: any) {
       return json({ error: e.message }, 400)
@@ -684,8 +689,18 @@ async function addKey() {
   const name = document.getElementById("new-name").value.trim()
   const key = document.getElementById("new-key").value.trim()
   if (!name || !key) return showErr("名称和 key 不能为空")
-  try { await api("/api/keys/add", { name, key }); document.getElementById("new-name").value=""; document.getElementById("new-key").value=""; refresh() }
-  catch (e) { showErr(e.message) }
+  try {
+    const r = await fetch("/api/keys/add", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, key }) })
+    const j = await r.json()
+    if (!r.ok) throw new Error(j.error || r.statusText)
+    document.getElementById("new-name").value=""; document.getElementById("new-key").value=""
+    if (j.health) {
+      const map = { ok:'可用', invalid:'key 无效', nobalance:'余额不足', limited:'限流', error:'异常' }
+      const label = map[j.health.status] || j.health.status
+      showMsg('已添加 "' + name + '" → ' + label + (label==='可用' ? '' : '：' + j.health.detail))
+    } else { showMsg('已添加 "' + name + '"') }
+    refresh()
+  } catch (e) { showErr(e.message) }
 }
 async function rotate() { try { await api("/api/rotate", {}); refresh() } catch (e) { showErr(e.message) } }
 async function checkKeys() {

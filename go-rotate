@@ -123,6 +123,14 @@ def do_add(cfg, name, key):
         cfg["current"] = name
     save(cfg)
     print(f'added key "{name}"')
+    # 添加后立即探测状态
+    print("检测新 key 状态…")
+    status, detail = probe_key(key)
+    labels = {"ok": "✅ 可用", "invalid": "⚠️  key 无效", "nobalance": "⚠️  余额不足",
+              "limited": "⚠️  限流", "error": "❌ 异常"}
+    print(f"  {labels.get(status, status)}: {detail}")
+    if status != "ok":
+        print("  ⚠️  该 key 当前不可用，建议检查或更换。")
 
 
 def do_cooldown(cfg, name, minutes):
@@ -163,6 +171,13 @@ def do_init():
         if not cfg["current"]:
             cfg["current"] = name
         print(f"  ✅ 已添加 \"{name}\"")
+        # 添加后立即探测状态
+        status, detail = probe_key(key)
+        labels = {"ok": "✅ 可用", "invalid": "⚠️  key 无效", "nobalance": "⚠️  余额不足",
+                  "limited": "⚠️  限流", "error": "❌ 异常"}
+        print(f"     状态: {labels.get(status, status)}: {detail}")
+        if status != "ok":
+            print("     ⚠️  该 key 当前不可用，建议检查或更换。")
     if not cfg["keys"]:
         print("\n未添加任何 key。可稍后用 `go-rotate add <name> <key>` 添加。")
     else:
@@ -203,48 +218,56 @@ def do_web():
     os.execv(bun, [bun, "-e", code])
 
 
+def probe_key(key):
+    """发 1-token 请求探测 key，返回 (状态, 详情)。
+    状态: ok / invalid / nobalance / limited / error"""
+    import urllib.request
+    req = urllib.request.Request(
+        "https://opencode.ai/zen/go/v1/chat/completions",
+        data=json.dumps({
+            "model": "hy3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1,
+            "stream": False,
+        }).encode(),
+        headers={
+            "content-type": "application/json",
+            "authorization": f"Bearer {key}",
+            # opencode.ai 会拦截 Python-urllib 默认 UA，需伪装成浏览器
+            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15):
+            return "ok", "可用"
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read())["error"]["message"]
+        except Exception:
+            msg = f"HTTP {e.code}"
+        s = msg.lower()
+        if "invalid api key" in s:
+            return "invalid", msg
+        if "insufficient" in s or "balance" in s:
+            return "nobalance", msg
+        if "quota" in s or "rate" in s or "limit" in s:
+            return "limited", msg
+        return "error", msg
+    except Exception as e:
+        return "error", f"网络错误: {e}"
+
+
 def do_check(cfg, name=None):
     """探测指定 key（或全部）健康状态：发 1-token 请求判断是否可用"""
-    import urllib.request
     targets = [k for k in cfg["keys"] if name is None or k["name"] == name]
     if not targets:
         sys.exit("没有可检测的 key")
     print(f"探测 {len(targets)} 个 key（每次消耗约 1 token）…")
+    labels = {"ok": "✅ 可用", "invalid": "⚠️  key 无效", "nobalance": "⚠️  余额不足",
+              "limited": "⚠️  限流", "error": "❌ 异常"}
     for k in targets:
-        req = urllib.request.Request(
-            "https://opencode.ai/zen/go/v1/chat/completions",
-            data=json.dumps({
-                "model": "hy3",
-                "messages": [{"role": "user", "content": "hi"}],
-                "max_tokens": 1,
-                "stream": False,
-            }).encode(),
-            headers={
-                "content-type": "application/json",
-                "authorization": f"Bearer {k['key']}",
-                # opencode.ai 会拦截 Python-urllib 默认 UA，需伪装成浏览器
-                "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=15) as r:
-                print(f"  {k['name']:<12} ✅ 可用")
-        except urllib.error.HTTPError as e:
-            try:
-                msg = json.loads(e.read())["error"]["message"]
-            except Exception:
-                msg = f"HTTP {e.code}"
-            s = msg.lower()
-            if "invalid api key" in s:
-                print(f"  {k['name']:<12} ⚠️  key 无效: {msg}")
-            elif "insufficient" in s or "balance" in s:
-                print(f"  {k['name']:<12} ⚠️  余额不足: {msg}")
-            elif "quota" in s or "rate" in s or "limit" in s:
-                print(f"  {k['name']:<12} ⚠️  限流: {msg}")
-            else:
-                print(f"  {k['name']:<12} ⚠️  HTTP {e.code}: {msg}")
-        except Exception as e:
-            print(f"  {k['name']:<12} ❌ 网络错误: {e}")
+        status, detail = probe_key(k["key"])
+        print(f"  {k['name']:<12} {labels.get(status, status)}: {detail}")
 
 
 def do_uninstall(force=False):
