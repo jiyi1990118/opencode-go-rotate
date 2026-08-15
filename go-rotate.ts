@@ -383,6 +383,7 @@ function statusPayload() {
     provider_id: cfg.provider_id,
     cooldown_minutes: cfg.cooldown_minutes,
     current: cfg.current,
+    auto_web: cfg.auto_web !== false,
     keyCount: cfg.keys.length,
     availableCount: keys.filter((k) => k.state === "available").length,
     keys,
@@ -489,6 +490,18 @@ async function handleWeb(req: any): Promise<Response> {
   if (route === "/api/keys/check") {
     return json({ results: await checkAllKeys() })
   }
+  // Web 开关：/api/web/off 关闭并停止 server；/api/web/on 开启自动启动
+  if (route === "/api/web/off") {
+    setAutoWeb(false)
+    const res = json({ ok: true, shutting_down: true, auto_web: false })
+    // 先让响应发出，再停止 server（否则客户端收不到响应）
+    setTimeout(() => stopWeb(), 300)
+    return res
+  }
+  if (route === "/api/web/on") {
+    setAutoWeb(true)
+    return json({ ok: true, auto_web: true })
+  }
   if (method === "POST") {
     try {
       let body: any = {}
@@ -529,6 +542,8 @@ function setAutoWeb(on: boolean): Config {
   })
 }
 
+let server: any = null
+
 async function startWeb(force = false) {
   if (webStarted) return
   // 未强制 且 auto_web 关闭 且 未显式强制(GOROTATE_FORCE_WEB) 时，跳过自动启动（轮换仍可用）
@@ -539,7 +554,7 @@ async function startWeb(force = false) {
   }
   try {
     // 端口绑定失败即认为已有实例在跑（满足"web 只启动一个"）
-    Bun.serve({ port: WEB_PORT, fetch: handleWeb })
+    server = Bun.serve({ port: WEB_PORT, fetch: handleWeb })
     webStarted = true
     log(`🌐 Web 管理界面: http://localhost:${WEB_PORT}`)
   } catch {
@@ -553,6 +568,22 @@ async function startWeb(force = false) {
     } catch {
       log(`⚠️  端口 ${WEB_PORT} 被其它程序占用，web 未启动`)
     }
+  }
+}
+
+/** 停止当前运行的 web server（web 页面"关闭 Web"用） */
+function stopWeb(): boolean {
+  try {
+    if (server) {
+      server.stop(true) // 关闭并断开活动连接
+      server = null
+      webStarted = false
+      log(`🛑 Web 已关闭（端口 ${WEB_PORT} 已释放）`)
+      return true
+    }
+    return false
+  } catch {
+    return false
   }
 }
 
@@ -660,6 +691,12 @@ const WEB_HTML = `<!doctype html>
       <div class="stat"><div class="v" id="s-current">-</div><div class="l">当前 key</div></div>
       <div class="stat"><div class="v" id="s-avail">-</div><div class="l">可用 &nbsp;<span class="muted" id="s-total"></span></div></div>
       <div class="stat"><div class="v" id="s-cooldown">-</div><div class="l">冷却窗口(min)</div></div>
+      <div class="stat"><div class="v" id="s-autoweb">-</div><div class="l">Web 自动启动</div></div>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <span class="muted">关闭后本页面会立即停止，且 opencode 启动时不再自动起 Web（轮换功能不受影响）。</span>
+      <button id="web-off-btn" class="danger" onclick="webOff()">关闭 Web</button>
+      <button id="web-on-btn" onclick="webOn()">开启自动启动</button>
     </div>
   </div>
 
@@ -698,6 +735,9 @@ async function refresh() {
     document.getElementById("s-avail").textContent = st.availableCount + "/" + st.keyCount
     document.getElementById("s-total").textContent = "total " + st.keyCount
     document.getElementById("s-cooldown").textContent = st.cooldown_minutes
+    document.getElementById("s-autoweb").textContent = st.auto_web ? "开启" : "关闭"
+    document.getElementById("web-off-btn").disabled = !st.auto_web
+    document.getElementById("web-on-btn").disabled = st.auto_web
     const tb = document.getElementById("tbody")
     tb.innerHTML = ""
     for (const k of st.keys) {
@@ -757,6 +797,17 @@ async function addKey() {
   } catch (e) { showErr(e.message) }
 }
 async function rotate() { try { await api("/api/rotate", {}); refresh() } catch (e) { showErr(e.message) } }
+async function webOff() {
+  if (!confirm("确认关闭 Web？关闭后本页面立即停止，且 opencode 启动时不再自动起 Web（轮换功能不受影响）。")) return
+  try {
+    await api("/api/web/off", {})
+    document.body.innerHTML = '<div style="padding:40px;text-align:center;color:#9aa3ad">Web 已关闭。<br><br>需要时用 <code>go-rotate web</code> 重新启动，或 <code>go-rotate web on</code> 恢复自动启动。</div>'
+  } catch (e) { showErr(e.message) }
+}
+async function webOn() {
+  try { await api("/api/web/on", {}); showMsg("已开启 Web 自动启动"); refresh() }
+  catch (e) { showErr(e.message) }
+}
 async function checkKeys() {
   const hint = document.getElementById("check-hint")
   hint.textContent = "检测中…"
