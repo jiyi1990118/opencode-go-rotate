@@ -108,7 +108,9 @@ session.error 事件
 
 ## CLI 命令
 
-`status` / `list` / `init`(交互式) / `add <name> <key>` / `set <name>` / `next [min]` / `cooldown <name> [min]`
+`status` / `list` / `init`(交互式) / `web`(独立启动 Web，无需 opencode) / `add <name> <key>` / `set <name>` / `next [min]` / `cooldown <name> [min]`
+
+> `go-rotate web` 通过 `bun -e` 加载插件模块并调用 `GoRotate()` 起 Web，复用插件同一套逻辑（不复制代码）。端口仍固定 8899，若已有 go-rotate web 在跑会自动跳过（只启一个）。
 
 ## 验证方法（重要：改完必测）
 

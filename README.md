@@ -48,11 +48,16 @@ go-rotate status            # 查看状态
 
 或启动 opencode 后访问 **http://localhost:8899**，在网页里增删/切换 key。
 
+> **不想开 opencode 也能用 Web 界面**：直接运行 `go-rotate web` 即可独立启动
+> Web 管理界面（http://localhost:8899），Ctrl+C 停止。
+> 若已有 go-rotate web 在运行（如 opencode 已开着），会自动复用，不会重复启动。
+
 ## CLI 命令
 
 | 命令 | 说明 |
 |---|---|
 | `go-rotate init` | 交互式首次配置 |
+| `go-rotate web` | 独立启动 Web 界面（无需 opencode 运行） |
 | `go-rotate status` / `list` | 查看当前 key 与冷却状态 |
 | `go-rotate add <name> <key>` | 新增 key |
 | `go-rotate set <name>` | 启用指定 key |
@@ -79,7 +84,7 @@ rm -f ~/.config/opencode/go-keys.json
 ## FAQ
 
 **Web 界面打不开？**
-Web 随 opencode 进程存活——需要开着 opencode（TUI 或 server）才能访问 localhost:8899。不开 opencode 时用 `go-rotate` CLI 即可。
+插件随 opencode 启动时自动起 Web（localhost:8899）。若没开 opencode，直接运行 `go-rotate web` 即可独立启动。
 
 **为什么要有多个 key？**
 opencode-go 是订阅套餐，配额按时间窗口重置。多账号轮换可提升可用时长。

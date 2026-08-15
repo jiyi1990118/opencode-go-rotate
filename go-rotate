@@ -5,6 +5,8 @@ go-rotate: opencode-go multi-key manager CLI (shares go-keys.json with go-rotate
 Usage:
   go-rotate status           show current key and cooldown status
   go-rotate list             alias of status
+  go-rotate init             interactive first-time setup
+  go-rotate web              start the web UI standalone (no opencode needed)
   go-rotate set <name>       switch to a named key (and sync auth.json)
   go-rotate next [minutes]   rotate to next available key (optional cooldown minutes)
   go-rotate add <name> <key> add a key
@@ -179,6 +181,26 @@ def reconcile(cfg):
         cfg["current"] = cfg["keys"][0]["name"]
 
 
+def do_web():
+    """独立启动 Web 管理界面（无需 opencode 运行）"""
+    import shutil
+    plugin = os.path.join(os.path.expanduser("~"), ".config", "opencode", "plugins", "go-rotate.ts")
+    if not os.path.exists(plugin):
+        sys.exit(f"插件未安装：{plugin}\n请先运行安装脚本 install.sh。")
+    bun = shutil.which("bun")
+    if not bun:
+        sys.exit("未找到 bun。opencode 自带 bun 运行时，或 brew install bun。")
+    code = (
+        'import("' + plugin + '").then(async m => { '
+        'await m.GoRotate({ directory: "go-rotate-web" }); '
+        '})'
+    )
+    print("== go-rotate Web 管理界面 ==")
+    print("  地址: http://localhost:8899")
+    print("  Ctrl+C 停止\n")
+    os.execv(bun, [bun, "-e", code])
+
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -187,6 +209,9 @@ def main():
     cmd = args[0]
     if cmd == "init":
         do_init()
+        return
+    if cmd == "web":
+        do_web()
         return
     cfg = load()
     if cmd in ("status", "list"):
