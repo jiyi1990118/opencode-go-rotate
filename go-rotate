@@ -7,6 +7,7 @@ Usage:
   go-rotate list             alias of status
   go-rotate init             interactive first-time setup
   go-rotate web              start the web UI standalone (no opencode needed)
+  go-rotate web on|off|status  toggle auto-start web on opencode launch (off = no port, rotation still works)
   go-rotate set <name>       switch to a named key (and sync auth.json)
   go-rotate next [minutes]   rotate to next available key (optional cooldown minutes)
   go-rotate add <name> <key> add a key
@@ -204,8 +205,24 @@ def reconcile(cfg):
         cfg["current"] = cfg["keys"][0]["name"]
 
 
-def do_web():
-    """独立启动 Web 管理界面（无需 opencode 运行）"""
+def do_web(cfg, mode=None):
+    """Web 控制：
+       go-rotate web        独立启动 Web（强制，即使 auto_web 关闭）
+       go-rotate web on     开启随 opencode 自动启动 Web
+       go-rotate web off    关闭自动启动 Web（轮换仍可用，避免占用端口）
+       go-rotate web status 查看当前 auto_web 状态
+    """
+    if mode == "on" or mode == "off":
+        cfg["auto_web"] = (mode == "on")
+        save(cfg)
+        print(f'Web 自动启动已{"开启" if mode == "on" else "关闭"}（轮换功能仍可用）')
+        return
+    if mode == "status":
+        print(f'auto_web: {"开启" if cfg.get("auto_web", True) else "关闭"}')
+        print("  开启 = opencode 启动时自动起 Web (localhost:8899)")
+        print("  关闭 = 不自动起 Web，避免占用端口；轮换功能仍可用")
+        return
+    # 独立启动（强制）
     import shutil
     plugin = os.path.join(os.path.expanduser("~"), ".config", "opencode", "plugins", "go-rotate.ts")
     if not os.path.exists(plugin):
@@ -221,7 +238,9 @@ def do_web():
     print("== go-rotate Web 管理界面 ==")
     print("  地址: http://localhost:8899")
     print("  Ctrl+C 停止\n")
-    os.execv(bun, [bun, "-e", code])
+    env = os.environ.copy()
+    env["GOROTATE_FORCE_WEB"] = "1"  # 独立启动强制起 Web，忽略 auto_web
+    os.execvpe(bun, [bun, "-e", code], env)
 
 
 def probe_key(key):
@@ -344,13 +363,13 @@ def main():
     if cmd == "init":
         do_init()
         return
+    cfg = load()
     if cmd == "web":
-        do_web()
+        do_web(cfg, args[1] if len(args) > 1 else None)
         return
     if cmd == "uninstall":
         do_uninstall(force=("-y" in args or "--yes" in args))
         return
-    cfg = load()
     if cmd == "check":
         do_check(cfg, args[1] if len(args) > 1 else None)
         return

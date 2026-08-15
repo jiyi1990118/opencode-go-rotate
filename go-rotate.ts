@@ -59,6 +59,8 @@ type Config = {
   cooldown_minutes: number
   current: string
   keys: KeyEntry[]
+  /** 是否随 opencode 启动自动起 Web；false 时轮换仍可用，仅不占用端口 */
+  auto_web?: boolean
 }
 
 /* ---------------- 日志 ---------------- */
@@ -145,10 +147,11 @@ function loadConfig(): Config {
       cooldown_minutes: cfg.cooldown_minutes ?? DEFAULT_COOLDOWN_MIN,
       current: cfg.current ?? "",
       keys,
+      auto_web: cfg.auto_web !== false,
     }
   } catch (e) {
     log(`loadConfig error: ${(e as Error).message}`)
-    return { provider_id: "opencode-go", cooldown_minutes: DEFAULT_COOLDOWN_MIN, current: "", keys: [] }
+    return { provider_id: "opencode-go", cooldown_minutes: DEFAULT_COOLDOWN_MIN, current: "", keys: [], auto_web: true }
   }
 }
 
@@ -518,8 +521,22 @@ async function handleWeb(req: any): Promise<Response> {
   return json({ error: "not found" }, 404)
 }
 
-async function startWeb() {
+/** 设置是否随 opencode 自动起 Web（web/CLI 用） */
+function setAutoWeb(on: boolean): Config {
+  return mutateConfig((cfg) => {
+    cfg.auto_web = !!on
+    log(`🌐 Web 自动启动已${on ? "开启" : "关闭"}（轮换功能不受影响）`)
+  })
+}
+
+async function startWeb(force = false) {
   if (webStarted) return
+  // 未强制 且 auto_web 关闭 且 未显式强制(GOROTATE_FORCE_WEB) 时，跳过自动启动（轮换仍可用）
+  const forced = force || process.env.GOROTATE_FORCE_WEB === "1"
+  if (!forced && loadConfig().auto_web === false) {
+    log(`🌐 auto_web 已关闭，跳过 Web 启动（轮换功能仍可用）`)
+    return
+  }
   try {
     // 端口绑定失败即认为已有实例在跑（满足"web 只启动一个"）
     Bun.serve({ port: WEB_PORT, fetch: handleWeb })
