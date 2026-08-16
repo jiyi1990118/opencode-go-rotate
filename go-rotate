@@ -12,7 +12,9 @@ Usage:
   go-rotate next [minutes]   rotate to next available key (optional cooldown minutes)
   go-rotate add <name> <key> add a key
   go-rotate cooldown <name> [minutes|clear]  set cooldown (or 'clear'/0 to cancel)
+  go-rotate cooldown <name> window <min|clear>  set/clear per-key cooldown window (fallback to global)
   go-rotate check [name]     probe key health (valid/balance/limited)
+  go-rotate stats            show per-key rotation/cooling stats from the log
   go-rotate uninstall [-y]   uninstall (remove plugin, CLI, config)
 
 Config:      ~/.config/opencode/go-keys.json
@@ -20,13 +22,53 @@ Sync target: ~/.local/share/opencode/auth.json -> opencode-go.key
 """
 import json
 import os
+import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 DATA_DIR = os.path.join(os.path.expanduser("~"), ".config", "opencode")
 CONFIG_FILE = os.path.join(DATA_DIR, "go-keys.json")
 AUTH_FILE = os.path.join(os.path.expanduser("~"), ".local", "share", "opencode", "auth.json")
+LOG_FILE = "/tmp/opencode-go-rotate.log"
 DEFAULT_COOLDOWN_MIN = 300
+
+# 与 go-rotate.ts 插件一致的锁参数
+LOCK_FILE = CONFIG_FILE + ".lock"
+LOCK_TIMEOUT_MS = 5000      # 拿不到锁的等待上限
+LOCK_STALE_MS = 15000       # 超过该 mtime 视为陈旧锁，可强制删除
+
+
+def _with_lock(fn):
+    """跨进程写锁（与插件 withLockSync 同机制：O_EXCL + 陈旧锁检测 + 超时降级）。
+    所有写 go-keys.json 的路径都必须走这里，避免与插件 rotate 并发时互相覆盖/损坏。"""
+    lock = LOCK_FILE
+    os.makedirs(os.path.dirname(lock) or ".", exist_ok=True)
+    deadline = time.time() + LOCK_TIMEOUT_MS / 1000
+    while True:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - os.stat(lock).st_mtime > LOCK_STALE_MS / 1000:
+                    os.unlink(lock)
+                    continue
+            except OSError:
+                pass
+            if time.time() >= deadline:
+                print("⚠️  获取配置锁超时（>5s），跳过锁继续（与插件降级行为一致）")
+                break
+            time.sleep(0.05)
+    try:
+        return fn()
+    finally:
+        try:
+            os.unlink(lock)
+        except OSError:
+            pass
 
 
 def load() -> dict:
@@ -43,8 +85,10 @@ def load() -> dict:
 
 def save(cfg: dict):
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(CONFIG_FILE, "w") as f:
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CONFIG_FILE)  # 原子写（与插件 atomicWrite 对齐）
 
 
 def sync_auth(key: str):
@@ -140,9 +184,27 @@ def do_add(cfg, name, key):
         print("  ⚠️  该 key 当前不可用，建议检查或更换。")
 
 
-def do_cooldown(cfg, name, minutes):
+def do_cooldown(cfg, name, argv):
     for k in cfg["keys"]:
         if k["name"] == name:
+            # 子命令 window：设置/清除该 key 的独立冷却窗口
+            if argv and str(argv[0]) == "window":
+                if len(argv) >= 2 and str(argv[1]).lower() in ("clear", "off", "0"):
+                    k.pop("cooldown_minutes", None)
+                    save(cfg)
+                    print(f'key "{name}" 独立冷却窗口已清除（回退全局 {cfg.get("cooldown_minutes", DEFAULT_COOLDOWN_MIN)} min）')
+                    return
+                try:
+                    mins = int(argv[1])
+                except (IndexError, ValueError):
+                    sys.exit("用法: go-rotate cooldown <name> window <minutes|clear>")
+                if mins < 0:
+                    sys.exit("独立冷却窗口不能为负数")
+                k["cooldown_minutes"] = mins
+                save(cfg)
+                print(f'key "{name}" 独立冷却窗口设为 {mins} min')
+                return
+            minutes = argv[0] if argv else None
             # 清除冷却：传 clear / off / 0
             if isinstance(minutes, str) and str(minutes).lower() in ("clear", "off", "0"):
                 k["cooldown_until"] = None
@@ -154,8 +216,11 @@ def do_cooldown(cfg, name, minutes):
                 save(cfg)
                 print(f'key "{name}" 冷却已清除（恢复可用）')
                 return
-            # 默认用全局冷却窗口
-            mins = int(minutes) if minutes else cfg.get("cooldown_minutes", DEFAULT_COOLDOWN_MIN)
+            # 冷却窗口优先级：该 key 独立窗口 > 全局窗口 > DEFAULT
+            try:
+                mins = int(minutes) if minutes else k.get("cooldown_minutes") or cfg.get("cooldown_minutes", DEFAULT_COOLDOWN_MIN)
+            except ValueError:
+                sys.exit(f"非法冷却分钟值: {minutes}\n用法: go-rotate cooldown <name> <minutes|clear|window <minutes|clear>>")
             k["cooldown_until"] = (datetime.now(timezone.utc) + timedelta(minutes=mins)).isoformat()
             save(cfg)
             print(f'key "{name}" cooling for {mins} min')
@@ -201,7 +266,7 @@ def do_init():
         print("\n未添加任何 key。可稍后用 `go-rotate add <name> <key>` 添加。")
     else:
         reconcile(cfg)
-        save(cfg)
+        _with_lock(lambda: save(cfg))
         cur = next((k for k in cfg["keys"] if k["name"] == cfg["current"]), cfg["keys"][0])
         sync_auth(cur["key"])
         print(f"\n✅ 配置完成！当前 key: \"{cur['name']}\"")
@@ -344,7 +409,10 @@ def do_uninstall(force=False):
         print(f"  - 配置 {CONFIG_FILE}")
 
     if not force:
-        ans = input("确认卸载？删除配置会丢失 key 列表 [y/N]: ").strip().lower()
+        try:
+            ans = input("确认卸载？删除配置会丢失 key 列表 [y/N]: ").strip().lower()
+        except EOFError:
+            ans = "n"  # 非交互（管道/EOF）时默认取消，防误删
         if ans not in ("y", "yes"):
             print("已取消。")
             return
@@ -366,6 +434,44 @@ def do_uninstall(force=False):
     print("\n卸载完成。auth.json 未改动（保留你的 opencode-go 凭据）。")
 
 
+def do_stats():
+    """解析运行日志，统计每个 key 的轮换/冷却次数与最近切换时间。
+    注意：只统计主日志文件（/tmp/opencode-go-rotate.log），归档轮转文件不计；
+    日志保留窗口有限，统计是「近期」而非全历史。"""
+    if not os.path.exists(LOG_FILE):
+        sys.exit(f"日志不存在: {LOG_FILE}（尚无运行记录）")
+    rotated = {}   # key -> count（该 key 被轮换「到」的次数）
+    cooling = {}   # key -> count（该 key 进冷却的次数）
+    last_switch = {}  # key -> ISO 时间
+    total = 0
+    rot_re = re.compile(r"轮换到 key \"([^\"]+)\"")
+    cool_re = re.compile(r"key \"([^\"]+)\" 配额耗尽")
+    ts_re = re.compile(r"^\[([^\]]+)\]")
+    with open(LOG_FILE, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            m = rot_re.search(line)
+            if m:
+                name = m.group(1)
+                rotated[name] = rotated.get(name, 0) + 1
+                total += 1
+                t = ts_re.match(line)
+                if t:
+                    last_switch[name] = t.group(1)
+            m = cool_re.search(line)
+            if m:
+                name = m.group(1)
+                cooling[name] = cooling.get(name, 0) + 1
+    if total == 0:
+        print("日志中暂无轮换记录。")
+        return
+    print(f"统计自 {LOG_FILE}")
+    print(f"总轮换次数: {total}")
+    print("-" * 60)
+    all_names = sorted(set(rotated) | set(cooling))
+    for name in all_names:
+        print(f"{name:<12} 被切到 {rotated.get(name, 0):<3} 次   进冷却 {cooling.get(name, 0):<3} 次   最近切换 {last_switch.get(name, '-')}")
+
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -375,27 +481,37 @@ def main():
     if cmd == "init":
         do_init()
         return
-    cfg = load()
-    if cmd == "web":
-        do_web(cfg, args[1] if len(args) > 1 else None)
-        return
     if cmd == "uninstall":
         do_uninstall(force=("-y" in args or "--yes" in args))
         return
     if cmd == "check":
+        cfg = load()
         do_check(cfg, args[1] if len(args) > 1 else None)
         return
+    if cmd == "web":
+        # web on/off 写配置 → 持锁；web（独立启动）不写配置不持锁
+        if len(args) > 1 and args[1] in ("on", "off"):
+            _with_lock(lambda: do_web(load(), args[1]))
+        else:
+            do_web(load(), args[1] if len(args) > 1 else None)
+        return
+    if cmd == "stats":
+        do_stats()
+        return
     if cmd in ("status", "list"):
-        do_status(cfg)
+        do_status(load())
     elif cmd == "set" and len(args) >= 2:
-        do_set(cfg, args[1])
+        _with_lock(lambda: do_set(load(), args[1]))
     elif cmd == "next":
-        do_next(cfg, int(args[1]) if len(args) > 1 else None)
+        try:
+            minutes = int(args[1]) if len(args) > 1 else None
+        except ValueError:
+            sys.exit(f"非法分钟值: {args[1]}\n用法: go-rotate next [minutes]")
+        _with_lock(lambda: do_next(load(), minutes))
     elif cmd == "add" and len(args) >= 3:
-        do_add(cfg, args[1], args[2])
+        _with_lock(lambda: do_add(load(), args[1], args[2]))
     elif cmd == "cooldown" and len(args) >= 2:
-        raw = args[2] if len(args) > 2 else None
-        do_cooldown(cfg, args[1], raw)
+        _with_lock(lambda: do_cooldown(load(), args[1], args[2:]))
     else:
         print(__doc__)
         sys.exit(1)

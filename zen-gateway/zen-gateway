@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# ============================================================
+# zen-gateway 管理脚本（macOS launchd LaunchAgent）
+#
+# 用法:
+#   zen-gateway start | stop | restart | status | logs | uninstall
+#
+# 说明:
+#   - 通过 launchctl 管理 com.go-rotate.zen-gateway 这个 LaunchAgent
+#   - 配置文件在 ~/Library/LaunchAgents/com.go-rotate.zen-gateway.plist
+#   - 日志在 ~/Library/Logs/zen-gateway.log
+#   - 幂等：重复 start / stop 不报错
+# ============================================================
+# 注意：刻意不用 set -u（nounset）。macOS 系统自带 bash 3.2 存在已知 bug：
+#   set -u 下，多字节 UTF-8 字符紧邻 ${VAR} 于同一 word 时（如「通过 $URL）」），
+#   bash 会误报 "unbound variable"。本项目中文提示较多，故仅启用 -eo pipefail。
+set -eo pipefail
+
+LABEL="com.go-rotate.zen-gateway"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOG="$HOME/Library/Logs/zen-gateway.log"
+PORT="${ZEN_GATEWAY_PORT:-18888}"
+HEALTH_URL="http://127.0.0.1:${PORT}/healthz"
+
+C_GREEN='\033[0;32m'; C_YELLOW='\033[1;33m'; C_CYAN='\033[0;36m'; C_RED='\033[0;31m'; C_NC='\033[0m'
+info() { echo -e "${C_CYAN}[zen-gateway]${C_NC} $*"; }
+ok()   { echo -e "${C_GREEN}[zen-gateway]${C_NC} $*"; }
+warn() { echo -e "${C_YELLOW}[zen-gateway]${C_NC} $*"; }
+die()  { echo -e "${C_RED}[zen-gateway]${C_NC} $*" >&2; exit 1; }
+
+# 健康检查：0=通过 1=未通过
+healthz() {
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$HEALTH_URL" 2>/dev/null || echo 000)"
+  [ "$code" = "200" ]
+}
+
+# 判断 LaunchAgent 是否已加载（launchctl print 是否成功）
+is_loaded() {
+  launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1
+}
+
+# 加载 LaunchAgent：优先新版 bootstrap，回退旧版 load（幂等）
+do_boot() { # boot(load)
+  if launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null; then
+    return 0
+  fi
+  launchctl load "$PLIST" 2>/dev/null || true
+}
+
+# 卸载 LaunchAgent：优先新版 bootout，回退旧版 unload（幂等）
+do_bootout() {
+  if launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null; then
+    return 0
+  fi
+  launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
+  launchctl unload "$PLIST" 2>/dev/null || true
+}
+
+start() {
+  if [ ! -f "$PLIST" ]; then
+    die "未安装服务（找不到 $PLIST ）。请先: bash install.sh zen-gateway"
+  fi
+  if is_loaded; then
+    if healthz; then
+      ok "已在运行（pid 见 launchctl print gui/\$(id -u)/$LABEL ）"
+    else
+      warn "服务已加载但健康检查未通过（$HEALTH_URL ），请查看日志: zen-gateway logs"
+    fi
+    return 0
+  fi
+  info "启动 $LABEL ..."
+  do_boot
+  # 等待健康检查（最多 ~15s；launchd 首次 bootstrap 的 spawn 可能较慢）
+  for _ in $(seq 1 60); do
+    if healthz; then ok "启动成功 → $HEALTH_URL"; return 0; fi
+    sleep 0.25
+  done
+  warn "已加载但健康检查未通过（可能端口 $PORT 被占用或依赖未就绪）。"
+  warn "查看日志: zen-gateway logs"
+}
+
+stop() {
+  if ! is_loaded; then
+    warn "未在运行（服务已停止或未加载）"
+    return 0
+  fi
+  info "停止 $LABEL ..."
+  do_bootout
+  ok "已停止"
+}
+
+restart() {
+  stop
+  start
+}
+
+status() {
+  if ! is_loaded; then
+    warn "状态: stopped（LaunchAgent 未加载）"
+    return 0
+  fi
+  if healthz; then
+    ok "状态: running（健康检查通过 $HEALTH_URL ）"
+  else
+    warn "状态: loaded 但健康检查未通过（$HEALTH_URL ）"
+  fi
+  echo
+  launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | grep -E "state =|pid =|last exit code" || true
+}
+
+logs() {
+  if [ ! -f "$LOG" ]; then
+    warn "日志文件不存在: $LOG"
+    return 0
+  fi
+  if [ "${1:-}" = "-f" ] || [ "${1:-}" = "--follow" ]; then
+    tail -f "$LOG"
+  else
+    tail -n "${2:-100}" "$LOG"
+  fi
+}
+
+uninstall() {
+  echo ""
+  warn "正在卸载 zen-gateway 服务 ..."
+  echo "  将删除:"
+  echo "    $PLIST"
+  echo "    $LOG"
+  local ans=""
+  if [ "${1:-}" != "-y" ]; then
+    printf "确认卸载？（不改动 go-keys.json / auth.json）[y/N]: "
+    read -r ans
+  else
+    ans="y"
+  fi
+  if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
+    stop >/dev/null 2>&1 || true
+    [ -f "$PLIST" ] && rm -f "$PLIST" && ok "已删除 $PLIST"
+    [ -f "$LOG" ] && rm -f "$LOG" && ok "已删除 $LOG"
+    ok "卸载完成。gateway.mjs 与 go-keys.json / auth.json 均未改动。"
+  else
+    warn "已取消卸载。"
+  fi
+}
+
+case "${1:-}" in
+  start)     start ;;
+  stop)      stop ;;
+  restart)   restart ;;
+  status)    status ;;
+  logs)      logs "${2:-}" ;;
+  uninstall) uninstall "${2:-}" ;;
+  *)
+    echo "用法: zen-gateway {start|stop|restart|status|logs [-f]|uninstall [-y]}"
+    exit 1
+    ;;
+esac

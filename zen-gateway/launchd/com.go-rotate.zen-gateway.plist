@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  zen-gateway · macOS LaunchAgent 模板
+  
+  本文件是「模板」，含占位符 __NODE_BIN__ / __GATEWAY_MJS__ / __LOG_PATH__，
+  由 install.sh 用 python3 替换为真实绝对路径后写入 ~/Library/LaunchAgents/。
+  请不要直接把本文件拷到 LaunchAgents 使用（占位符不会被 launchd 展开）。
+  
+  label 命名说明：
+    用 com.go-rotate.zen-gateway（而非 com.jary.*）—— 项目品牌命名、
+    对任何用户可移植（install.sh 分发不吃用户名）、与 go-rotate 体系一致。
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.go-rotate.zen-gateway</string>
+
+  <!-- 程序路径：launchd 不走 shebang，第一项必须是 node 可执行文件绝对路径 -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE_BIN__</string>
+    <string>__GATEWAY_MJS__</string>
+  </array>
+
+  <!-- 工作目录指向 gateway.mjs 所在目录 -->
+  <key>WorkingDirectory</key>
+  <string>__GATEWAY_DIR__</string>
+
+  <!-- 开机自动启动 -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- 崩溃 / 被 kill 后自动重启 -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <!--
+    ProcessType：
+      Background —— 后台服务、无 UI，不抢占前台交互任务的资源与响应优先级，
+      且崩溃重启延迟等策略更合适常驻服务。Interactive 会显著提高优先级，
+      对纯网络服务是浪费，故选 Background。
+  -->
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <!-- 日志：~/Library/Logs/zen-gateway.log（launchd 不展开 ~，故用绝对路径） -->
+  <key>StandardOutPath</key>
+  <string>__LOG_PATH__</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_PATH__</string>
+
+  <!--
+    环境变量：默认空，走 gateway.mjs 代码默认值（18888 / 127.0.0.1 / hy3）。
+    需要覆盖时取消注释对应项并填值，然后：
+        launchctl bootout gui/$(id -u)/com.go-rotate.zen-gateway
+        launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.go-rotate.zen-gateway.plist
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>ZEN_GATEWAY_PORT</key><string>18888</string>
+    <key>ZEN_GATEWAY_HOST</key><string>127.0.0.1</string>
+    <key>ZEN_GATEWAY_TOKEN</key><string></string>
+    <key>ZEN_DEFAULT_MODEL</key><string>hy3</string>
+    <key>ZEN_UPSTREAM_BASE</key><string>https://opencode.ai/zen/go/v1</string>
+  </dict>
+  -->
+</dict>
+</plist>

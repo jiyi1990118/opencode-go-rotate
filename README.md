@@ -14,6 +14,9 @@ opencode 的 opencode-go 多 key 自动轮换插件 + Web 管理界面。
 - ✅ 免重启：热切换，当前会话不丢
 - ✅ 冷却机制：按滚动窗口让用尽的 key 冷却（可解析错误里的 reset 时间）
 - ✅ Web 管理界面：`http://localhost:8899` 增删/切换 key（全系统只启动一个）
+- ✅ Web 支持**每 key 独立冷却窗口**（行内「窗口/清窗」按钮）与**全局窗口编辑**
+- ✅ Web **轮换统计卡片**（从日志解析每 key 轮换/冷却次数）与 **zen-gateway 状态卡片**（跨进程展示 18888 服务与每 key 用量，未运行时灰卡降级）
+- ✅ Web **删除 key 确认弹窗**、日志**自动刷新开关 + 关键字过滤**
 - ✅ 并发安全：跨进程文件锁 + 原子写
 - ✅ 零依赖：插件用 Node 内置模块，CLI 用纯 Python
 
@@ -48,6 +51,28 @@ go-rotate status            # 查看状态
 
 或启动 opencode 后访问 **http://localhost:8899**，在网页里增删/切换 key。
 
+## 配置 Schema（go-keys.json）
+
+```jsonc
+{
+  "provider_id": "opencode-go",   // 命中的 providerID（前缀匹配 "opencode"）
+  "cooldown_minutes": 300,        // 全局冷却窗口（分钟）；缺省 300
+  "current": "act1",              // 当前 key 的 name
+  "keys": [
+    {
+      "name": "act1",
+      "key": "sk-...",
+      "cooldown_until": null,     // null=可用；ISO 时间=冷却到何时
+      "cooldown_minutes": 30      // 可选：该 key 独立冷却窗口；缺省回退全局 cooldown_minutes
+    }
+  ]
+}
+```
+
+冷却窗口优先级：**该 key 的 `cooldown_minutes` > 全局 `cooldown_minutes` > 默认 300 分钟**。
+通过 `go-rotate cooldown <name> window <min>` 设置独立窗口，`window clear` 删除字段回退全局。
+旧配置（无每 key 字段）行为完全不变。
+
 > **不想开 opencode 也能用 Web 界面**：直接运行 `go-rotate web` 即可独立启动
 > Web 管理界面（http://localhost:8899），Ctrl+C 停止。
 > 若已有 go-rotate web 在运行（如 opencode 已开着），会自动复用，不会重复启动。
@@ -55,6 +80,8 @@ go-rotate status            # 查看状态
 > **不想让 opencode 自动占用 8899 端口**：`go-rotate web off`。之后 opencode 启动时
 > 不再自动起 Web，但**自动轮换功能不受影响**；需要 Web 时再 `go-rotate web` 手动起，
 > 或 `go-rotate web on` 恢复自动启动。
+
+> 📖 **Web 界面完整使用文档**（页面布局 / API 速查表 / 安全说明 / FAQ / 增强前基线 / **Web 增强**）：[`docs/Web界面使用.md`](docs/Web界面使用.md)
 
 ## CLI 命令
 
@@ -67,8 +94,10 @@ go-rotate status            # 查看状态
 | `go-rotate add <name> <key>` | 新增 key |
 | `go-rotate set <name>` | 启用指定 key |
 | `go-rotate next [分钟]` | 切到下一个可用 key |
-| `go-rotate cooldown <name> [分钟]` | 手动设置/清除冷却 |
+| `go-rotate cooldown <name> [分钟]` | 手动设置/清除冷却（无参用该 key 独立窗口或全局） |
+| `go-rotate cooldown <name> window <分钟\|clear>` | 设置/清除该 key 独立的冷却窗口（clear 回退全局） |
 | `go-rotate check [name]` | 探测 key 健康（可用/无效/余额不足/限流） |
+| `go-rotate stats` | 从日志统计每 key 轮换/冷却次数（近期） |
 | `go-rotate uninstall [-y]` | 卸载（删插件、CLI、配置） |
 
 ## 文件
@@ -112,3 +141,7 @@ opencode-go 没有公开的额度/余额查询 API，**无法主动查额度**�
 
 **对我的其它 provider（codeplan/fox-aws 等）有影响吗？**
 没有。插件只在 `providerID` 命中的 opencode-go 请求上注入 key，只处理 opencode-go 的配额错误。
+
+## 相关项目
+
+- **zen-gateway（`zen-gateway/`）**：把 opencode zen（Go 档）暴露成标准 OpenAI/Anthropic/Responses 兼容网关，供 claude code / codex / cursor 使用。与 go-rotate **共用 `go-keys.json`** 和自动轮换。见 [`zen-gateway/README.md`](zen-gateway/README.md)，架构设计见 [`docs/zen-gateway-architecture.md`](docs/zen-gateway-architecture.md)。含零依赖工具 `zen-gateway/usage-report.mjs`（用量趋势分析）与 `zen-gateway/tests/run-tests.mjs`（纯逻辑单测，`ZEN_TEST=1 node run-tests.mjs`）。

@@ -97,6 +97,115 @@ fetch_or_copy() {
   fi
 }
 
+# ================== zen-gateway 服务安装 ==================
+# 用法: bash install.sh zen-gateway  或  bash install.sh --zen-gateway
+# 卸载: bash install.sh zen-gateway-uninstall
+# 把 zen-gateway 做成 macOS 常驻服务（launchd LaunchAgent，开机自启）。
+install_zen_gateway() {
+  echo ""
+  info "=============================================="
+  info " zen-gateway · opencode zen → OpenAI 兼容网关（macOS 常驻服务）"
+  info "=============================================="
+  command -v node >/dev/null 2>&1 || die "需要 node（≥18）。请先安装 Node.js"
+
+  local NODE_BIN GATEWAY_DIR LAUNCH_AGENTS_DIR LOG_PATH PLIST_DST
+  NODE_BIN="$(command -v node)"
+  GATEWAY_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/zen-gateway"
+  LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
+  LOG_PATH="$HOME/Library/Logs/zen-gateway.log"
+  PLIST_DST="$LAUNCH_AGENTS_DIR/com.go-rotate.zen-gateway.plist"
+
+  # 1) gateway.mjs —— 程序本体放 ~/.local/share/zen-gateway/（应用数据目录，非配置）
+  mkdir -p "$GATEWAY_DIR"
+  fetch_or_copy "zen-gateway/gateway.mjs" "$GATEWAY_DIR/gateway.mjs"
+  [ -x "$GATEWAY_DIR/gateway.mjs" ] || chmod +x "$GATEWAY_DIR/gateway.mjs"
+  ok "gateway  => $GATEWAY_DIR/gateway.mjs"
+
+  # 2) 管理脚本 -> ~/.local/bin/zen-gateway（与 go-rotate CLI 不冲突）
+  mkdir -p "$BIN_DIR"
+  fetch_or_copy "zen-gateway/zen-gateway" "$BIN_DIR/zen-gateway"
+  chmod +x "$BIN_DIR/zen-gateway"
+  ok "管理脚本 => $BIN_DIR/zen-gateway"
+
+  # 3) 生成 LaunchAgent plist（模板占位符 → 真实绝对路径）
+  mkdir -p "$LAUNCH_AGENTS_DIR"
+  local TPL_TMP; TPL_TMP="$(mktemp)"
+  fetch_or_copy "zen-gateway/launchd/com.go-rotate.zen-gateway.plist" "$TPL_TMP"
+  python3 - "$TPL_TMP" "$PLIST_DST" "$NODE_BIN" "$GATEWAY_DIR/gateway.mjs" "$GATEWAY_DIR" "$LOG_PATH" <<'PY'
+import sys
+tpl, dst, node, mjs, gdir, lpath = sys.argv[1:]
+s = open(tpl, encoding="utf-8").read()
+for k, v in [("__NODE_BIN__", node), ("__GATEWAY_MJS__", mjs),
+             ("__GATEWAY_DIR__", gdir), ("__LOG_PATH__", lpath)]:
+    s = s.replace(k, v)
+open(dst, "w", encoding="utf-8").write(s)
+PY
+  rm -f "$TPL_TMP"
+  ok "plist    => $PLIST_DST"
+
+  # 4) 加载 LaunchAgent（新版 bootstrap，回退旧版 load）
+  if launchctl bootstrap "gui/$(id -u)" "$PLIST_DST" 2>/dev/null; then
+    ok "服务已加载（label: com.go-rotate.zen-gateway），开机自启 + 崩溃自动重启"
+  elif launchctl print "gui/$(id -u)/com.go-rotate.zen-gateway" >/dev/null 2>&1; then
+    warn "label 已加载（可能是已安装的旧 plist），未重复 bootstrap。如需重载: zen-gateway restart"
+  elif launchctl load "$PLIST_DST" 2>/dev/null; then
+    ok "服务已加载（label: com.go-rotate.zen-gateway，旧版 load），开机自启 + 崩溃自动重启"
+  else
+    warn "LaunchAgent 加载失败（bootstrap/load 均失败）。请手动检查: launchctl bootstrap gui/\$(id -u) $PLIST_DST"
+  fi
+
+  echo ""
+  echo "  常用命令："
+  echo "    zen-gateway status     # 查看状态"
+  echo "    zen-gateway start      # 启动"
+  echo "    zen-gateway stop       # 停止"
+  echo "    zen-gateway logs -f    # 跟踪日志 (~/Library/Logs/zen-gateway.log)"
+  echo "    zen-gateway uninstall  # 卸载（不动 go-keys.json / auth.json）"
+  echo "  卸载服务：bash install.sh zen-gateway-uninstall"
+  echo ""
+}
+
+uninstall_zen_gateway() {
+  echo ""
+  warn "正在卸载 zen-gateway 服务 ..."
+  local GATEWAY_DIR LAUNCH_AGENTS_DIR PLIST_DST LOG_PATH
+  GATEWAY_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/zen-gateway"
+  LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
+  PLIST_DST="$LAUNCH_AGENTS_DIR/com.go-rotate.zen-gateway.plist"
+  LOG_PATH="$HOME/Library/Logs/zen-gateway.log"
+  local ans=""
+  if [ "${2:-}" != "-y" ]; then
+    printf "确认卸载？（不动 go-keys.json / auth.json）[y/N]: "
+    read -r ans
+  else
+    ans="y"
+  fi
+  if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
+    # 先卸载 launchd 服务
+    launchctl bootout "gui/$(id -u)/com.go-rotate.zen-gateway" 2>/dev/null || true
+    launchctl bootout "gui/$(id -u)" "$PLIST_DST" 2>/dev/null || true
+    launchctl unload "$PLIST_DST" 2>/dev/null || true
+    [ -f "$PLIST_DST" ] && rm -f "$PLIST_DST" && ok "已删除 $PLIST_DST"
+    [ -f "$LOG_PATH" ] && rm -f "$LOG_PATH" && ok "已删除 $LOG_PATH"
+    [ -d "$GATEWAY_DIR" ] && rm -rf "$GATEWAY_DIR" && ok "已删除 $GATEWAY_DIR"
+    [ -f "$BIN_DIR/zen-gateway" ] && rm -f "$BIN_DIR/zen-gateway" && ok "已删除 $BIN_DIR/zen-gateway"
+    ok "zen-gateway 卸载完成。go-keys.json / auth.json 未改动。"
+  else
+    warn "已取消卸载。"
+  fi
+  exit 0
+}
+
+# zen-gateway 子命令分发
+if [ "${1:-}" = "zen-gateway" ] || [ "${1:-}" = "--zen-gateway" ]; then
+  install_zen_gateway
+  exit 0
+fi
+if [ "${1:-}" = "zen-gateway-uninstall" ]; then
+  uninstall_zen_gateway "$@"
+  exit 0
+fi
+
 echo ""
 info "=============================================="
 info " go-rotate · opencode-go 多 key 自动轮换"
@@ -153,7 +262,7 @@ fi
 if [ ! -f "$AUTH_DIR/auth.json" ]; then
   mkdir -p "$AUTH_DIR" 2>/dev/null || true
   printf '{\n  "opencode-go": {\n    "type": "api",\n    "key": ""\n  }\n}\n' > "$AUTH_DIR/auth.json" 2>/dev/null || \
-    warn "无法创建 auth.json（$AUTH_DIR），将由 opencode 首次启动时自动创建。"
+    warn "无法创建 auth.json（ $AUTH_DIR ），将由 opencode 首次启动时自动创建。"
 fi
 
 echo ""

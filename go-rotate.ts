@@ -32,9 +32,11 @@ import {
 } from "node:fs"
 import path from "node:path"
 
+// 测试隔离：bun 的 homedir() 不尊重 $HOME（实测固定返回真实 home），故支持环境变量覆盖。
+// 生产环境不设这两个变量，行为与之前完全一致。
 const DATA_DIR = path.join(homedir(), ".config", "opencode")
-const CONFIG_FILE = path.join(DATA_DIR, "go-keys.json")
-const AUTH_FILE = path.join(homedir(), ".local", "share", "opencode", "auth.json")
+const CONFIG_FILE = process.env.GOROTATE_CONFIG_FILE ?? path.join(DATA_DIR, "go-keys.json")
+const AUTH_FILE = process.env.GOROTATE_AUTH_FILE ?? path.join(homedir(), ".local", "share", "opencode", "auth.json")
 const LOG_FILE = "/tmp/opencode-go-rotate.log"
 const LOCK_FILE = CONFIG_FILE + ".lock"
 // 固定端口用于保证"全系统只启动一个 web"（tui-control 占用 7792-7811，故避开）
@@ -51,6 +53,8 @@ type KeyEntry = {
   name: string
   key: string
   cooldown_until: string | null
+  /** 该 key 的独立冷却窗口（分钟）；缺省回退全局 cfg.cooldown_minutes，再回退 DEFAULT_COOLDOWN_MIN */
+  cooldown_minutes?: number
   /** 最近一次探测/轮换得到的健康状态：ok | invalid | nobalance | limited | error | null */
   last_status?: string | null
 }
@@ -142,13 +146,18 @@ function loadConfig(): Config {
     const keys = (Array.isArray(cfg.keys) ? cfg.keys : []).filter(
       (k: any) => k && typeof k.name === "string" && typeof k.key === "string",
     )
-    return {
+    const out: any = {
       provider_id: cfg.provider_id ?? "opencode-go",
       cooldown_minutes: cfg.cooldown_minutes ?? DEFAULT_COOLDOWN_MIN,
       current: cfg.current ?? "",
       keys,
       auto_web: cfg.auto_web !== false,
     }
+    // 保留其它扩展字段（mutateConfig 往返不能丢自定义顶层字段）
+    for (const k of Object.keys(cfg)) {
+      if (!(k in out)) out[k] = cfg[k]
+    }
+    return out
   } catch (e) {
     log(`loadConfig error: ${(e as Error).message}`)
     return { provider_id: "opencode-go", cooldown_minutes: DEFAULT_COOLDOWN_MIN, current: "", keys: [], auto_web: true }
@@ -193,19 +202,22 @@ function currentKey(cfg: Config): KeyEntry | undefined {
   return cfg.keys.find((k) => k.name === cfg.current) ?? cfg.keys[0]
 }
 
-function cooldownUntilDefault(cfg: Config): string {
-  return new Date(Date.now() + (cfg.cooldown_minutes ?? DEFAULT_COOLDOWN_MIN) * 60_000).toISOString()
+/** 计算冷却到期时间：key 有独立窗口用它的，否则用全局窗口，再回退 DEFAULT_COOLDOWN_MIN */
+function cooldownUntilDefault(cfg: Config, key?: KeyEntry): string {
+  const minutes = key?.cooldown_minutes ?? cfg.cooldown_minutes ?? DEFAULT_COOLDOWN_MIN
+  return new Date(Date.now() + minutes * 60_000).toISOString()
 }
 
 /** 从配额错误消息解析 "reset at <time>"，含时区偏移；解析失败返回 null */
 function parseResetTime(msg: string): string | null {
-  const m = String(msg).match(/reset at\s+(\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}:\d{2}(?:\s*[+-]\d{4})?)/i)
+  // 偏移支持 +0800 / +08:00 / Z；无偏移按本地时区解释（保持既有行为）。
+  // 2026-08-16 修复：旧正则只捕获 [+-]\d{4}，+08:00 与 Z 会被剥离后按本地时区
+  // 解析（非 +8 时区或 Z 后缀会解析错 8 小时），改为显式捕获 Z | ±HH:MM 并原样传给 Date.parse。
+  const m = String(msg).match(
+    /reset at\s+(\d{4}-\d{2}-\d{2})[\sT](\d{2}:\d{2}:\d{2})(?:\s*(Z|[+-]\d{2}:?\d{2}))?/i,
+  )
   if (!m) return null
-  // 优先带偏移；无偏移则按本地时区解释
-  let t = Date.parse(m[1])
-  if (Number.isNaN(t) && !/\+|-/.test(m[1].slice(10))) {
-    t = Date.parse(m[1].replace(" ", "T"))
-  }
+  const t = Date.parse(`${m[1]}T${m[2]}${m[3] ?? ""}`)
   return Number.isNaN(t) ? null : new Date(t).toISOString()
 }
 
@@ -214,7 +226,7 @@ function isQuotaError(err: any): boolean {
   const data = err.data ?? {}
   const msg = String(data.message ?? "").toLowerCase()
   const status = data.statusCode
-  const quotaWords = /quota|insufficient|balance|rate.?limit|usage limit|exceeded/i
+  const quotaWords = /quota|insufficient|balance|rate.?limit|usage limit|exceeded|配额|余额|限流|超出/i
   const quotaStatus = status === 401 || status === 402 || status === 429
   return quotaStatus || quotaWords.test(msg)
 }
@@ -257,7 +269,7 @@ function rotate(errMsg: string, err?: any): Config {
   return mutateConfig((cfg) => {
     const cur = currentKey(cfg)
     if (cur) {
-      cur.cooldown_until = parseResetTime(errMsg) ?? cooldownUntilDefault(cfg)
+      cur.cooldown_until = parseResetTime(errMsg) ?? cooldownUntilDefault(cfg, cur)
       cur.last_status = classifyGoError(errMsg, err?.data?.statusCode)
       log(`⚠️  key "${cur.name}" 配额耗尽（${cur.last_status}），进入冷却 until=${cur.cooldown_until}`)
     }
@@ -349,6 +361,31 @@ function setCooldown(name: string, minutes: number | null): Config {
   })
 }
 
+/** 设置/清除某 key 的独立冷却窗口（分钟）；minutes=null 删除字段，回退全局窗口 */
+function setCooldownWindow(name: string, minutes: number | null): Config {
+  return mutateConfig((cfg) => {
+    const k = cfg.keys.find((x) => x.name === name)
+    if (!k) throw new Error(`key "${name}" 不存在`)
+    if (minutes === null) {
+      delete k.cooldown_minutes
+      log(`🧊  清除 key "${name}" 独立冷却窗口（回退全局 ${cfg.cooldown_minutes} 分钟）`)
+    } else {
+      if (!Number.isInteger(minutes) || minutes <= 0) throw new Error("独立冷却窗口必须是正整数分钟")
+      k.cooldown_minutes = minutes
+      log(`🧊  key "${name}" 独立冷却窗口设为 ${minutes} 分钟`)
+    }
+  })
+}
+
+/** 设置全局冷却窗口（分钟），必须为正整数 */
+function setGlobalCooldown(minutes: number): Config {
+  return mutateConfig((cfg) => {
+    if (!Number.isInteger(minutes) || minutes <= 0) throw new Error("冷却窗口必须是正整数分钟")
+    cfg.cooldown_minutes = minutes
+    log(`🧊  全局冷却窗口设为 ${minutes} 分钟`)
+  })
+}
+
 /* ---------------- 状态视图（给 web/日志用） ---------------- */
 
 function statusPayload() {
@@ -375,6 +412,7 @@ function statusPayload() {
       state,
       remainMin,
       cooldown_until: k.cooldown_until,
+      cooldown_minutes: k.cooldown_minutes ?? null,
       last_status: k.last_status ?? null,
       isCurrent: k.name === cfg.current,
     }
@@ -412,6 +450,64 @@ function clearLog() {
   } catch {
     return false
   }
+}
+
+/* ---------------- 轮换统计（对齐 CLI `go-rotate stats` 正则，纯函数便于测试） ----------------
+ * 注意：只统计主日志文件（/tmp/opencode-go-rotate.log），归档轮转文件不计；
+ * 日志保留窗口有限，统计是「近期」而非全历史（与 CLI stats 一致）。
+ */
+function parseStatsLog(text: string): {
+  totalRotations: number
+  byKey: Record<string, { rotations: number; coolings: number; lastRotate: string | null }>
+} {
+  const byKey: Record<string, { rotations: number; coolings: number; lastRotate: string | null }> = {}
+  let totalRotations = 0
+  const rotRe = /轮换到 key "([^"]+)"/g
+  const coolRe = /key "([^"]+)" 配额耗尽/g
+  const tsRe = /^\[([^\]]+)\]/
+  let m: RegExpExecArray | null
+  rotRe.lastIndex = 0
+  while ((m = rotRe.exec(text))) {
+    const name = m[1]
+    const k = (byKey[name] ??= { rotations: 0, coolings: 0, lastRotate: null })
+    k.rotations++
+    totalRotations++
+    // 时间戳取自匹配所在行的行首 [ISO]
+    const lineStart = text.lastIndexOf("\n", m.index - 1) + 1
+    const lineEnd = text.indexOf("\n", m.index)
+    const line = lineEnd < 0 ? text.slice(lineStart) : text.slice(lineStart, lineEnd)
+    const t = tsRe.exec(line)
+    if (t) k.lastRotate = t[1]
+  }
+  coolRe.lastIndex = 0
+  while ((m = coolRe.exec(text))) {
+    const name = m[1]
+    const k = (byKey[name] ??= { rotations: 0, coolings: 0, lastRotate: null })
+    k.coolings++
+  }
+  return { totalRotations, byKey }
+}
+
+/* ---------------- zen-gateway 跨进程状态（只读，2s 超时，失败优雅降级） ---------------- */
+
+// 生产默认 18888；测试可用 GOROTATE_GATEWAY_BASE 指向不可达端口验证降级
+const GATEWAY_BASE = process.env.GOROTATE_GATEWAY_BASE ?? "http://127.0.0.1:18888"
+
+async function gatewayStatus(): Promise<{
+  running: boolean
+  healthz?: any
+  usage?: any
+  error?: string
+}> {
+  const [h, u] = await Promise.allSettled([
+    fetch(GATEWAY_BASE + "/healthz", { signal: AbortSignal.timeout(2000) }).then((r) => r.json()),
+    fetch(GATEWAY_BASE + "/api/usage", { signal: AbortSignal.timeout(2000) }).then((r) => r.json()),
+  ])
+  const out: any = { running: h.status === "fulfilled" }
+  if (h.status === "fulfilled") out.healthz = h.value
+  if (u.status === "fulfilled") out.usage = u.value
+  if (h.status === "rejected") out.error = String(h.reason?.message ?? h.reason)
+  return out
 }
 
 /* ---------------- 每 key 健康探测 ----------------
@@ -487,6 +583,14 @@ async function handleWeb(req: any): Promise<Response> {
   if (method === "GET" && route === "/api/log") {
     return new Response(logTail(300), { headers: { "content-type": "text/plain; charset=utf-8" } })
   }
+  if (method === "GET" && route === "/api/stats") {
+    let text = ""
+    try {
+      text = existsSync(LOG_FILE) ? readFileSync(LOG_FILE, "utf8") : ""
+    } catch {}
+    return json(parseStatsLog(text))
+  }
+  if (method === "GET" && route === "/api/gateway") return json(await gatewayStatus())
   if (route === "/api/keys/check") {
     return json({ results: await checkAllKeys() })
   }
@@ -515,6 +619,12 @@ async function handleWeb(req: any): Promise<Response> {
         if (route === "/api/current") return setCurrent(String(body.name))
         if (route === "/api/cooldown")
           return setCooldown(String(body.name), body.minutes === null ? null : Number(body.minutes))
+        if (route === "/api/cooldown/window")
+          return setCooldownWindow(
+            String(body.name),
+            body.minutes === null || body.minutes === "" ? null : Number(body.minutes),
+          )
+        if (route === "/api/settings") return setGlobalCooldown(Number(body.cooldown_minutes))
         if (route === "/api/rotate") return manualRotate()
         if (route === "/api/log/clear") return clearLog()
         return null
@@ -690,7 +800,7 @@ const WEB_HTML = `<!doctype html>
     <div class="stats">
       <div class="stat"><div class="v" id="s-current">-</div><div class="l">当前 key</div></div>
       <div class="stat"><div class="v" id="s-avail">-</div><div class="l">可用 &nbsp;<span class="muted" id="s-total"></span></div></div>
-      <div class="stat"><div class="v" id="s-cooldown">-</div><div class="l">冷却窗口(min)</div></div>
+      <div class="stat"><div class="v" id="s-cooldown">-</div><div class="l">冷却窗口(min) <a href="javascript:void(0)" onclick="editGlobalWindow()" style="color:#60a5fa">编辑</a></div></div>
       <div class="stat"><div class="v" id="s-autoweb">-</div><div class="l">Web 自动启动</div></div>
     </div>
     <div class="row" style="margin-top:12px">
@@ -712,8 +822,40 @@ const WEB_HTML = `<!doctype html>
 
   <div class="card">
     <div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between">
+      <b>轮换统计</b>
+      <span class="muted" id="stats-hint">统计自运行日志（近期，非全历史）</span>
+    </div>
+    <div class="stats" style="margin-bottom:8px">
+      <div class="stat"><div class="v" id="st-total">-</div><div class="l">总轮换次数</div></div>
+    </div>
+    <table>
+      <thead><tr><th>Key</th><th>被切到</th><th>进冷却</th><th>最近切换</th></tr></thead>
+      <tbody id="stats-tbody"><tr><td colspan="4" class="muted">加载中…</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="card" id="gateway-card">
+    <div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between">
+      <b>zen-gateway 状态 <span id="gw-badge"></span></b>
+      <span class="muted">127.0.0.1:18888</span>
+    </div>
+    <div class="stats" style="margin-bottom:8px">
+      <div class="stat"><div class="v" id="gw-current">-</div><div class="l">当前 key</div></div>
+      <div class="stat"><div class="v" id="gw-avail">-</div><div class="l">可用</div></div>
+      <div class="stat"><div class="v" id="gw-rot">-</div><div class="l">轮换数</div></div>
+      <div class="stat"><div class="v" id="gw-req">-</div><div class="l">总请求</div></div>
+    </div>
+    <div id="gw-body"><span class="muted">加载中…</span></div>
+  </div>
+
+  <div class="card">
+    <div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
       <b>运行日志</b>
-      <button class="danger" id="clear-log-btn" onclick="clearLog()">清空日志</button>
+      <div class="row" style="flex-wrap:wrap">
+        <label class="muted" style="display:flex;align-items:center;gap:4px"><input type="checkbox" id="log-auto" style="width:auto"> 自动刷新</label>
+        <input id="log-filter" placeholder="过滤关键字（如 key 名 / 轮换 / 冷却）" style="width:200px">
+        <button class="danger" id="clear-log-btn" onclick="clearLog()">清空日志</button>
+      </div>
     </div>
     <pre id="logview"></pre>
   </div>
@@ -770,13 +912,20 @@ async function refresh() {
           (k.state === "cooling"
             ? '<button data-cooldown="' + k.name + '" data-min="0">清除冷却</button>'
             : '<button data-cooldown="' + k.name + '" data-min="' + st.cooldown_minutes + '">冷却</button>') +
+          '<button data-window="' + k.name + '" title="设置该 key 独立冷却窗口（分钟，留空清除回退全局）">窗口</button>' +
+          (k.cooldown_minutes ? '<button data-window-clear="' + k.name + '" title="清除独立窗口，回退全局">清窗</button>' : '') +
           '<button class="danger" data-del="' + k.name + '">删除</button>' +
         '</div></td>'
       tb.appendChild(tr)
     }
     tb.querySelectorAll("[data-set]").forEach(b => b.onclick = () => doOp(() => api("/api/current", { name: b.dataset.set })))
     tb.querySelectorAll("[data-cooldown]").forEach(b => b.onclick = () => doOp(() => api("/api/cooldown", { name: b.dataset.cooldown, minutes: Number(b.dataset.min) })))
-    tb.querySelectorAll("[data-del]").forEach(b => b.onclick = () => doOp(() => api("/api/keys/delete", { name: b.dataset.del })))
+    tb.querySelectorAll("[data-window]").forEach(b => b.onclick = () => editKeyWindow(b.dataset.window))
+    tb.querySelectorAll("[data-window-clear]").forEach(b => b.onclick = () => doOp(() => api("/api/cooldown/window", { name: b.dataset.windowClear, minutes: null })))
+    tb.querySelectorAll("[data-del]").forEach(b => b.onclick = () => {
+      if (!confirm('确定删除 key "' + b.dataset.del + '"？此操作不可恢复。')) return
+      doOp(() => api("/api/keys/delete", { name: b.dataset.del }))
+    })
   } catch (e) { showErr(e.message) }
 }
 async function addKey() {
@@ -822,15 +971,163 @@ async function checkKeys() {
 async function doOp(p) { try { await p(); refresh() } catch (e) { showErr(e.message) } }
 function showErr(m) { const el = document.getElementById("msg"); el.textContent = m; el.className = "msg err"; setTimeout(() => showMsg(""), 3000) }
 function showMsg(m) { const el = document.getElementById("msg"); el.textContent = m; el.className = "msg" }
+
+/* ---- 独立冷却窗口 / 全局窗口编辑 ---- */
+async function editKeyWindow(name) {
+  const v = prompt('设置 key "' + name + '" 的独立冷却窗口（分钟，正整数；留空或取消 = 清除，回退全局窗口）', "")
+  if (v === null) return
+  const minutes = v.trim() === "" ? null : Number(v.trim())
+  try {
+    if (minutes !== null && (!Number.isInteger(minutes) || minutes <= 0)) throw new Error("请输入正整数分钟")
+    await api("/api/cooldown/window", { name, minutes })
+    showMsg(minutes === null ? '已清除 "' + name + '" 独立窗口（回退全局）' : '已设置 "' + name + '" 独立窗口 = ' + minutes + ' 分钟')
+    refresh()
+  } catch (e) { showErr(e.message) }
+}
+async function editGlobalWindow() {
+  const cur = document.getElementById("s-cooldown").textContent
+  const v = prompt("设置全局冷却窗口（分钟，正整数）", cur)
+  if (v === null) return
+  try {
+    const minutes = Number(v.trim())
+    if (!Number.isInteger(minutes) || minutes <= 0) throw new Error("请输入正整数分钟")
+    await api("/api/settings", { cooldown_minutes: minutes })
+    showMsg("全局冷却窗口已设为 " + minutes + " 分钟")
+    refresh()
+  } catch (e) { showErr(e.message) }
+}
+
+/* ---- 轮换统计（/api/stats） ---- */
+async function refreshStats() {
+  try {
+    const st = await api("/api/stats")
+    document.getElementById("st-total").textContent = st.totalRotations
+    const tb = document.getElementById("stats-tbody")
+    const names = Object.keys(st.byKey || {})
+    if (!names.length) { tb.innerHTML = '<tr><td colspan="4" class="muted">暂无轮换记录</td></tr>'; return }
+    tb.innerHTML = ""
+    names.sort().forEach(name => {
+      const k = st.byKey[name]
+      const tr = document.createElement("tr")
+      tr.innerHTML = '<td>' + name + '</td><td>' + k.rotations + '</td><td>' + k.coolings +
+        '</td><td class="muted">' + (k.lastRotate ? new Date(k.lastRotate).toLocaleString() : '-') + '</td>'
+      tb.appendChild(tr)
+    })
+  } catch (e) { document.getElementById("st-total").textContent = "n/a" }
+}
+
+/* ---- zen-gateway 跨进程状态（/api/gateway，失败灰卡降级） ---- */
+async function refreshGateway() {
+  const card = document.getElementById("gateway-card")
+  const badge = document.getElementById("gw-badge")
+  try {
+    const g = await api("/api/gateway")
+    const setDash = () => {
+      document.getElementById("gw-current").textContent = "-"
+      document.getElementById("gw-avail").textContent = "-"
+      document.getElementById("gw-rot").textContent = "-"
+      document.getElementById("gw-req").textContent = "-"
+    }
+    if (!g.running) {
+      card.style.opacity = "0.55"
+      badge.innerHTML = '<span class="badge b-cooling">未运行</span>'
+      setDash()
+      document.getElementById("gw-body").innerHTML =
+        '<span class="muted">zen-gateway 服务未运行' + (g.error ? '（' + g.error + '）' : '') +
+        '。可用 <code>zen-gateway start</code> 启动。</span>'
+      return
+    }
+    card.style.opacity = "1"
+    const h = g.healthz || {}
+    const u = g.usage || {}
+    badge.innerHTML = '<span class="badge b-available">运行中</span>'
+    document.getElementById("gw-current").textContent = h.current || "-"
+    document.getElementById("gw-avail").textContent = (h.available ?? "-") + "/" + (h.keys ?? "-")
+    document.getElementById("gw-rot").textContent = h.rotations ?? "-"
+    document.getElementById("gw-req").textContent = u.totalRequests ?? "-"
+    const pk = u.perKey || {}
+    const names = Object.keys(pk)
+    let html = '<span class="muted">暂无用量记录</span>'
+    if (names.length) {
+      html = '<table><thead><tr><th>Key</th><th>成功</th><th>轮换</th></tr></thead><tbody>'
+      names.sort().forEach(n => {
+        const s = pk[n]
+        html += '<tr><td>' + n + '</td><td>' + (s.success ?? 0) + '</td><td>' + (s.rotated ?? 0) + '</td></tr>'
+      })
+      html += '</tbody></table>'
+    }
+    document.getElementById("gw-body").innerHTML = html
+  } catch (e) {
+    card.style.opacity = "0.55"
+    badge.innerHTML = '<span class="badge b-cooling">未运行</span>'
+    document.getElementById("gw-body").innerHTML = '<span class="muted">获取失败：' + e.message + '</span>'
+  }
+}
+
+/* ---- 日志：自动刷新开关 + 关键字过滤 ---- */
+let logText = ""
 async function refreshLog() {
-  try { const r = await fetch("/api/log"); document.getElementById("logview").textContent = await r.text() } catch {}
+  try {
+    const r = await fetch("/api/log")
+    logText = await r.text()
+    applyLogFilter()
+  } catch {}
+}
+function applyLogFilter() {
+  const kw = document.getElementById("log-filter").value.trim().toLowerCase()
+  document.getElementById("logview").textContent = kw
+    ? (logText.split("\\n").filter(l => l.toLowerCase().includes(kw)).join("\\n") || "(无匹配)")
+    : logText
+}
+let logTimer = null
+function setLogAuto(on) {
+  if (logTimer) { clearInterval(logTimer); logTimer = null }
+  if (on) logTimer = setInterval(refreshLog, 3000)
 }
 async function clearLog() {
   if (!confirm("确认清空日志？")) return
   try { await api("/api/log/clear", {}); refreshLog(); showMsg("日志已清空") }
   catch (e) { showErr(e.message) }
 }
-refresh(); refreshLog(); setInterval(refresh, 5000); setInterval(refreshLog, 8000);
+refresh(); refreshLog(); refreshStats(); refreshGateway();
+setInterval(refresh, 5000);
+setInterval(refreshStats, 10000);
+// gateway 拉取带 2s 超时，独立异步刷新避免阻塞 status 轮询
+setInterval(refreshGateway, 15000);
+document.getElementById("log-auto").onchange = e => { setLogAuto(e.target.checked); if (e.target.checked) refreshLog() }
+document.getElementById("log-filter").oninput = applyLogFilter;
 </script>
 </body>
 </html>`
+
+/* ---------------- 测试导出（2026-08-16 追加，仅命名导出不改变行为；供 tests/go-rotate-plugin.test.ts 使用） ---------------- */
+export {
+  atomicWrite,
+  loadConfig,
+  saveConfig,
+  mutateConfig,
+  withLockSync,
+  cooldownUntilDefault,
+  parseResetTime,
+  pickNext,
+  rotate,
+  manualRotate,
+  isGoError,
+  isQuotaError,
+  classifyGoError,
+  syncAuth,
+  currentKey,
+  reconcileCurrent,
+  statusPayload,
+  logTail,
+  addKey,
+  updateKey,
+  removeKey,
+  setCurrent,
+  setCooldown,
+  setCooldownWindow,
+  setGlobalCooldown,
+  parseStatsLog,
+  gatewayStatus,
+  handleWeb,
+}
