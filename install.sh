@@ -102,6 +102,16 @@ install_zen_gateway() {
   [ -x "$GATEWAY_DIR/gateway.mjs" ] || chmod +x "$GATEWAY_DIR/gateway.mjs"
   ok "gateway  => $GATEWAY_DIR/gateway.mjs"
 
+  # 1.5) 默认网关配置 gateway-config.json（套餐/token，含凭据 0600）
+  #      网关启动走文件配置（env > 文件 > 默认）；已存在则保留用户配置不覆盖
+  if [ ! -f "$GATEWAY_DIR/gateway-config.json" ]; then
+    printf '%s\n' '{"plan":"go"}' > "$GATEWAY_DIR/gateway-config.json"
+    chmod 600 "$GATEWAY_DIR/gateway-config.json"
+    ok "网关配置 => $GATEWAY_DIR/gateway-config.json"
+  else
+    ok "网关配置已存在，跳过: $GATEWAY_DIR/gateway-config.json"
+  fi
+
   # 2) 管理脚本 -> ~/.local/bin/zen-gateway（与 go-rotate CLI 不冲突）
   mkdir -p "$BIN_DIR"
   fetch_or_copy "zen-gateway/zen-gateway" "$BIN_DIR/zen-gateway"
@@ -168,6 +178,7 @@ uninstall_zen_gateway() {
     launchctl unload "$PLIST_DST" 2>/dev/null || true
     [ -f "$PLIST_DST" ] && rm -f "$PLIST_DST" && ok "已删除 $PLIST_DST"
     [ -f "$LOG_PATH" ] && rm -f "$LOG_PATH" && ok "已删除 $LOG_PATH"
+    # gateway-config.json（套餐/token 配置）随网关目录一并删除，rm -rf 已覆盖
     [ -d "$GATEWAY_DIR" ] && rm -rf "$GATEWAY_DIR" && ok "已删除 $GATEWAY_DIR"
     [ -f "$BIN_DIR/zen-gateway" ] && rm -f "$BIN_DIR/zen-gateway" && ok "已删除 $BIN_DIR/zen-gateway"
     ok "zen-gateway 卸载完成。go-keys.json / auth.json 未改动。"

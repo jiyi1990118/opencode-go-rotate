@@ -106,8 +106,9 @@ go-rotate status            # 查看状态
 | `go-rotate check [name]` | 探测 key 健康（可用/无效/余额不足/限流） |
 | `go-rotate stats` | 从日志统计每 key 轮换/冷却次数（近期） |
 | `go-rotate gateway {start\|stop\|restart\|status\|logs [n]}` | 管理 zen-gateway 服务（launchd 常驻，端口 18888） |
+| `go-rotate gateway plan [go\|zen]` | 查看/切换网关套餐（Go 订阅 / Zen 免费档，切换后需 restart） |
+| `go-rotate gateway token [gen\|clear\|set <v>]` | 管理网关访问 token（供其它 agent 连接鉴权，只显示掩码） |
 | `go-rotate uninstall [-y] [--gateway]` | 卸载（`--gateway` 同时卸载网关服务） |
-| `go-rotate uninstall [-y]` | 卸载（删插件、CLI、配置） |
 
 ## 文件
 
@@ -150,3 +151,4 @@ opencode-go 没有公开的额度/余额查询 API，**无法主动查额度**�
 
 - **zen-gateway（`zen-gateway/`）**：把 opencode zen（Go 档 / opencode-go 订阅 key）暴露成标准 OpenAI/Anthropic/Responses 兼容网关，供 claude code / codex / cursor 使用。与 go-rotate **共用 `go-keys.json`** 和自动轮换。见 [`zen-gateway/README.md`](zen-gateway/README.md)，架构设计见 [`docs/zen-gateway-architecture.md`](docs/zen-gateway-architecture.md)。含零依赖工具 `zen-gateway/usage-report.mjs`（用量趋势分析）与 `zen-gateway/tests/run-tests.mjs`（纯逻辑单测，`ZEN_TEST=1 node run-tests.mjs`）。
 - **渐进整合**：go-rotate 与 zen-gateway 已统一管理面——CLI `go-rotate gateway {start|stop|restart|status|logs}` 管理网关服务，`go-rotate status` 汇总网关状态，Web（8899）网关管理卡（启停/重启/模型/日志）直连 18888 只读端点。整合方案见 [`docs/整合设计方案-渐进整合.md`](docs/整合设计方案-渐进整合.md)。
+- **网关管理端**：Web（8899）已可视化管理网关——**go/zen 套餐切换**（Go 订阅 26 模型 / Zen 免费 7 模型）、**网关访问 token 定义**（供 claude code/codex/cursor 等其它 agent 连接鉴权）、启停重启/模型/日志/用量。配置独立存 `~/.local/share/zen-gateway/gateway-config.json`（0600）。设计见 [`docs/网关管理端设计方案.md`](docs/网关管理端设计方案.md)。

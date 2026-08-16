@@ -29,6 +29,7 @@ import {
   utimesSync,
   chmodSync,
   unlinkSync,
+  statSync,
 } from "node:fs"
 import path from "node:path"
 
@@ -45,6 +46,10 @@ const AUTH_FILE = path.join(AUTH_DIR, "auth.json")
 
 process.env.GOROTATE_CONFIG_FILE = CFG_FILE
 process.env.GOROTATE_AUTH_FILE = AUTH_FILE
+// 网关配置隔离：GOROTATE_GATEWAY_CONFIG 指向临时 gateway-config.json（测试写套餐/token
+// 不碰真实 ~/.local/share/zen-gateway/gateway-config.json；import 前设，模块常量固化）
+const GW_CONFIG_FILE = path.join(TMP_ROOT, "zen-gateway", "gateway-config.json")
+process.env.GOROTATE_GATEWAY_CONFIG = GW_CONFIG_FILE
 // 网关管理隔离：GOROTATE_GATEWAY_CTL 指向临时假脚本（真实启停绝不在测试里执行）；
 // GOROTATE_GATEWAY_BASE 指向不可达端口，强制 gatewayStatus/gatewayLog 走降级/回退分支。
 const FAKE_CTL = path.join(TMP_ROOT, "zen-gateway")
@@ -761,5 +766,178 @@ describe("key 健康探测路由（/api/keys/check 仅 POST，防呆）", () => 
     const pj = await pr.json()
     expect(pj.results).toBeDefined()
     expect(Object.keys(pj.results).length).toBe(0)
+  })
+})
+
+/* ================= 网关配置（gateway-config.json：套餐 + token，GOROTATE_GATEWAY_CONFIG 隔离） ================= */
+
+describe("网关配置（gateway-config.json：套餐 + token）", () => {
+  test("genToken 返回 64 hex（0-9a-f）", () => {
+    const t = mod.genToken()
+    expect(t).toMatch(/^[0-9a-f]{64}$/)
+    expect(mod.genToken()).not.toBe(t) // 随机性：两次不同
+  })
+  test("readGatewayConfig 文件缺失回退默认（go / 无 token）", () => {
+    try { unlinkSync(GW_CONFIG_FILE) } catch {}
+    const c = mod.readGatewayConfig()
+    expect(c.plan).toBe("go")
+    expect(c.token).toBeNull()
+    expect(c.token_set_at).toBeNull()
+  })
+  test("writeGatewayConfig 写 plan + 0600 权限 + 无锁残留 + 无 .tmp", () => {
+    const c = mod.writeGatewayConfig({ plan: "zen" })
+    expect(c.plan).toBe("zen")
+    const raw = JSON.parse(readFileSync(GW_CONFIG_FILE, "utf8"))
+    expect(raw.plan).toBe("zen")
+    const st = statSync(GW_CONFIG_FILE)
+    expect(st.mode & 0o777).toBe(0o600) // 敏感凭据文件 0600
+    expect(existsSync(LOCK_FILE)).toBe(false)
+    expect(existsSync(GW_CONFIG_FILE + ".tmp")).toBe(false)
+  })
+  test("writeGatewayConfig token 写入 + token_set_at 记录", () => {
+    const t = mod.genToken()
+    const c = mod.writeGatewayConfig({ token: t })
+    expect(c.token).toBe(t)
+    expect(typeof c.token_set_at).toBe("string")
+    const raw = JSON.parse(readFileSync(GW_CONFIG_FILE, "utf8"))
+    expect(raw.token).toBe(t)
+    expect(typeof raw.token_set_at).toBe("string")
+  })
+  test("writeGatewayConfig 非法 plan 抛异常且锁释放、文件不变", () => {
+    mod.writeGatewayConfig({ plan: "go" })
+    const before = readFileSync(GW_CONFIG_FILE, "utf8")
+    expect(() => mod.writeGatewayConfig({ plan: "turbo" })).toThrow('"go"')
+    expect(readFileSync(GW_CONFIG_FILE, "utf8")).toBe(before)
+    expect(existsSync(LOCK_FILE)).toBe(false)
+  })
+  test("writeGatewayConfig 空 token 抛异常", () => {
+    expect(() => mod.writeGatewayConfig({ token: "" })).toThrow()
+    expect(existsSync(LOCK_FILE)).toBe(false)
+  })
+})
+
+describe("网关配置路由（/api/gateway/plans + /api/gateway/config）", () => {
+  test("GET /api/gateway/plans 返回两档套餐 + current", async () => {
+    mod.writeGatewayConfig({ plan: "zen" })
+    const req = new Request("http://127.0.0.1:8899/api/gateway/plans")
+    const res = await mod.handleWeb(req)
+    expect(res.status).toBe(200)
+    const j = await res.json()
+    expect(j.plans.length).toBe(2)
+    expect(j.plans.map((p: any) => p.id)).toEqual(["go", "zen"])
+    expect(j.plans[0].name).toBe("Go 订阅")
+    expect(j.plans[0].upstreamBase).toBe("https://opencode.ai/zen/go/v1")
+    expect(j.plans[0].defaultModel).toBe("hy3")
+    expect(j.plans[1].defaultModel).toBe("hy3-free")
+    expect(j.current).toBe("zen")
+  })
+  test("POST /api/gateway/config {plan} 写文件 + needsRestart:true + 透传不套统一包装", async () => {
+    const req = new Request("http://127.0.0.1:8899/api/gateway/config", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ plan: "go" }),
+    })
+    const res = await mod.handleWeb(req)
+    expect(res.status).toBe(200)
+    const j = await res.json()
+    expect(j.ok).toBe(true)
+    expect(j.needsRestart).toBe(true)
+    expect(j.status).toBeUndefined() // 网关路由透传 {ok,...}，不套统一包装
+    expect(JSON.parse(readFileSync(GW_CONFIG_FILE, "utf8")).plan).toBe("go")
+  })
+  test("POST {token} 明文落盘 + GET 掩码返回（绝不返回明文）", async () => {
+    const plain = mod.genToken()
+    const p = new Request("http://127.0.0.1:8899/api/gateway/config", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: plain }),
+    })
+    const pr = await mod.handleWeb(p)
+    expect((await pr.json()).needsRestart).toBe(true)
+    expect(JSON.parse(readFileSync(GW_CONFIG_FILE, "utf8")).token).toBe(plain)
+    const g = await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/config"))
+    const gj = await g.json()
+    expect(gj.token).not.toContain(plain)
+    expect(gj.token).toMatch(/^[0-9a-f]{4}\.\.\.[0-9a-f]{4}$/)
+    expect(gj.authEnabled).toBe(true)
+    expect(typeof gj.tokenSetAt).toBe("string")
+  })
+  test("POST {token:null} 清除（关鉴权）", async () => {
+    const p = new Request("http://127.0.0.1:8899/api/gateway/config", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: null }),
+    })
+    const pr = await mod.handleWeb(p)
+    expect((await pr.json()).needsRestart).toBe(true)
+    const g = await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/config"))
+    const gj = await g.json()
+    expect(gj.token).toBeNull()
+    expect(gj.authEnabled).toBe(false)
+  })
+  test("POST 空 body（无 plan/token）→ 400", async () => {
+    const p = new Request("http://127.0.0.1:8899/api/gateway/config", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    })
+    const res = await mod.handleWeb(p)
+    expect(res.status).toBe(400)
+    expect((await res.json()).error).toContain("至少提供")
+  })
+  test("GET /api/gateway/config 无 token → token null + authEnabled false + plan 正确", async () => {
+    mod.writeGatewayConfig({ plan: "zen" })
+    const g = await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/config"))
+    const gj = await g.json()
+    expect(gj.plan).toBe("zen")
+    expect(gj.token).toBeNull()
+    expect(gj.authEnabled).toBe(false)
+    expect(gj.needsRestart).toBe(false)
+  })
+})
+
+describe("WEB_HTML 网关管理区块（主导航 + 套餐卡 + Token 卡）", () => {
+  test("主导航区块（main-nav + 5 区块 id + switchNav）", () => {
+    const html: string = (mod as any).WEB_HTML
+    expect(html).toContain('id="main-nav"')
+    for (const b of ["overview", "keys", "gateway", "stats", "settings"]) {
+      expect(html).toContain('data-nav="' + b + '"')
+      expect(html).toContain('id="nav-' + b + '"')
+    }
+    expect(html).toContain("function switchNav(block)")
+    expect(html).toContain('onclick="switchNav(\'overview\')"')
+  })
+  test("套餐切换卡（gw-plan-card + 单选 + 保存函数 + plans 拉取）", () => {
+    const html: string = (mod as any).WEB_HTML
+    expect(html).toContain('id="gw-plan-card"')
+    expect(html).toContain('id="plan-go"')
+    expect(html).toContain('id="plan-zen"')
+    expect(html).toContain('id="plan-apply"')
+    expect(html).toContain('id="plan-meta"')
+    expect(html).toContain('onclick="saveGatewayPlan()"')
+    expect(html).toContain("async function saveGatewayPlan()")
+    expect(html).toContain('api("/api/gateway/plans")')
+    expect(html).toContain("async function refreshPlans()")
+    expect(html).toContain('api("/api/gateway/restart", {})') // 保存后显式重启
+  })
+  test("Token 管理卡（gw-token-card + 5 操作函数 + 掩码/复制/清除）", () => {
+    const html: string = (mod as any).WEB_HTML
+    expect(html).toContain('id="gw-token-card"')
+    expect(html).toContain('id="token-input"')
+    expect(html).toContain('id="token-badge"')
+    expect(html).toContain('onclick="genGatewayToken()"')
+    expect(html).toContain('onclick="setGatewayToken()"')
+    expect(html).toContain('onclick="copyToken()"')
+    expect(html).toContain('onclick="toggleTokenMask()"')
+    expect(html).toContain('onclick="clearGatewayToken()"')
+    expect(html).toContain("async function refreshGatewayConfig()")
+    expect(html).toContain("async function genGatewayToken()")
+    expect(html).toContain("async function setGatewayToken()")
+    expect(html).toContain("async function clearGatewayToken()")
+    expect(html).toContain("async function copyToken()")
+    expect(html).toContain("function toggleTokenMask()")
+    expect(html).toContain('api("/api/gateway/config"')
+    expect(html).toContain("crypto.getRandomValues") // 浏览器端 64 hex 生成
+    expect(html).toContain("navigator.clipboard.writeText")
   })
 })

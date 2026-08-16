@@ -24,10 +24,14 @@ process.env.ZEN_DEFAULT_MODEL = "hy3" // 固定默认模型（mapModel 断言依
 process.env.ZEN_NOTIFY = "0" // 不弹系统通知
 process.env.ZEN_CONFIG = "/tmp/zen-gateway-unittest-go-keys.json" // 防御：指向临时配置
 process.env.ZEN_USAGE_FILE = "/tmp/zen-gateway-unittest-usage.jsonl"
+process.env.ZEN_GATEWAY_CONFIG = "/tmp/zen-gateway-unittest-gateway-config.json" // 防御：网关配置指向临时（绝不读真实 ~/.local/share/zen-gateway/）
 delete process.env.ZEN_GATEWAY_HOST // 默认 127.0.0.1，避免 S6 拒绝启动
 delete process.env.ZEN_GATEWAY_TOKEN
 delete process.env.ZEN_PROBE_INTERVAL_MIN
 delete process.env.ZEN_UPSTREAM_BASE
+
+// 保证 import 时 ACTIVE_PLAN 为默认 go 档（此前任何测试若残留 zen 配置会污染模块加载态）
+try { rmSync(process.env.ZEN_GATEWAY_CONFIG, { force: true }) } catch {}
 
 let gw
 try {
@@ -1262,6 +1266,160 @@ t("max 参数：getLogRing(5) 只返回最近 5 条", () => {
   const r = gw.getLogRing(5)
   assert.equal(r.lines.length, 5)
   assert.ok(r.lines[4].includes("__RING_TEST_250__"))
+})
+
+/* ================= 17. gateway-config.json 读取 + 套餐/token 解析（Team A 新增） ================= */
+const _gwCfgPath = process.env.ZEN_GATEWAY_CONFIG
+
+group("readGatewayConfig（gateway-config.json 读取容错）")
+
+t("文件缺失 → {}（零迁移回退，老部署兼容）", () => {
+  try { rmSync(_gwCfgPath, { force: true }) } catch {}
+  assert.deepEqual(gw.readGatewayConfig(), {})
+})
+
+t("损坏 JSON → {}（不抛错，回退默认）", () => {
+  writeFileSync(_gwCfgPath, "{ broken json")
+  assert.deepEqual(gw.readGatewayConfig(), {})
+})
+
+t("正常文件 → plan/token/token_set_at 归一返回", () => {
+  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "zen", token: "a".repeat(64), token_set_at: "2026-08-16T00:00:00.000Z" }))
+  const c = gw.readGatewayConfig()
+  assert.equal(c.plan, "zen")
+  assert.equal(c.token, "a".repeat(64))
+  assert.equal(c.token_set_at, "2026-08-16T00:00:00.000Z")
+})
+
+t("token 非字符串（数字/缺失）→ null；token_set_at 非字符串 → null", () => {
+  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "go", token: 12345, token_set_at: 7 }))
+  const c = gw.readGatewayConfig()
+  assert.equal(c.token, null)
+  assert.equal(c.token_set_at, null)
+  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "go" }))
+  assert.equal(gw.readGatewayConfig().token, null)
+})
+
+// 清理临时配置，保持环境干净（ACTIVE_PLAN 已在 import 时固化，不受影响）
+try { rmSync(_gwCfgPath, { force: true }) } catch {}
+
+group("resolvePlan（套餐解析，env > 文件 > 默认）")
+
+t("go 档：upstreamBase=zen/go/v1、默认模型 hy3、builtinModels=ZEN_MODELS(26)", () => {
+  const p = gw.resolvePlan({ plan: "go" }, {})
+  assert.equal(p.id, "go")
+  assert.equal(p.upstreamBase, "https://opencode.ai/zen/go/v1")
+  assert.equal(p.defaultModel, "hy3")
+  assert.equal(p.builtinModels.length, 26)
+  assert.ok(p.builtinModels.includes("hy3"))
+})
+
+t("zen 档：upstreamBase=zen/v1、默认模型 hy3-free、builtinModels=ZEN_MODELS_ZEN(7)", () => {
+  const p = gw.resolvePlan({ plan: "zen" }, {})
+  assert.equal(p.id, "zen")
+  assert.equal(p.upstreamBase, "https://opencode.ai/zen/v1")
+  assert.equal(p.defaultModel, "hy3-free")
+  assert.equal(p.builtinModels.length, 7)
+  assert.ok(p.builtinModels.includes("hy3-free"))
+  assert.ok(p.builtinModels.includes("deepseek-v4-flash-free"))
+})
+
+t("无 config / plan 缺失 / 非法 plan → 回退 go 档", () => {
+  assert.equal(gw.resolvePlan(null, {}).id, "go")
+  assert.equal(gw.resolvePlan({}, {}).id, "go")
+  assert.equal(gw.resolvePlan({ plan: "abc" }, {}).id, "go")
+  assert.equal(gw.resolvePlan({ plan: null }, {}).id, "go")
+})
+
+t("env ZEN_UPSTREAM_BASE / ZEN_DEFAULT_MODEL 优先于文件/默认（go 与 zen 档均生效）", () => {
+  const p = gw.resolvePlan({ plan: "go" }, { ZEN_UPSTREAM_BASE: "http://127.0.0.1:9999/v1", ZEN_DEFAULT_MODEL: "env-model" })
+  assert.equal(p.id, "go")
+  assert.equal(p.upstreamBase, "http://127.0.0.1:9999/v1")
+  assert.equal(p.defaultModel, "env-model")
+  const z = gw.resolvePlan({ plan: "zen" }, { ZEN_DEFAULT_MODEL: "env-model" })
+  assert.equal(z.defaultModel, "env-model")
+  assert.equal(z.upstreamBase, "https://opencode.ai/zen/v1")
+})
+
+t("env 缺省时文件 plan 决定 upstreamBase（zen 档不残留 go 的 base）", () => {
+  const p = gw.resolvePlan({ plan: "zen" }, {})
+  assert.equal(p.upstreamBase, "https://opencode.ai/zen/v1")
+  assert.notEqual(p.upstreamBase, "https://opencode.ai/zen/go/v1")
+})
+
+t("PLANS 表完整性：go/zen 两档各字段齐备且模型表引用正确", () => {
+  const plans = gw.PLANS
+  assert.deepEqual(Object.keys(plans).sort(), ["go", "zen"])
+  assert.equal(plans.go.builtinModels.length, 26)
+  assert.equal(plans.zen.builtinModels.length, 7)
+  assert.notEqual(plans.go.builtinModels, plans.zen.builtinModels)
+  assert.equal(plans.zen.builtinModels, gw.ZEN_MODELS_ZEN)
+  for (const id of ["go", "zen"]) {
+    assert.equal(plans[id].id, id)
+    assert.ok(plans[id].upstreamBase.startsWith("https://opencode.ai/zen"))
+    assert.ok(typeof plans[id].defaultModel === "string" && plans[id].defaultModel)
+  }
+})
+
+group("resolveToken（token 解析，env 优先）")
+
+t("env ZEN_GATEWAY_TOKEN 优先于文件 token", () => {
+  assert.equal(gw.resolveToken({ token: "file-token" }, { ZEN_GATEWAY_TOKEN: "env-token" }), "env-token")
+})
+
+t("env 空串 → 视为未设置（S2 语义），回退文件 token", () => {
+  assert.equal(gw.resolveToken({ token: "file-token" }, { ZEN_GATEWAY_TOKEN: "" }), "file-token")
+})
+
+t("无 env → 文件 token", () => {
+  assert.equal(gw.resolveToken({ token: "file-token" }, {}), "file-token")
+})
+
+t("env 与文件都无 → null（鉴权关闭）", () => {
+  assert.equal(gw.resolveToken({}, {}), null)
+  assert.equal(gw.resolveToken(null, {}), null)
+})
+
+t("文件 token 非字符串（数字/null）→ null", () => {
+  assert.equal(gw.resolveToken({ token: 123 }, {}), null)
+  assert.equal(gw.resolveToken({ token: null }, {}), null)
+})
+
+group("ACTIVE_PLAN / ACTIVE_TOKEN / ZEN_MODELS_ZEN（模块加载固化态）")
+
+t("ACTIVE_PLAN 导出：测试 env 默认 go 档（base=go/v1、defaultModel=hy3、builtinModels=26）", () => {
+  const p = gw.ACTIVE_PLAN
+  assert.equal(p.id, "go")
+  assert.equal(p.upstreamBase, "https://opencode.ai/zen/go/v1")
+  assert.equal(p.defaultModel, "hy3")
+  assert.equal(p.builtinModels.length, 26)
+})
+
+t("ACTIVE_TOKEN 导出：测试 env 未设 token → null", () => {
+  assert.equal(gw.ACTIVE_TOKEN, null)
+})
+
+t("ZEN_MODELS_ZEN 免费档 7 个模型齐全（research §1.1 官方定价表）", () => {
+  const m = gw.ZEN_MODELS_ZEN
+  assert.equal(m.length, 7)
+  for (const id of ["big-pickle", "deepseek-v4-flash-free", "mimo-v2.5-free", "hy3-free", "laguna-s-2.1-free", "nemotron-3-ultra-free", "nemotron-3.5-lightning-free"]) {
+    assert.ok(m.includes(id), `应含 ${id}`)
+  }
+})
+
+group("gatewayStatusSummary 扩展（plan / authEnabled 字段）")
+
+t("status 含 plan='go'（模块默认档）与 authEnabled=false（无 token）", () => {
+  const s = gw.gatewayStatusSummary(_statusCfg)
+  assert.equal(s.plan, "go")
+  assert.equal(s.authEnabled, false)
+})
+
+t("status 的 defaultModel/upstreamBase/modelCount 随 ACTIVE_PLAN（默认 go 档）", () => {
+  const s = gw.gatewayStatusSummary(_statusCfg)
+  assert.equal(s.defaultModel, "hy3")
+  assert.equal(s.upstreamBase, "https://opencode.ai/zen/go/v1")
+  assert.equal(s.modelCount, 26)
 })
 
 /* ================= 汇总 ================= */

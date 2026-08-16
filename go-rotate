@@ -8,7 +8,7 @@ Usage:
   go-rotate init             interactive first-time setup
   go-rotate web              start the web UI standalone (no opencode needed)
   go-rotate web on|off|status  toggle auto-start web on opencode launch (off = no port, rotation still works)
-  go-rotate gateway {start|stop|restart|status|logs [n]}  manage zen-gateway service (launchd LaunchAgent)
+  go-rotate gateway {start|stop|restart|status|logs [n]|plan [go|zen]|token [gen|clear|set <v>]}  manage zen-gateway service (launchd LaunchAgent)
   go-rotate set <name>       switch to a named key (and sync auth.json)
   go-rotate next [minutes]   rotate to next available key (optional cooldown minutes)
   go-rotate add <name> <key> add a key
@@ -24,6 +24,7 @@ Sync target: ~/.local/share/opencode/auth.json -> opencode-go.key
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -43,6 +44,11 @@ try:
     GATEWAY_PORT = int(os.environ.get("ZEN_GATEWAY_PORT") or "18888")
 except ValueError:
     GATEWAY_PORT = 18888
+
+# gateway-config.json：网关运行时配置（plan 套餐 / token 访问凭据），独立于 go-keys.json（低频静态配置 + 凭据隔离 0600）。
+# 环境变量 GOROTATE_GATEWAY_CONFIG 可覆盖路径（测试隔离；生产不设行为不变，与 GOROTATE_CONFIG_FILE/AUTH_FILE 对称）。
+GATEWAY_CONFIG = os.environ.get("GOROTATE_GATEWAY_CONFIG") or os.path.join(
+    os.path.expanduser("~"), ".local", "share", "zen-gateway", "gateway-config.json")
 
 # 与 go-rotate.ts 插件一致的锁参数
 LOCK_FILE = CONFIG_FILE + ".lock"
@@ -491,12 +497,14 @@ def do_stats():
 # 用户域操作：bootstrap gui/$(id -u) <plist> / bootout gui/$(id -u)/<label> / print / kickstart。
 
 GATEWAY_USAGE = (
-    "用法: go-rotate gateway {start|stop|restart|status|logs [行数]}\n"
+    "用法: go-rotate gateway {start|stop|restart|status|logs [行数]|plan [go|zen]|token [gen|clear|set <值>]}\n"
     "  start    幂等启动 zen-gateway 服务（launchd LaunchAgent，已加载则跳过）\n"
     "  stop     停止服务（launchctl bootout）\n"
     "  restart  重启服务（stop + start）\n"
     "  status   查看运行状态（stopped/running/健康检查未通过）+ 端口 + key 数\n"
     "  logs     查看网关日志（默认 ~/Library/Logs/zen-gateway.log，行数默认 100）\n"
+    "  plan     查看当前套餐（无参）或切换 go/zen 套餐（写 gateway-config.json，重启生效）\n"
+    "  token    查看网关 token 掩码（无参）；gen 生成 / clear 清除 / set <值> 设置（重启生效）\n"
 )
 
 
@@ -636,8 +644,109 @@ def _gateway_logs(n_str="100"):
     sys.stdout.write("".join(lines[-n:]))
 
 
+def _gateway_config() -> dict:
+    """读 gateway-config.json（容错：缺失/损坏回退默认 {plan:'go', token:None}）。
+    保留未知扩展字段（向后兼容：将来新增字段不因写 plan/token 丢失）。"""
+    cfg = {"plan": "go", "token": None, "token_set_at": None}
+    try:
+        with open(GATEWAY_CONFIG) as f:
+            data = json.load(f)
+    except Exception:
+        return cfg
+    if not isinstance(data, dict):
+        return cfg
+    cfg.update(data)  # 保留扩展字段（plan/token/token_set_at 由下方归一化覆盖）
+    if data.get("plan") not in ("go", "zen"):
+        cfg["plan"] = "go"
+    if not (isinstance(data.get("token"), str) and data["token"]):
+        cfg["token"] = None
+        cfg["token_set_at"] = None
+    return cfg
+
+
+def _save_gateway_config(cfg: dict):
+    """原子写 gateway-config.json（.tmp + os.replace + 0600，与 go-keys.json save 对齐）。"""
+    d = os.path.dirname(GATEWAY_CONFIG)
+    os.makedirs(d, exist_ok=True)
+    tmp = GATEWAY_CONFIG + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, GATEWAY_CONFIG)
+
+
+def _mask_token(token):
+    """token 掩码（前4****后4，与 go-rotate.ts maskToken 语义一致）；空串返回占位。"""
+    if not token:
+        return "(未设置)"
+    if len(token) <= 8:
+        return "*" * len(token)
+    return f"{token[:4]}****{token[-4:]}"
+
+
+def _gateway_plan(plan=None):
+    """套餐查看/切换：无参读当前（配置缺失显示默认 go + 提示）；go|zen 写配置（调用方持锁）。"""
+    if plan is None:
+        cfg = _gateway_config()
+        print(f"当前套餐: {cfg['plan']}")
+        print(f"配置文件: {GATEWAY_CONFIG}")
+        if not os.path.exists(GATEWAY_CONFIG):
+            print("（配置文件不存在，当前为默认套餐 go）")
+        return
+    if plan not in ("go", "zen"):
+        sys.exit(f"非法套餐: {plan}\n用法: go-rotate gateway plan [go|zen]")
+    cfg = _gateway_config()
+    cfg["plan"] = plan
+    _save_gateway_config(cfg)
+    print(f"套餐已改为 {plan}，需重启网关生效: go-rotate gateway restart")
+
+
+def _gateway_token(action=None, value=None):
+    """网关访问 token 管理：无参查看掩码；gen 生成 64-hex / clear 清除 / set <value> 设置（写配置，调用方持锁）。
+    gen/set 只打印掩码，明文 token 落盘 gateway-config.json（0600，仅本机可读），避免终端/日志泄漏。"""
+    if action is None:
+        cfg = _gateway_config()
+        if cfg.get("token"):
+            print(f"当前 token: {_mask_token(cfg['token'])}")
+            print("（完整 token 见 gateway-config.json，仅本机可读）")
+        else:
+            print("网关 token: 未设置（鉴权关闭）")
+        print("生成: go-rotate gateway token gen")
+        return
+    if action == "gen":
+        token = secrets.token_hex(32)  # 64 hex 字符（0-9a-f），无易混淆字符
+        cfg = _gateway_config()
+        cfg["token"] = token
+        cfg["token_set_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        _save_gateway_config(cfg)
+        print(f"已生成网关 token: {_mask_token(token)}")
+        print(f"完整 token 已写入 {GATEWAY_CONFIG}（0600，仅本机可读）")
+        print("复制完整 token 后配置给其它 agent（curl -H 'Authorization: Bearer <token>'）")
+        print("需重启网关生效: go-rotate gateway restart")
+        return
+    if action == "clear":
+        cfg = _gateway_config()
+        cfg["token"] = None
+        cfg["token_set_at"] = None
+        _save_gateway_config(cfg)
+        print("已清除网关 token（回退无鉴权）")
+        print("需重启网关生效: go-rotate gateway restart")
+        return
+    if action == "set":
+        if not value:
+            sys.exit("用法: go-rotate gateway token set <value>")
+        cfg = _gateway_config()
+        cfg["token"] = value
+        cfg["token_set_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        _save_gateway_config(cfg)
+        print(f"已设置网关 token: {_mask_token(value)}")
+        print("需重启网关生效: go-rotate gateway restart")
+        return
+    sys.exit(f"未知 token 操作: {action}\n用法: go-rotate gateway token [gen|clear|set <value>]")
+
+
 def do_gateway(action, argv=None):
-    """zen-gateway 服务管理：go-rotate gateway {start|stop|restart|status|logs [n]}"""
+    """zen-gateway 服务管理：go-rotate gateway {start|stop|restart|status|logs [n]|plan [go|zen]|token ...}"""
     argv = argv or []
     if action == "start":
         _gateway_start()
@@ -649,6 +758,10 @@ def do_gateway(action, argv=None):
         _gateway_status()
     elif action == "logs":
         _gateway_logs(argv[0] if argv else "100")
+    elif action == "plan":
+        _gateway_plan(argv[0] if argv else None)
+    elif action == "token":
+        _gateway_token(argv[0] if argv else None, argv[1] if len(argv) > 1 else None)
     else:
         print(GATEWAY_USAGE)
         if action is not None:
@@ -683,8 +796,12 @@ def main():
         return
     if cmd == "gateway":
         sub = args[1] if len(args) > 1 else None
-        # start/stop/restart 是启停操作 → 持配置锁（避免与插件轮换并发写配置）；status/logs 只读不锁
+        # 启停 + 写配置（plan go|zen / token gen|clear|set）持配置锁（避免与插件并发写配置）；只读（status/logs/plan 无参/token 无参）不锁
         if sub in ("start", "stop", "restart"):
+            _with_lock(lambda: do_gateway(sub, args[2:]))
+        elif sub == "plan" and len(args) > 2:
+            _with_lock(lambda: do_gateway(sub, args[2:]))
+        elif sub == "token" and len(args) > 2 and args[2] in ("gen", "clear", "set"):
             _with_lock(lambda: do_gateway(sub, args[2:]))
         else:
             do_gateway(sub, args[2:])

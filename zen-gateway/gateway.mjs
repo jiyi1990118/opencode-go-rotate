@@ -19,14 +19,19 @@
  * 环境变量：
  *   ZEN_GATEWAY_PORT    （默认 18888）
  *   ZEN_GATEWAY_HOST    （默认 127.0.0.1，仅本地）
- *   ZEN_GATEWAY_TOKEN   （可选，设置后所有请求需 Authorization: Bearer <token>）
+ *   ZEN_GATEWAY_TOKEN   （可选，设置后所有请求需 Authorization: Bearer <token>；优先级高于 gateway-config.json 的 token）
+ *   ZEN_GATEWAY_CONFIG  （可选，gateway-config.json 路径覆盖，默认 ~/.local/share/zen-gateway/gateway-config.json）
  *   ZEN_CONFIG          （可选，go-keys.json 路径覆盖，默认 ~/.config/opencode/go-keys.json）
  *   ZEN_AUTH_FILE       （可选，auth.json 路径覆盖，默认 ~/.local/share/opencode/auth.json；测试/多实例隔离用）
- *   ZEN_DEFAULT_MODEL   （可选，未知名映射到的模型，默认 hy3）
- *   ZEN_UPSTREAM_BASE   （可选，上游端点覆盖，默认 https://opencode.ai/zen/go/v1）
+ *   ZEN_DEFAULT_MODEL   （可选，未知名映射到的模型，默认随套餐 hy3 / hy3-free）
+ *   ZEN_UPSTREAM_BASE   （可选，上游端点覆盖，默认随套餐 https://opencode.ai/zen/go/v1 / https://opencode.ai/zen/v1）
  *   ZEN_USAGE_FILE      （可选，用量持久化趋势文件覆盖，默认 ~/.local/share/zen-gateway/usage.jsonl）
  *   ZEN_NOTIFY          （可选，"0" 关闭轮换系统通知，默认开（仅 macOS））
  *   ZEN_PROBE_INTERVAL_MIN （可选，主动探测间隔分钟；>0 启用，0 或未设则不启用）
+ *
+ * 套餐（plan）：由 gateway-config.json 的 plan 字段决定（"go" 订阅档默认 / "zen" 免费档），
+ * 优先级 env(ZEN_UPSTREAM_BASE/ZEN_DEFAULT_MODEL/ZEN_GATEWAY_TOKEN) > 文件(plan/token) > 内置默认(go)。
+ * 同一 opencode key 双端点通用，切套餐只需换上游 base + 默认模型 + 内置模型表（hy3 ↔ hy3-free）。
  *
  * 启动：  node gateway.mjs   （Ctrl+C 停止）
  * 后台：  nohup node gateway.mjs >/tmp/zen-gateway.log 2>&1 &
@@ -58,11 +63,13 @@ const AUTH_FILE =
   process.env.ZEN_AUTH_FILE || path.join(os.homedir(), ".local", "share", "opencode", "auth.json")
 const LOCK_FILE = CONFIG_FILE + ".lock"
 const LOG_FILE = "/tmp/opencode-go-rotate.log"
-const UPSTREAM_BASE = process.env.ZEN_UPSTREAM_BASE || "https://opencode.ai/zen/go/v1"
-const GO_API = UPSTREAM_BASE + "/chat/completions"
-const MODELS_API = UPSTREAM_BASE + "/models"
+// 网关配置（套餐 + token）：默认 ~/.local/share/zen-gateway/gateway-config.json，ZEN_GATEWAY_CONFIG env 覆盖。
+// 与 USAGE_FILE 同族（.local 数据目录）；优先级 env(ZEN_*) > 文件(plan/token) > 内置默认(go)。见下方 resolvePlan/resolveToken。
+const GATEWAY_CONFIG =
+  process.env.ZEN_GATEWAY_CONFIG ||
+  path.join(os.homedir(), ".local", "share", "zen-gateway", "gateway-config.json")
+// UPSTREAM_BASE / GO_API / MODELS_API / DEFAULT_MODEL 由 ACTIVE_PLAN 派生（见「套餐表」节），此处不再直接声明。
 const DEFAULT_COOLDOWN_MIN = 300
-const DEFAULT_MODEL = process.env.ZEN_DEFAULT_MODEL || "hy3"
 const LOCK_TIMEOUT_MS = 5000
 const LOCK_STALE_MS = 15000
 const LOG_MAX_BYTES = 1024 * 1024
@@ -421,6 +428,93 @@ const ZEN_MODELS = [
   "qwen3.5-plus", "qwen3.6-plus", "qwen3.7-max", "qwen3.7-plus", "qwen3.8-max",
 ]
 
+// zen 免费档真实可用模型（官方定价表 / docs/zen-model-research.md §1.1 核实，2026-08-16）。
+// 注意：免费名单会变，以 /v1/models 实时返回为准，内置表仅兜底。
+const ZEN_MODELS_ZEN = [
+  "big-pickle",
+  "deepseek-v4-flash-free",
+  "mimo-v2.5-free",
+  "hy3-free",
+  "laguna-s-2.1-free",
+  "nemotron-3-ultra-free",
+  "nemotron-3.5-lightning-free",
+]
+
+/* ---------------- 套餐表 + 网关配置读取（gateway-config.json） ----------------
+ * 优先级（高 → 低）：env(ZEN_UPSTREAM_BASE / ZEN_DEFAULT_MODEL / ZEN_GATEWAY_TOKEN)
+ *   → gateway-config.json 的 plan/token → 内置默认（go 档）。
+ * 同一 opencode key 双端点通用（research §2.1），切套餐只需换上游 base + 默认模型 +
+ * 内置模型表（hy3 ↔ hy3-free），无需换 key。加载时固化一次，变更走「写配置 → 重启」生效。 */
+const PLANS = {
+  go: {
+    id: "go",
+    upstreamBase: "https://opencode.ai/zen/go/v1",
+    defaultModel: "hy3",
+    builtinModels: ZEN_MODELS,
+  },
+  zen: {
+    id: "zen",
+    upstreamBase: "https://opencode.ai/zen/v1",
+    defaultModel: "hy3-free",
+    builtinModels: ZEN_MODELS_ZEN,
+  },
+}
+
+/** 读 gateway-config.json（ZEN_GATEWAY_CONFIG 覆盖路径）。缺失/损坏/非法 → {}（零迁移回退）。
+ *  纯函数：只读文件 + JSON.parse + 字段归一，绝不写文件。 */
+function readGatewayConfig() {
+  try {
+    if (!existsSync(GATEWAY_CONFIG)) return {}
+    const raw = readFileSync(GATEWAY_CONFIG, "utf8")
+    const cfg = JSON.parse(raw)
+    if (!cfg || typeof cfg !== "object") return {}
+    return {
+      plan: cfg.plan,
+      token: typeof cfg.token === "string" && cfg.token ? cfg.token : null,
+      token_set_at: typeof cfg.token_set_at === "string" ? cfg.token_set_at : null,
+    }
+  } catch (e) {
+    log(`⚠️  readGatewayConfig 失败（${GATEWAY_CONFIG}），回退默认: ${e.message}`)
+    return {}
+  }
+}
+
+/** 解析套餐 → ACTIVE_PLAN{id, upstreamBase, defaultModel, builtinModels}。
+ *  config：readGatewayConfig() 的返回值（plan 字段）；env：显式覆盖（缺省 process.env）。
+ *  非法/缺失 plan → 回退 go 档；env 的 ZEN_UPSTREAM_BASE / ZEN_DEFAULT_MODEL 优先于文件/默认。 */
+function resolvePlan(config, env) {
+  env = env || process.env
+  const planId = config && config.plan === "zen" ? "zen" : "go"
+  const p = PLANS[planId]
+  return {
+    id: planId,
+    upstreamBase: env.ZEN_UPSTREAM_BASE || p.upstreamBase,
+    defaultModel: env.ZEN_DEFAULT_MODEL || p.defaultModel,
+    builtinModels: p.builtinModels,
+  }
+}
+
+/** 解析网关访问 token → ACTIVE_TOKEN（string | null）。env ZEN_GATEWAY_TOKEN 优先（向后兼容），
+ *  其次文件 token；空串/缺省 → null（鉴权关闭，与现状一致）。 */
+function resolveToken(config, env) {
+  env = env || process.env
+  const envToken = env.ZEN_GATEWAY_TOKEN
+  if (envToken !== undefined && envToken !== null && envToken !== "") return envToken
+  const fileToken = config && config.token
+  return typeof fileToken === "string" && fileToken ? fileToken : null
+}
+
+// 模块加载时固化当前套餐与 token（变更走重启生效，不做热切换）
+const _GW_CFG = readGatewayConfig()
+const ACTIVE_PLAN = resolvePlan(_GW_CFG, process.env)
+const ACTIVE_TOKEN = resolveToken(_GW_CFG, process.env)
+
+// 由 ACTIVE_PLAN 派生既有常量（保持下游引用不变：upstreamOnce / refreshDynamicModels / mapModel / status 等）
+const UPSTREAM_BASE = ACTIVE_PLAN.upstreamBase
+const GO_API = UPSTREAM_BASE + "/chat/completions"
+const MODELS_API = UPSTREAM_BASE + "/models"
+const DEFAULT_MODEL = ACTIVE_PLAN.defaultModel
+
 // 其它 agent 常请求的模型名 → zen 模型。未命中 → 默认模型。
 // 注意：hy3 是推理模型（会先输出 reason，需要预留 max_tokens 余量）。
 // 工具密集/agentic 场景若想避免推理开销，可把默认映射到非推理模型（如 deepseek-v4-flash）。
@@ -468,21 +562,21 @@ async function refreshDynamicModels() {
     const list = Array.isArray(j?.data) ? j.data.map((m) => m?.id).filter(Boolean) : []
     if (list.length === 0) throw new Error("empty model list")
     ZEN_MODELS_DYNAMIC = list
-    log(`✅  动态模型表更新：上游 ${list.length} 个模型（内置 ${ZEN_MODELS.length} 个兜底）`)
+    log(`✅  动态模型表更新：上游 ${list.length} 个模型（套餐=${ACTIVE_PLAN.id}，内置 ${ACTIVE_PLAN.builtinModels.length} 个兜底）`)
     return list.length
   } catch (e) {
-    log(`⚠️  模型表拉取失败，回退内置 ${ZEN_MODELS.length} 个: ${e.message}`)
+    log(`⚠️  模型表拉取失败，回退内置 ${ACTIVE_PLAN.builtinModels.length} 个（套餐=${ACTIVE_PLAN.id}）: ${e.message}`)
     return 0
   }
 }
 
 function mapModel(requested) {
-  if (!requested) return DEFAULT_MODEL
+  if (!requested) return ACTIVE_PLAN.defaultModel
   const r = String(requested).toLowerCase()
   if (ZEN_MODELS_DYNAMIC.includes(r)) return r               // 动态表（上游最新）
-  if (ZEN_MODELS.includes(r)) return r                      // 内置真实 zen 模型
-  if (MODEL_ALIAASES[r]) return MODEL_ALIAASES[r]           // 已知别名
-  return DEFAULT_MODEL                                      // 未知名 → 默认
+  if (ACTIVE_PLAN.builtinModels.includes(r)) return r        // 内置真实模型（当前套餐）
+  if (MODEL_ALIAASES[r]) return MODEL_ALIAASES[r]            // 已知别名
+  return ACTIVE_PLAN.defaultModel                             // 未知名 → 默认
 }
 
 /* ---------------- Anthropic Messages API 兼容层（claude code 走 /v1/messages） ---------------- */
@@ -933,7 +1027,7 @@ async function sendWithRotation(bodyObj, isStream, clientSignal, endpoint = "cha
 /* ---------------- HTTP 服务 ---------------- */
 
 function gatewayAuth(req) {
-  const token = process.env.ZEN_GATEWAY_TOKEN
+  const token = ACTIVE_TOKEN
   if (!token) return true
   const h = req.headers.authorization || ""
   if (h === `Bearer ${token}`) return true
@@ -1497,7 +1591,7 @@ async function handleResponses(req, res) {
 }
 
 const allModelIds = () =>
-  [...new Set([...ZEN_MODELS_DYNAMIC, ...ZEN_MODELS])].sort()
+  [...new Set([...ZEN_MODELS_DYNAMIC, ...ACTIVE_PLAN.builtinModels])].sort()
 
 const handleModels = (res) =>
   sendJson(res, 200, {
@@ -1512,7 +1606,7 @@ const handleModels = (res) =>
 
 const handleModelsRefresh = async (res) => {
   const n = await refreshDynamicModels()
-  return sendJson(res, 200, { ok: true, dynamic: ZEN_MODELS_DYNAMIC.length, builtin: ZEN_MODELS.length, added: n })
+  return sendJson(res, 200, { ok: true, dynamic: ZEN_MODELS_DYNAMIC.length, builtin: ACTIVE_PLAN.builtinModels.length, added: n })
 }
 
 const handleUsage = (res) => {
@@ -1618,12 +1712,13 @@ async function probeCurrentKey() {
       log(`⏱️  主动探测：无可用 key，跳过`)
       return
     }
+    const probeModel = ACTIVE_PLAN.defaultModel // 探测模型随套餐变（go 档 hy3 / zen 档 hy3-free，research §1.2 别混用）
     const probeBody = JSON.stringify({
-      model: "hy3",
+      model: probeModel,
       max_tokens: 1,
       messages: [{ role: "user", content: "ping" }],
     })
-    log(`⏱️  主动探测 key "${key.name}"（model=hy3 max_tokens=1）...`)
+    log(`⏱️  主动探测 key "${key.name}"（model=${probeModel} max_tokens=1）...`)
     const { res, bodyText } = await upstreamOnce(key.key, probeBody, false, PROBE_TIMEOUT_MS)
     if (res.ok) {
       log(`⏱️  主动探测 key "${key.name}" 正常（status=${res.status}）`)
@@ -1660,12 +1755,11 @@ function startActiveProbe() {
 
 const PORT = Number(process.env.ZEN_GATEWAY_PORT || DEFAULT_PORT)
 const HOST = process.env.ZEN_GATEWAY_HOST || DEFAULT_HOST
-const TOKEN = process.env.ZEN_GATEWAY_TOKEN
 
 // S6：非 loopback 且未设 token → 拒绝启动（避免成为内网开放代理烧配额）。
 // 空串 token 视为未设置（S2 语义）。ZEN_ALLOW_OPEN_NOSEC=1 可显式绕过（有风险）。
 const isLoopback = HOST === "127.0.0.1" || HOST === "localhost" || HOST === "::1" || HOST === "::" || HOST === "0:0:0:0:0:0:0:1"
-if (!isLoopback && !TOKEN && process.env.ZEN_ALLOW_OPEN_NOSEC !== "1") {
+if (!isLoopback && !ACTIVE_TOKEN && process.env.ZEN_ALLOW_OPEN_NOSEC !== "1") {
   const msg =
     `zen-gateway: 拒绝启动 —— HOST=${HOST} 非回环地址且未设置 ZEN_GATEWAY_TOKEN。` +
     `内网开放必须设置鉴权 token，否则任何内网主机都能消耗你的 key 配额。` +
@@ -1686,7 +1780,7 @@ if (!process.env.ZEN_TEST) {
     console.log(`zen-gateway listening on http://${HOST}:${PORT}`)
     console.log(`  POST /v1/chat/completions   POST /v1/messages   POST /v1/responses   GET /v1/models   GET /healthz`)
     console.log(`  default model: ${DEFAULT_MODEL}   keys: ${cfg.keys.length}   current: ${cfg.current}`)
-    if (TOKEN) console.log(`  auth: Bearer ${maskToken(TOKEN)}（已掩码）`)
+    if (ACTIVE_TOKEN) console.log(`  auth: Bearer ${maskToken(ACTIVE_TOKEN)}（已掩码）`)
     else console.log(`  auth: none (仅绑定 ${HOST})`)
     // M3：启动即异步拉取上游模型表（失败静默降级为内置表，不阻塞启动）
     refreshDynamicModels()
@@ -1721,25 +1815,28 @@ process.on("uncaughtException", (err) => {
  * 铁律：绝不返回 key 明文（密钥只存在于 loadConfig 内部，config 摘要仅透出 name/cooldown_until）。 */
 
 /** GET /api/gateway/status 响应组装：网关运行态 + 模型清单（不含任何 key 值）。
- *  running 默认 true（端点能被请求到即网关在跑）；port 默认模块 PORT，可注入便于单测。 */
+ *  running 默认 true（端点能被请求到即网关在跑）；port 默认模块 PORT，可注入便于单测。
+ *  扩展字段：plan（"go"/"zen" 当前套餐）、authEnabled（ACTIVE_TOKEN 非空 = 鉴权开）。 */
 function gatewayStatusSummary(cfg, opts = {}) {
   return {
     running: opts.running !== false,
     version: GATEWAY_VERSION,
     port: opts.port ?? PORT,
-    defaultModel: DEFAULT_MODEL,
-    modelCount: ZEN_MODELS.length,
+    plan: ACTIVE_PLAN.id,
+    defaultModel: ACTIVE_PLAN.defaultModel,
+    authEnabled: !!ACTIVE_TOKEN,
+    modelCount: ACTIVE_PLAN.builtinModels.length,
     keys: Array.isArray(cfg?.keys) ? cfg.keys.length : 0,
     current: cfg?.current ?? "",
     usageFile: USAGE_FILE,
-    upstreamBase: UPSTREAM_BASE,
-    models: [...ZEN_MODELS],
+    upstreamBase: ACTIVE_PLAN.upstreamBase,
+    models: [...ACTIVE_PLAN.builtinModels],
   }
 }
 
-/** GET /api/gateway/models 响应组装：内置模型 + 别名映射（拷贝引用，防调用方污染模块常量）。 */
+/** GET /api/gateway/models 响应组装：内置模型（当前套餐）+ 别名映射（拷贝引用，防调用方污染模块常量）。 */
 function gatewayModelsSummary() {
-  return { models: [...ZEN_MODELS], aliases: { ...MODEL_ALIAASES } }
+  return { models: [...ACTIVE_PLAN.builtinModels], aliases: { ...MODEL_ALIAASES } }
 }
 
 /** GET /api/gateway/config 响应组装：只读配置摘要。keys 仅含 name/cooldown_until（绝不含 key 明文）。
@@ -1877,4 +1974,12 @@ export {
   gatewayConfigSummary,
   gatewayModelsSummary,
   readRawConfig,
+  readGatewayConfig,
+  resolvePlan,
+  resolveToken,
+  ACTIVE_PLAN,
+  ACTIVE_TOKEN,
+  PLANS,
+  GATEWAY_CONFIG,
+  ZEN_MODELS_ZEN,
 }

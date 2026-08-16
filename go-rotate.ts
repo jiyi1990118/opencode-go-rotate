@@ -34,6 +34,8 @@ import path from "node:path"
 // 同步执行管理脚本（zen-gateway start/stop/restart/logs）：管理操作低频，同步调用可被
 // withLockSync 直接包裹（异步 execFile 无法在同步锁内）。bun 兼容 node:child_process。
 import { execFileSync } from "node:child_process"
+// 网关访问 token 生成（crypto.randomBytes(32) → 64 hex）；bun 兼容 node:crypto
+import { randomBytes } from "node:crypto"
 
 // 测试隔离：bun 的 homedir() 不尊重 $HOME（实测固定返回真实 home），故支持环境变量覆盖。
 // 生产环境不设这两个变量，行为与之前完全一致。
@@ -504,6 +506,17 @@ const GATEWAY_BASE = process.env.GOROTATE_GATEWAY_BASE ?? "http://127.0.0.1:1888
 const GATEWAY_CTL = process.env.GOROTATE_GATEWAY_CTL ?? path.join(homedir(), ".local", "bin", "zen-gateway")
 // 管理操作（start 含 15s 健康等待）与日志读取的超时
 const GATEWAY_CTL_TIMEOUT_MS = 20000
+// 网关运行时配置（套餐 + token）：独立文件，与 go-keys.json 职责分离（低频静态配置 + 敏感凭据隔离）。
+// 文件缺失回退默认（go / 无 token）；GOROTATE_GATEWAY_CONFIG 仅供测试隔离覆盖（生产不设行为不变）
+const GATEWAY_CONFIG_FILE =
+  process.env.GOROTATE_GATEWAY_CONFIG ??
+  path.join(homedir(), ".local", "share", "zen-gateway", "gateway-config.json")
+// 套餐元数据（go 订阅 / zen 免费）。modelCount = 内置兜底模型表数量（运行时模型以 /v1/models 为准；
+// 免费名单会变，内置表仅兜底）。同一 opencode key 双端点通用，切换只需换上游 base + 默认模型。
+const GATEWAY_PLANS = [
+  { id: "go", name: "Go 订阅", upstreamBase: "https://opencode.ai/zen/go/v1", defaultModel: "hy3", modelCount: 26 },
+  { id: "zen", name: "Zen 免费", upstreamBase: "https://opencode.ai/zen/v1", defaultModel: "hy3-free", modelCount: 7 },
+]
 
 /** zen-gateway 管理脚本是否存在（区分「未安装」与「已安装未运行」，供前端灰卡/按钮禁用） */
 function gatewayCtlExists(): boolean {
@@ -583,6 +596,83 @@ async function gatewayStatus(): Promise<{
   if (s.status === "fulfilled" && typeof s.value?.version === "string") out.version = s.value.version
   if (h.status === "rejected") out.error = String(h.reason?.message ?? h.reason)
   return out
+}
+
+/* ---------------- 网关配置（gateway-config.json：套餐 + token） ----------------
+ * 独立于 go-keys.json：低频静态配置 + 敏感凭据隔离。写路径走 withLockSync（跨进程锁）
+ * + atomicWrite（tmp+rename）+ 0600；只落盘不重启（重启由前端显式调 /api/gateway/restart，
+ * 职责分离：用户可先改多个配置项再一次性重启）。
+ */
+type GatewayConfig = { plan: string; token: string | null; token_set_at: string | null }
+
+function defaultGatewayConfig(): GatewayConfig {
+  return { plan: "go", token: null, token_set_at: null }
+}
+
+function readGatewayConfig(): GatewayConfig {
+  try {
+    if (!existsSync(GATEWAY_CONFIG_FILE)) return defaultGatewayConfig()
+    const raw = JSON.parse(readFileSync(GATEWAY_CONFIG_FILE, "utf8"))
+    return {
+      plan: raw.plan === "zen" ? "zen" : "go",
+      token: typeof raw.token === "string" && raw.token ? raw.token : null,
+      token_set_at: typeof raw.token_set_at === "string" ? raw.token_set_at : null,
+    }
+  } catch (e) {
+    log(`readGatewayConfig error: ${(e as Error).message}`)
+    return defaultGatewayConfig()
+  }
+}
+
+/** 写网关配置（plan / token 至少给一个；token:null = 清除关鉴权）。返回写后配置。 */
+function writeGatewayConfig(patch: { plan?: string; token?: string | null }): GatewayConfig {
+  return withLockSync<GatewayConfig>(() => {
+    const cfg = readGatewayConfig()
+    if (patch.plan !== undefined) {
+      if (patch.plan !== "go" && patch.plan !== "zen")
+        throw new Error(`plan 必须是 "go" 或 "zen"，收到: ${patch.plan}`)
+      cfg.plan = patch.plan
+    }
+    if (patch.token !== undefined) {
+      if (patch.token !== null && typeof patch.token !== "string")
+        throw new Error("token 必须是字符串或 null（清除）")
+      cfg.token = patch.token === null ? null : patch.token
+      if (cfg.token === "") throw new Error("token 不能为空字符串（清除请传 null）")
+      cfg.token_set_at = new Date().toISOString()
+    }
+    mkdirSync(path.dirname(GATEWAY_CONFIG_FILE), { recursive: true })
+    atomicWrite(GATEWAY_CONFIG_FILE, JSON.stringify(cfg, null, 2), 0o600)
+    return cfg
+  })
+}
+
+/** 掩码 token（前4…后4，复用 maskToken 语义）；空/短串全掩码 */
+function maskGatewayToken(t: string): string {
+  if (!t) return ""
+  if (t.length <= 8) return `${t.slice(0, 2)}...${t.slice(-2)}`
+  return `${t.slice(0, 4)}...${t.slice(-4)}`
+}
+
+/** 生成网关访问 token：crypto.randomBytes(32).toString("hex") = 64 hex */
+function genToken(): string {
+  return randomBytes(32).toString("hex")
+}
+
+/** GET /api/gateway/config 载荷：token 一律掩码返回，绝不返回明文 */
+function gatewayConfigPayload() {
+  const cfg = readGatewayConfig()
+  return {
+    plan: cfg.plan,
+    token: cfg.token ? maskGatewayToken(cfg.token) : null,
+    authEnabled: !!cfg.token,
+    tokenSetAt: cfg.token_set_at,
+    needsRestart: false, // GET 只读；needsRestart:true 仅由 POST 写操作返回
+  }
+}
+
+/** GET /api/gateway/plans 载荷：两档套餐元数据 + 当前套餐 */
+function gatewayPlansPayload() {
+  return { plans: GATEWAY_PLANS, current: readGatewayConfig().plan }
 }
 
 /* ---------------- 每 key 健康探测 ----------------
@@ -667,6 +757,8 @@ async function handleWeb(req: any): Promise<Response> {
   }
   if (method === "GET" && route === "/api/gateway") return json(await gatewayStatus())
   if (method === "GET" && route === "/api/gateway/log") return json(await gatewayLog())
+  if (method === "GET" && route === "/api/gateway/plans") return json(gatewayPlansPayload())
+  if (method === "GET" && route === "/api/gateway/config") return json(gatewayConfigPayload())
   // key 健康探测：仅 POST（GET 会意外触发真实探测消耗配额，防呆 405/404）
   if (method === "POST" && route === "/api/keys/check") {
     return json({ results: await checkAllKeys() })
@@ -712,6 +804,16 @@ async function handleWeb(req: any): Promise<Response> {
         if (route === "/api/gateway/start") return gatewayManage("start")
         if (route === "/api/gateway/stop") return gatewayManage("stop")
         if (route === "/api/gateway/restart") return gatewayManage("restart")
+        // 网关配置（套餐/token）：只写 gateway-config.json 不重启（重启由前端显式调 restart）
+        if (route === "/api/gateway/config") {
+          if (body.plan === undefined && body.token === undefined)
+            throw new Error("至少提供 plan 或 token 之一")
+          writeGatewayConfig({
+            plan: body.plan === undefined ? undefined : String(body.plan),
+            token: body.token === undefined ? undefined : body.token,
+          })
+          return { ok: true, needsRestart: true }
+        }
         return null
       }
       const res = run()
@@ -884,6 +986,10 @@ const WEB_HTML = `<!doctype html>
   pre { background: #0c0e12; border: 1px solid #242a33; border-radius: 8px; padding: 12px; font-size: 12px; overflow: auto; max-height: 260px; color: #9ceba8; }
   .muted { color: #6b7280; font-size: 12px; }
   .gr-tip { cursor: help; border-bottom: 1px dotted #7a8494; }
+  .nav { display: flex; gap: 6px; margin-bottom: 16px; flex-wrap: wrap; }
+  .nav-btn { border-radius: 6px; padding: 6px 14px; }
+  .nav-btn.active { background: #2563eb; border-color: #2563eb; color: #fff; }
+  input[type="radio"] { width: auto; margin-right: 4px; }
 </style>
 </head>
 <body>
@@ -891,6 +997,15 @@ const WEB_HTML = `<!doctype html>
   <h1>go-rotate · opencode-go keys</h1>
   <div class="sub">多 key 自动轮换 · 修改会自动同步到 auth.json 并立即生效</div>
 
+  <div class="nav" id="main-nav">
+    <button class="nav-btn active" data-nav="overview" onclick="switchNav('overview')">概览</button>
+    <button class="nav-btn" data-nav="keys" onclick="switchNav('keys')">Key 管理</button>
+    <button class="nav-btn" data-nav="gateway" onclick="switchNav('gateway')">网关管理</button>
+    <button class="nav-btn" data-nav="stats" onclick="switchNav('stats')">统计</button>
+    <button class="nav-btn" data-nav="settings" onclick="switchNav('settings')">设置</button>
+  </div>
+
+  <div class="block" id="nav-overview">
   <div class="card">
     <div class="stats">
       <div class="stat"><div class="v" id="s-current">-</div><div class="l">当前 key</div></div>
@@ -904,7 +1019,9 @@ const WEB_HTML = `<!doctype html>
       <button id="web-on-btn" onclick="webOn()">开启自动启动</button>
     </div>
   </div>
+  </div>
 
+  <div class="block" id="nav-keys" style="display:none">
   <div class="card">
     <div class="row" style="margin-bottom:10px"><input id="new-name" placeholder="名称，如 act2">&nbsp;<input id="new-key" placeholder="sk-xxxx 完整的 API key"><button class="primary" onclick="addKey()">新增 key</button></div>
     <div class="row" style="margin-bottom:10px"><span class="muted">手动操作：</span><button onclick="rotate()">轮换</button><button onclick="checkKeys()">检测所有 key</button><span class="muted" id="check-hint"></span></div>
@@ -914,7 +1031,9 @@ const WEB_HTML = `<!doctype html>
     </table>
     <div class="msg" id="msg"></div>
   </div>
+  </div>
 
+  <div class="block" id="nav-stats" style="display:none">
   <div class="card">
     <div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between">
       <b>轮换统计</b>
@@ -927,6 +1046,46 @@ const WEB_HTML = `<!doctype html>
       <thead><tr><th>Key</th><th>被切到</th><th>进冷却</th><th>最近切换</th></tr></thead>
       <tbody id="stats-tbody"><tr><td colspan="4" class="muted">加载中…</td></tr></tbody>
     </table>
+  </div>
+
+  <div class="card">
+    <div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+      <b>运行日志</b>
+      <div class="row" style="flex-wrap:wrap">
+        <label class="muted" style="display:flex;align-items:center;gap:4px"><input type="checkbox" id="log-auto" style="width:auto"> 自动刷新</label>
+        <input id="log-filter" placeholder="过滤关键字（如 key 名 / 轮换 / 冷却）" style="width:200px">
+        <button class="danger" id="clear-log-btn" onclick="clearLog()">清空日志</button>
+      </div>
+    </div>
+    <pre id="logview"></pre>
+  </div>
+  </div>
+
+  <div class="block" id="nav-gateway" style="display:none">
+  <div class="card" id="gw-plan-card">
+    <b>上游套餐</b>
+    <div class="row" style="margin-top:10px">
+      <label style="display:flex;align-items:center;gap:4px;margin-right:12px"><input type="radio" name="plan" value="go" id="plan-go"> Go 订阅</label>
+      <label style="display:flex;align-items:center;gap:4px"><input type="radio" name="plan" value="zen" id="plan-zen"> Zen 免费</label>
+      <button id="plan-apply" class="primary" style="margin-left:auto" onclick="saveGatewayPlan()">切换并重启</button>
+    </div>
+    <div class="muted" id="plan-meta" style="margin-top:8px">加载中…</div>
+    <div class="muted" style="margin-top:6px">提示：Zen 免费档数据可能被用于训练，敏感代码请勿使用（个人自用合规）。切换后需重启网关生效。</div>
+    <div id="plan-msg" class="msg" style="margin-top:6px"></div>
+  </div>
+
+  <div class="card" id="gw-token-card">
+    <b>网关访问 Token <span id="token-badge"></span></b>
+    <div class="row" style="margin-top:10px">
+      <input id="token-input" readonly placeholder="未设置（鉴权关闭）" class="mono">
+      <button onclick="genGatewayToken()">生成</button>
+      <button onclick="setGatewayToken()">编辑</button>
+      <button onclick="copyToken()">复制</button>
+      <button onclick="toggleTokenMask()">显示/隐藏</button>
+      <button class="danger" onclick="clearGatewayToken()">清除</button>
+    </div>
+    <div class="muted" style="margin-top:6px">其它 agent 连网关时用此 token（curl -H "Authorization: Bearer &lt;token&gt;"）。生成/编辑后点「显示/隐藏」可看明文。</div>
+    <div id="token-msg" class="msg" style="margin-top:6px"></div>
   </div>
 
   <div class="card" id="gateway-card">
@@ -961,17 +1120,22 @@ const WEB_HTML = `<!doctype html>
     </div>
     <pre id="gwlogview"></pre>
   </div>
+  </div>
 
+  <div class="block" id="nav-settings" style="display:none">
   <div class="card">
-    <div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
-      <b>运行日志</b>
-      <div class="row" style="flex-wrap:wrap">
-        <label class="muted" style="display:flex;align-items:center;gap:4px"><input type="checkbox" id="log-auto" style="width:auto"> 自动刷新</label>
-        <input id="log-filter" placeholder="过滤关键字（如 key 名 / 轮换 / 冷却）" style="width:200px">
-        <button class="danger" id="clear-log-btn" onclick="clearLog()">清空日志</button>
-      </div>
+    <b>设置</b>
+    <div class="row" style="margin-top:10px">
+      <span style="flex:1">全局冷却窗口：<b id="set-cooldown">-</b> 分钟</span>
+      <button onclick="editGlobalWindow()">编辑</button>
     </div>
-    <pre id="logview"></pre>
+    <div class="row" style="margin-top:10px">
+      <span style="flex:1">Web 自动启动：<b id="set-autoweb">-</b></span>
+      <button onclick="webOn()">开启</button>
+      <button class="danger" onclick="webOff()">关闭</button>
+    </div>
+    <div class="muted" style="margin-top:8px">套餐切换与网关 token 见「网关管理」区块；每 key 独立冷却窗口在 Key 表格内联。</div>
+  </div>
   </div>
 </div>
 
@@ -992,6 +1156,8 @@ async function refresh() {
     document.getElementById("s-total").textContent = "total " + st.keyCount
     document.getElementById("s-cooldown").textContent = st.cooldown_minutes
     document.getElementById("s-autoweb").textContent = st.auto_web ? "开启" : "关闭"
+    document.getElementById("set-cooldown").textContent = st.cooldown_minutes
+    document.getElementById("set-autoweb").textContent = st.auto_web ? "开启" : "关闭"
     document.getElementById("web-off-btn").disabled = !st.auto_web
     document.getElementById("web-on-btn").disabled = st.auto_web
     const tb = document.getElementById("tbody")
@@ -1267,6 +1433,126 @@ async function refreshGwLog() {
   }
 }
 
+/* ---- 主导航：区块切换（CSS display，全部区块常驻 DOM 避免重复拉取） ---- */
+function switchNav(block) {
+  document.querySelectorAll(".block").forEach(b => { b.style.display = "none" })
+  document.getElementById("nav-" + block).style.display = "block"
+  document.querySelectorAll(".nav-btn").forEach(b => { b.classList.toggle("active", b.dataset.nav === block) })
+}
+
+/* ---- 网关套餐 / Token（/api/gateway/plans + /api/gateway/config，写后显式调 restart 生效） ---- */
+var gwToken = { masked: "", plain: "", showPlain: false }
+function tokenBadge(on) {
+  document.getElementById("token-badge").innerHTML =
+    on ? '<span class="badge b-running">鉴权开启</span>' : '<span class="badge b-stopped">鉴权关闭</span>'
+}
+async function refreshPlans() {
+  try {
+    const p = await api("/api/gateway/plans")
+    const meta = (p.plans || []).map(x =>
+      x.name + "：" + x.defaultModel + "（" + x.upstreamBase + "，内置 " + x.modelCount + " 模型）").join("  |  ")
+    document.getElementById("plan-meta").textContent = meta || "暂无套餐数据"
+  } catch (e) { document.getElementById("plan-meta").textContent = "套餐信息获取失败：" + e.message }
+}
+async function refreshGatewayConfig() {
+  try {
+    const c = await api("/api/gateway/config")
+    document.getElementById("plan-go").checked = c.plan === "go"
+    document.getElementById("plan-zen").checked = c.plan === "zen"
+    tokenBadge(!!c.authEnabled)
+    gwToken.masked = c.token || ""
+    gwToken.plain = ""   // GET 只返回掩码；明文仅在本次会话生成/编辑后持有
+    gwToken.showPlain = false
+    document.getElementById("token-input").value = c.token ? c.token : "未设置（鉴权关闭）"
+  } catch (e) { showTokenMsg("配置读取失败：" + e.message, true) }
+}
+function showTokenMsg(m, isErr) {
+  const el = document.getElementById("token-msg")
+  el.textContent = m
+  el.className = isErr ? "msg err" : "msg"
+}
+async function saveGatewayPlan() {
+  const plan = document.getElementById("plan-go").checked ? "go" : "zen"
+  const msg = document.getElementById("plan-msg")
+  msg.className = "msg"
+  msg.textContent = "保存套餐 " + plan + " 并重启网关…"
+  try {
+    const r = await api("/api/gateway/config", { plan })
+    // API 只落盘不重启；显式调 restart 生效（复用幂等重启 + 健康等待）
+    if (r.needsRestart) {
+      const rr = await api("/api/gateway/restart", {})
+      msg.textContent = rr.ok
+        ? "已切换 " + (plan === "go" ? "Go 订阅" : "Zen 免费") + " 并重启网关"
+        : "配置已保存，但重启失败：" + (rr.output || "")
+      msg.className = rr.ok ? "msg" : "msg err"
+    }
+    refreshGateway(); refreshPlans(); refreshGatewayConfig()
+  } catch (e) { msg.className = "msg err"; msg.textContent = e.message }
+}
+async function genGatewayToken() {
+  // 浏览器端生成 64 hex（与后端 genToken() 同格式：crypto.randomBytes(32) 等价，hex 全集 0-9a-f）
+  const b = new Uint8Array(32)
+  crypto.getRandomValues(b)
+  const token = Array.from(b, x => x.toString(16).padStart(2, "0")).join("")
+  try {
+    const r = await api("/api/gateway/config", { token })
+    gwToken.plain = token
+    gwToken.masked = token.slice(0, 4) + "..." + token.slice(-4)
+    gwToken.showPlain = false
+    document.getElementById("token-input").value = gwToken.masked
+    tokenBadge(true)
+    showTokenMsg(r.needsRestart ? "Token 已生成并保存（重启网关后生效）" : "Token 已生成")
+  } catch (e) { showTokenMsg(e.message, true) }
+}
+async function setGatewayToken() {
+  const v = prompt("输入新的网关访问 token（64 位 hex；留空取消）", "")
+  if (v === null) return
+  const token = v.trim()
+  if (!token) return showTokenMsg("已取消（token 为空）", true)
+  try {
+    const r = await api("/api/gateway/config", { token })
+    gwToken.plain = token
+    gwToken.masked = token.slice(0, 4) + "..." + token.slice(-4)
+    gwToken.showPlain = false
+    document.getElementById("token-input").value = gwToken.masked
+    tokenBadge(true)
+    showTokenMsg(r.needsRestart ? "Token 已更新（重启网关后生效）" : "Token 已更新")
+  } catch (e) { showTokenMsg(e.message, true) }
+}
+async function clearGatewayToken() {
+  if (!confirm("确定清除网关访问 token（关闭鉴权）？清除后任何本机进程都可直连网关。")) return
+  try {
+    const r = await api("/api/gateway/config", { token: null })
+    gwToken = { masked: "", plain: "", showPlain: false }
+    document.getElementById("token-input").value = "未设置（鉴权关闭）"
+    tokenBadge(false)
+    showTokenMsg(r.needsRestart ? "Token 已清除（重启网关后生效）" : "Token 已清除")
+  } catch (e) { showTokenMsg(e.message, true) }
+}
+async function copyToken() {
+  const val = gwToken.plain || gwToken.masked
+  if (!val || val.indexOf("...") >= 0) return showTokenMsg("请先「显示/隐藏」查看明文后再复制", true)
+  try {
+    await navigator.clipboard.writeText(val)
+    showTokenMsg("已复制到剪贴板")
+  } catch (e) { showTokenMsg("复制失败（浏览器剪贴板权限被拒），请手动复制", true) }
+}
+function toggleTokenMask() {
+  const input = document.getElementById("token-input")
+  if (!gwToken.masked && !gwToken.plain) return showTokenMsg("当前未设置 token", true)
+  gwToken.showPlain = !gwToken.showPlain
+  if (gwToken.showPlain) {
+    if (!gwToken.plain) {
+      // GET 只返回掩码：明文仅在本次会话生成/编辑后可用（设计 §6.2）
+      gwToken.showPlain = false
+      return showTokenMsg("明文不可见（token 由外部设置，当前会话未持有），请重新「生成」或「编辑」后查看", true)
+    }
+    input.value = gwToken.plain
+  } else {
+    input.value = gwToken.masked
+  }
+}
+
 /* ---- 日志：自动刷新开关 + 关键字过滤 ---- */
 let logText = ""
 async function refreshLog() {
@@ -1292,11 +1578,13 @@ async function clearLog() {
   try { await api("/api/log/clear", {}); refreshLog(); showMsg("日志已清空") }
   catch (e) { showErr(e.message) }
 }
-refresh(); refreshLog(); refreshStats(); refreshGateway(); refreshGwLog();
+refresh(); refreshLog(); refreshStats(); refreshGateway(); refreshGwLog(); switchNav("overview");
+refreshPlans(); refreshGatewayConfig();
 setInterval(refresh, 5000);
 setInterval(refreshStats, 10000);
 // gateway 拉取带 2s 超时，独立异步刷新避免阻塞 status 轮询
 setInterval(refreshGateway, 15000);
+setInterval(refreshPlans, 30000);
 document.getElementById("log-auto").onchange = e => { setLogAuto(e.target.checked); if (e.target.checked) refreshLog() }
 document.getElementById("log-filter").oninput = applyLogFilter;
 </script>
@@ -1336,5 +1624,12 @@ export {
   gatewayManage,
   gatewayLog,
   gatewayCtlExists,
+  genToken,
+  readGatewayConfig,
+  writeGatewayConfig,
+  maskGatewayToken,
+  gatewayConfigPayload,
+  gatewayPlansPayload,
+  GATEWAY_PLANS,
   handleWeb,
 }
