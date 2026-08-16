@@ -35,7 +35,7 @@
 | 冷却窗口(min) | **全局**冷却窗口分钟数（`cooldown_minutes`） |
 | Web 自动启动 | `auto_web` 开关状态（开启/关闭） |
 | 关闭 Web（danger） | `confirm` 后调 `/api/web/off`：写 `auto_web=false` + 停止 server（300ms 后），页面提示重新启动方法。轮换功能不受影响 |
-| 开启自动启动 | 调 `/api/web/on`：只写 `auto_web=true`，**不立即重启**，下次 opencode 启动生效 |
+| 开启自动启动 | 调 `/api/web/on`：写 `auto_web=true` **并立即拉起**（若 server 未运行则 `startWeb()`，响应带 `restarted`；已在运行则仅写配置） |
 
 ### 卡片 2：key 管理表
 
@@ -46,8 +46,10 @@
 - **表格列**：名称 / Key（masked，hover 显示完整值）/ 状态（徽章：可用 / 冷却 Xmin / 无效 / 余额不足 / 限流，当前 key 额外「当前」蓝徽章）/ 健康（探测结果 hover 详情）/ 操作。
 - **行内操作按钮**：
   - 启用（非当前 key）→ `/api/current {name}`。
-  - 冷却 / 清除冷却 → `/api/cooldown {name, minutes}`：清除=0；冷却=**全局** `cooldown_minutes`（**不能设每 key 独立窗口**，见基线限制）。
-  - 删除（danger）→ `/api/keys/delete {name}`，**无确认弹窗**（单击即删，注意）。
+  - 冷却 / 清除冷却 → `/api/cooldown {name, minutes}`：清除=0；冷却=**全局** `cooldown_minutes`。
+  - 窗口 / 清窗 → `/api/cooldown/window {name, minutes}`：设置/清除该 key **独立**冷却窗口（留空=清除回退全局）。
+  - **编辑** → 两个 `prompt`（新名称可空=不改、新 key 值可空=不改）→ `POST /api/keys/update {name, patch:{key?,name?}}`；两者都留空则提示不调 API；编辑当前 key 的名称时 `current` 自动跟随（`updateKey` 逻辑）。
+  - 删除（danger）→ `/api/keys/delete {name}`，`confirm` 确认后删除。
 
 ### 卡片 3：运行日志
 
@@ -67,13 +69,13 @@
 | GET | `/api/log` | - | 纯文本 | 日志尾部 300 行 |
 | GET/POST | `/api/keys/check` | -（路由无方法判断，GET 亦可触发） | `{results:{name:{status,detail}}}` | **真实探测所有 key** + 写 `last_status`（消耗 ~1 token/key） |
 | POST | `/api/keys/add` | `{name,key}` | `{ok,health,status}` | 新增并立即探测健康 |
-| POST | `/api/keys/update` | `{name, patch:{key?,name?}}` | `{ok,status}` | 更新 key 值 / 改名（**页面无 UI 入口**，仅 API） |
+| POST | `/api/keys/update` | `{name, patch:{key?,name?}}` | `{ok,status}` | 更新 key 值 / 改名；编辑当前 key 名称时 `current` 跟随 |
 | POST | `/api/keys/delete` | `{name}` | `{ok,status}` | 删除 key |
 | POST | `/api/current` | `{name}` | `{ok,status}` | 设为当前 |
 | POST | `/api/cooldown` | `{name, minutes:number\|null}` | `{ok,status}` | 设置冷却（null/0=清除） |
 | POST | `/api/rotate` | `{}` | `{ok,status}` | 手动轮换 |
 | POST | `/api/web/off` | `{}` | `{ok,shutting_down,auto_web:false}` | `auto_web=false` + 300ms 后停 server |
-| POST | `/api/web/on` | `{}` | `{ok,auto_web:true}` | 仅开自动启动（不立即重启） |
+| POST | `/api/web/on` | `{}` | `{ok,auto_web:true,restarted}` | 开自动启动 + **立即重启**（server 未运行时拉起；`restarted` 表示本次是否真的拉起） |
 | POST | `/api/log/clear` | `{}` | `{ok,status}` | 清空日志 + 删归档 |
 | 其它 | 任意未匹配 | - | 404 `{"error":"not found"}` | POST 处理抛错时 400 `{"error":msg}` |
 
@@ -98,19 +100,19 @@
 ## 6. FAQ
 
 **Q：Web 关了怎么开？**
-三种方式：`go-rotate web`（立即起，当前进程 Ctrl+C 停）；`go-rotate web on` 后重启 opencode（自动起）；或等 opencode 下次启动（若 `auto_web` 未关）。页面关闭后轮换功能不受影响。
+三种方式：`go-rotate web`（立即起，当前进程 Ctrl+C 停）；页面/API 调 `/api/web/on`（写 `auto_web=true` **并立即重启**，无需等 opencode 重启）；`go-rotate web on` 后重启 opencode（自动起）。页面关闭后轮换功能不受影响。
 
 **Q：为什么只启动一个实例 / 端口冲突？**
 `startWeb` 绑定 8899 失败时会请求 `/api/status` 做健康检查：是自家实例就静默跳过（日志「不再重复启动」）；是其它程序则警告且不启动。`go-rotate web` 与 opencode 插件进程同时跑也只会有一个 Web。
 
 **Q：端口被别的程序占了怎么办？**
-当前 `WEB_PORT=8899` 是**代码常量，无环境变量覆盖**（`go-rotate.ts` 顶部）。需改端口则改常量并同步 README / 插件日志提示 / `startWeb` 健康检查三处（见项目 AGENTS.md「边界/易踩的坑」）。可以先用 `lsof -i :8899` 确认占用方。
+默认端口 `8899`，可通过环境变量 **`GOROTATE_WEB_PORT`** 覆盖（`Number(...) || 8899`，非法值回退 8899；生产不设行为不变）——供测试/隔离实例用临时端口验证。需长期改端口仍建议改 `go-rotate.ts` 顶部常量并同步 README / 插件日志提示 / `startWeb` 健康检查三处（见项目 AGENTS.md「边界/易踩的坑」）。可以先用 `lsof -i :8899` 确认占用方。
 
 **Q：能在 Web 上设置每 key 独立冷却窗口吗？**
-**不能**（基线限制）。Web 的「冷却」按钮只使用全局 `cooldown_minutes`；每 key 独立窗口只能通过 CLI `go-rotate cooldown <name> window <min|clear>` 设置。
+可以。key 行内「窗口」按钮 → `prompt` 输入分钟（留空=清除回退全局）→ `POST /api/cooldown/window {name, minutes}`；也可用 CLI `go-rotate cooldown <name> window <min|clear>`。
 
 **Q：Web 上能改 key 值 / 改名吗？**
-API 有 `/api/keys/update`，但**页面没有编辑入口**——需用 CLI 或直接改 `go-keys.json`（改后重载）。基线限制，见下。
+可以。key 行内「编辑」按钮：两个 `prompt` 依次输入新名称（可空=不改）与新 key 值（可空=不改）→ `POST /api/keys/update {name, patch}`；都留空则提示不调 API。编辑当前 key 名称时 `current` 自动跟随。也可以直接用 CLI 或改 `go-keys.json`。
 
 **Q：Web 与 CLI 会不会打架？**
 不会。同一把跨进程文件锁 + 原子写，60 个并行写命令实测 JSON 无损、无锁残留（AGENTS.md 记录）。
@@ -183,7 +185,7 @@ JS: refresh() 5s 轮询 /api/status；refreshLog() 8s 轮询 /api/log
 | — | 日志固定 8s 轮询 | ✅ 「自动刷新」开关（默认关，开则 3s 轮询）+「过滤关键字」输入框（前端过滤已拉取日志，不重新请求） |
 | — | — | ✅ 轮询策略：`refresh()` 5s status；`refreshStats()` 10s；`refreshGateway()` 15s（gateway 带 2s 超时，独立异步不阻塞 status 轮询） |
 
-未解决（有意保留，非本任务范围）：#2 key 编辑 UI、#5 鉴权、#6 端口 env 覆盖（新增 `GOROTATE_GATEWAY_BASE` 仅用于测试降级）、#7 check 非纯只读、#8 web/on 不立即重启、#9 provider_id 编辑、#10 相对时间。
+本会话解决：**#2 key 编辑 UI、#6 端口 env 覆盖（`GOROTATE_WEB_PORT`）、#8 `/api/web/on` 立即重启** —— 见 §9「收尾三件套」。未解决（有意保留，非本任务范围）：#5 鉴权、#7 check 非纯只读、#9 provider_id 编辑、#10 相对时间。
 
 ### 8.2 新增 API（向后兼容，既有 API 未动）
 
@@ -245,3 +247,57 @@ JS: refresh() 5s 轮询 /api/status；refreshLog() 8s 轮询 /api/log
 
 - `GOROTATE_GATEWAY_BASE`：覆盖 gateway 探测地址（默认 `http://127.0.0.1:18888`），**仅供测试**（指向不可达端口验证降级）；生产不设行为不变。
 - 既有 `GOROTATE_CONFIG_FILE` / `GOROTATE_AUTH_FILE`（插件测试隔离）继续有效。
+
+## 9. 收尾三件套（2026-08-16 本会话交付）
+
+> 对照 §7.4 基线限制：**⑥ 端口硬编码 → `GOROTATE_WEB_PORT` env 覆盖；⑧ `/api/web/on` 不立即重启 → 立即拉起 + `restarted`；② 无 key 编辑 UI → 行内「编辑」按钮**。仅改 `go-rotate.ts` + `tests/go-rotate-plugin.test.ts` + 本文档；未碰 `zen-gateway/gateway.mjs` / `go-rotate` / `install.sh`。
+
+### 9.1 改动清单（go-rotate.ts）
+
+| 改动 | 位置 | 说明 |
+|---|---|---|
+| `WEB_PORT = Number(process.env.GOROTATE_WEB_PORT) \|\| 8899` | 顶部常量 | 测试/隔离实例覆盖端口；非法值回退 8899；生产不设行为不变；`WEB_BASE` 同步跟随 |
+| `/api/web/on` 立即重启 | `handleWeb` 路由 | `setAutoWeb(true)` + `!webStarted` 时 `await startWeb()`；返回 `{ok, auto_web:true, restarted}`（`restarted = 本次真的拉起`）；端口被其它实例占用时 `startWeb` 内部健康检查不重复启动 |
+| key 行内「编辑」按钮 | `WEB_HTML` 表格 | `data-edit` 按钮 → `editKey(name)`：两个 `prompt`（新名称/新 key 值，可空=不改）→ 双空提示不调 API → `POST /api/keys/update {name, patch}` |
+| `webOn()` 展示 restarted | `WEB_HTML` JS | `r.restarted ? "Web 已重新启动（立即生效）" : "已开启 Web 自动启动"` |
+| 导出 `WEB_HTML` | 测试导出块 | 供单测断言 UI 内容（仅命名导出，不改变行为） |
+
+### 9.2 验证矩阵（真实执行）
+
+**A. 静态检查**
+
+| # | 检查 | 结果 |
+|---|---|---|
+| 1 | `bun build go-rotate.ts` | **PASS**（exit 0） |
+| 2 | 内嵌 JS 语法（提取 `<script>` → `node --check`） | **PASS**（12120 bytes，exit 0） |
+| 3 | 插件单测 `bun test tests/go-rotate-plugin.test.ts` | **PASS** **65 → 66 用例**（新增 1 条「WEB_HTML 含 key 编辑 UI」，172 expect） |
+
+**B. 隔离实例 E2E（`GOROTATE_CONFIG_FILE/GOROTATE_AUTH_FILE` → `/tmp/gr-e2e/`，2 假 key，`GOROTATE_WEB_PORT=18998`，`GOROTATE_GATEWAY_BASE=59999` 降级）**
+
+| # | 步骤 | 结果（真实输出） |
+|---|---|---|
+| 1 | 导入插件 + `GoRotate()`（config `auto_web:false` → 不绑定） | ✅ 无绑定 |
+| 2 | 进程内 `handleWeb` `POST /api/web/on` | ✅ `200 {"ok":true,"auto_web":true,"restarted":true}` |
+| 3 | 再次 `POST /api/web/on`（已在运行） | ✅ `200 {"ok":true,"auto_web":true,"restarted":false}` |
+| 4 | 进程内 fetch `http://127.0.0.1:18998/api/status` | ✅ `keyCount=2 current=a auto_web=true`（**证明端口 env 覆盖生效**：若未生效会尝试 8899 被真实实例占用而失败） |
+| 5 | curl `GET /` | ✅ 含 `data-edit="`、`function editKey`、`api("/api/keys/update", { name, patch })`、`未修改：名称与 key 值均为空` |
+| 6 | curl `POST /api/keys/update` 改名 a→a2 + 改 key | ✅ `{"ok":true,...}` → status `current=a2`、keys `[('a2','sk-aaa2…aaa2',True),('b','sk-bbb…-bbb',False)]`（**当前 key 改名跟随**） |
+| 7 | curl `POST /api/keys/update` 仅改 key（a2→sk-aaa3） | ✅ masked `sk-aaa3…aaa3` |
+| 8 | curl `POST /api/keys/update` 改名 b→b2（非当前） | ✅ keys `[('a2',...),('b2',...)]`、current 仍 a2 |
+| 9 | curl `POST /api/keys/update` 不存在 key | ✅ **400** |
+| 10 | 进程内 `POST /api/web/off` → 等 600ms → `POST /api/web/on`（**先停后开**） | ✅ `OFF 200 {"ok":true,"shutting_down":true,"auto_web":false}` → `ON2 200 {"ok":true,"auto_web":true,"restarted":true}` |
+| 11 | 重启后进程内 fetch `/api/status` | ✅ `REBOUND status keyCount=2 current=a2 auto_web=true`（server 重新绑定） |
+
+**C. 隔离铁证**
+
+- 真实 `~/.config/opencode/go-keys.json` md5：**`ae596e0e0a880bdb0f8c4c8ad1f2393e`（前后一致）**。
+- 真实 `~/.local/share/opencode/auth.json` md5：**`e4e9a727d22bc1535129f1b62fc9237c`（前后一致）**。
+- 真实 8899 未碰（`lsof -i :8899` → opencode 20126 LISTEN，未杀未动）；临时文件 `/tmp/gr-e2e/` 测后已清理；e2e 进程无残留。
+
+### 9.3 设计取舍与遗留
+
+- **`/api/web/on` 的 `restarted` 语义**：以进程内 `webStarted` 为准（server 已跑 → `false` 仅写配置；未跑 → `startWeb()` 拉起 → `true`）。端口被其它实例占用的边界复用 `startWeb` 既有健康检查（记录日志不重复起）。
+- **HTTP 路径下「先停后开」的真实可达性**：`/api/web/off` 会停掉页面所在 server，客户端无法再 POST `/api/web/on`（300ms 窗口竞态不可靠）；故 `restarted:true` 的完整路径（停→开）在隔离实例内以进程内 `handleWeb` 验证（E2E #10/#11），真实场景中「页面关闭后再开」走 `go-rotate web` / opencode 重启。
+- **UI 编辑采用双 `prompt`**（非行内表单）：与既有「窗口/清窗」交互风格一致，零新 DOM/样式；编辑当前 key 名称时 `current` 跟随由后端 `updateKey` 已有逻辑保证（E2E #6 验证）。
+- **单测新增 1 条**（65→66）：仅断言 `WEB_HTML` 内容（纯读、不 bind 端口、不触发网络），保持「不实际 bind 8899」铁律；`GOROTATE_WEB_PORT` 生效性由 E2E #4 真实验证。
+- 遗留（非阻塞）：`GOROTATE_WEB_PORT` 与 AGENTS.md「改端口记得同步 README 和 web 提示」约定——README 默认端口 8899 不变无需改；页面 JS 无内嵌端口提示（端口由启动端决定）。

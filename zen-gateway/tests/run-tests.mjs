@@ -14,7 +14,9 @@
  * 断言并在 docs/测试报告-zen-gateway.md 记录为发现项，不改生产实现。
  */
 import assert from "node:assert"
-import { writeFileSync } from "node:fs"
+import os from "node:os"
+import path from "node:path"
+import { writeFileSync, readFileSync, existsSync, mkdirSync, rmSync } from "node:fs"
 
 /* ---- 测试前固定环境，保证断言确定性、绝不触碰真实配置/服务 ---- */
 process.env.ZEN_TEST = "1" // 跳过 listen（网关不启动）
@@ -966,6 +968,130 @@ t("readUsageFile：正常文件 → 按行拆分（含空行保留给 aggregateU
   assert.equal(r.total, TREND_VALID_7D)
   assert.equal(r.badLines, 2)
 })
+
+/* ================= ZEN_AUTH_FILE 隔离（auth.json 绝不落真实路径） ================= */
+/* 铁律：本组只操作「临时 auth.json」；对真实 ~/.local/share/opencode/auth.json 仅做只读
+ * 快照 + 字节对比（绝不在本组内写入真实 auth.json）。
+ * 主 import（gw）在未设 ZEN_AUTH_FILE 时加载 → 其 AUTH_FILE 指向真实路径，仅用于字符串断言。
+ * 设 env 的实例用查询串强制重新执行模块顶层（fresh 实例），模拟「import 前设 env」。 */
+group("ZEN_AUTH_FILE 隔离（auth.json 绝不落真实路径）")
+
+const realAuthPath = path.join(os.homedir(), ".local", "share", "opencode", "auth.json")
+const realAuthBefore = existsSync(realAuthPath) ? readFileSync(realAuthPath, "utf8") : null
+const zauthTmp = path.join("/tmp", `gr-zauth-${Date.now()}-${Math.floor(Math.random() * 1e6)}`)
+mkdirSync(zauthTmp, { recursive: true })
+
+t("不设 ZEN_AUTH_FILE 时 AUTH_FILE 指向真实路径（仅字符串断言，不实际写）", () => {
+  assert.ok(gw.AUTH_FILE.includes(os.homedir()), `应包含 homedir，实际: ${gw.AUTH_FILE}`)
+  assert.ok(
+    gw.AUTH_FILE.endsWith(path.join(".local", "share", "opencode", "auth.json")),
+    `应以 .local/share/opencode/auth.json 结尾，实际: ${gw.AUTH_FILE}`,
+  )
+})
+
+// fresh 实例：先设 env 再 import（查询串绕过 ESM 缓存，重新执行模块顶层常量）
+process.env.ZEN_AUTH_FILE = path.join(zauthTmp, "auth.json")
+let gwA = null
+try {
+  gwA = await import("../gateway.mjs?zauth-isolation=1")
+} catch (e) {
+  failures.push({ group: currentGroup, name: "fresh import（ZEN_AUTH_FILE 已设）", error: e })
+  console.log(`  ❌ fresh import（ZEN_AUTH_FILE 已设）: ${String((e && e.message) || e)}`)
+}
+
+t("设 ZEN_AUTH_FILE 后（import 前）AUTH_FILE 指向临时路径", () => {
+  assert.ok(gwA, "fresh 实例应可加载")
+  assert.equal(gwA.AUTH_FILE, process.env.ZEN_AUTH_FILE)
+})
+
+t("syncAuth 写临时 auth.json，真实 auth.json 字节不变", () => {
+  assert.ok(gwA, "fresh 实例应可加载")
+  const fake = "sk-fake-zauth-" + Date.now()
+  gwA.syncAuth(fake)
+  const written = JSON.parse(readFileSync(gwA.AUTH_FILE, "utf8"))
+  assert.equal(written["opencode-go"].key, fake)
+  const realAfter = existsSync(realAuthPath) ? readFileSync(realAuthPath, "utf8") : null
+  assert.equal(realAfter, realAuthBefore, "真实 auth.json 必须字节不变")
+})
+
+t("syncAuth 保留既有 opencode-go 结构并更新 key，其它字段不动", () => {
+  assert.ok(gwA, "fresh 实例应可加载")
+  writeFileSync(
+    gwA.AUTH_FILE,
+    JSON.stringify(
+      { "opencode-go": { type: "api", key: "old-key" }, "other-provider": { key: "keep-me" } },
+      null,
+      2,
+    ),
+  )
+  gwA.syncAuth("new-key-2")
+  const data = JSON.parse(readFileSync(gwA.AUTH_FILE, "utf8"))
+  assert.deepEqual(data["opencode-go"], { type: "api", key: "new-key-2" })
+  assert.deepEqual(data["other-provider"], { key: "keep-me" })
+})
+
+t("syncAuth 容错：auth.json 损坏 → 静默失败不抛错、文件原样保留（当前实现实际行为）", () => {
+  assert.ok(gwA, "fresh 实例应可加载")
+  writeFileSync(gwA.AUTH_FILE, "{ this is not valid json")
+  assert.doesNotThrow(() => gwA.syncAuth("should-not-write"))
+  assert.equal(readFileSync(gwA.AUTH_FILE, "utf8"), "{ this is not valid json")
+})
+
+/* rotate() 是 async，同步 harness 的 t() 无法 await → 在 t() 外手动执行并计数（保证汇总准确） */
+{
+  let ok = true
+  let err = null
+  try {
+    const cfgPath = process.env.ZEN_CONFIG
+    writeFileSync(
+      cfgPath,
+      JSON.stringify(
+        {
+          provider_id: "opencode-go",
+          current: "bad",
+          keys: [
+            { name: "bad", key: "sk-fake-bad" },
+            { name: "good", key: "sk-fake-good" },
+          ],
+        },
+        null,
+        2,
+      ),
+    )
+    // 预置临时 auth.json 为「旧 key 内容」，验证 rotate 会覆盖为轮换后的新 key
+    writeFileSync(gwA.AUTH_FILE, JSON.stringify({ "opencode-go": { type: "api", key: "sk-old-before-rotate" } }, null, 2))
+    const cfg2 = await gwA.rotate(
+      { error: { message: "quota exceeded, reset at 2026-08-16 08:00:00 +0800 CST" } },
+      429,
+      "bad",
+    )
+    assert.equal(cfg2.current, "good")
+    const savedCfg = JSON.parse(readFileSync(cfgPath, "utf8"))
+    assert.equal(savedCfg.current, "good")
+    assert.equal(savedCfg.keys[0].cooldown_until, "2026-08-16T00:00:00.000Z")
+    const authAfter = JSON.parse(readFileSync(gwA.AUTH_FILE, "utf8"))
+    assert.equal(authAfter["opencode-go"].key, "sk-fake-good")
+    const realAfter = existsSync(realAuthPath) ? readFileSync(realAuthPath, "utf8") : null
+    assert.equal(realAfter, realAuthBefore, "真实 auth.json 必须字节不变")
+  } catch (e) {
+    ok = false
+    err = e
+  }
+  const name = "rotate() 全链路隔离：假 key 429 → 临时 config 切换 + 临时 auth 更新 + 真实 auth 字节不变"
+  if (ok) {
+    passed++
+    groups[groups.length - 1].count++
+    console.log(`  ✅ ${name}`)
+  } else {
+    failures.push({ group: currentGroup, name, error: err })
+    console.log(`  ❌ ${name}\n     ${String((err && err.message) || err).split("\n").join("\n     ")}`)
+  }
+}
+
+delete process.env.ZEN_AUTH_FILE // 清理：本组为最后一组，避免 env 残留
+try {
+  rmSync(zauthTmp, { recursive: true, force: true })
+} catch {}
 
 /* ================= 汇总 ================= */
 console.log(`\n${"=".repeat(64)}`)

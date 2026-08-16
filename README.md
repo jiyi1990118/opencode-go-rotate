@@ -13,12 +13,15 @@ opencode 的 opencode-go 多 key 自动轮换插件 + Web 管理界面。
 - ✅ 自动轮换：配额耗尽自动切换下一个 key
 - ✅ 免重启：热切换，当前会话不丢
 - ✅ 冷却机制：按滚动窗口让用尽的 key 冷却（可解析错误里的 reset 时间）
-- ✅ Web 管理界面：`http://localhost:8899` 增删/切换 key（全系统只启动一个）
+- ✅ Web 管理界面：`http://localhost:8899` 增删/切换/编辑 key（全系统只启动一个）
 - ✅ Web 支持**每 key 独立冷却窗口**（行内「窗口/清窗」按钮）与**全局窗口编辑**
 - ✅ Web **轮换统计卡片**（从日志解析每 key 轮换/冷却次数）与 **zen-gateway 状态卡片**（跨进程展示 18888 服务与每 key 用量，未运行时灰卡降级）
 - ✅ Web **删除 key 确认弹窗**、日志**自动刷新开关 + 关键字过滤**
+- ✅ Web **key 行内编辑**（双 prompt 改名称/key，当前 key 改名 current 自动跟随）
+- ✅ Web **`/api/web/on` 立即重启**（server 未运行即拉起并返回 `restarted`），支持 `GOROTATE_WEB_PORT` env 覆盖端口（隔离实例/测试用）
 - ✅ 并发安全：跨进程文件锁 + 原子写
 - ✅ 零依赖：插件用 Node 内置模块，CLI 用纯 Python
+- ✅ 测试体系：插件单测（`bun test tests/`）、CLI 单测（`python3 tests/test-go-rotate-cli.py`）、gateway 单测（`ZEN_TEST=1 node zen-gateway/tests/run-tests.mjs`）
 
 ## 安装
 
@@ -82,6 +85,7 @@ go-rotate status            # 查看状态
 > 或 `go-rotate web on` 恢复自动启动。
 
 > 📖 **Web 界面完整使用文档**（页面布局 / API 速查表 / 安全说明 / FAQ / 增强前基线 / **Web 增强**）：[`docs/Web界面使用.md`](docs/Web界面使用.md)
+> 📊 **Web 增强后回归**（基线十条逐项对比 + API 回归矩阵）：[`docs/Web增强后回归.md`](docs/Web增强后回归.md)
 
 ## CLI 命令
 
@@ -112,18 +116,13 @@ go-rotate status            # 查看状态
 ## 卸载
 
 ```bash
-rm -f ~/.config/opencode/plugins/go-rotate.ts ~/.local/bin/go-rotate
-# 可选：删除配置
-rm -f ~/.config/opencode/go-keys.json
-```
-
-## 卸载
-
-```bash
 go-rotate uninstall            # 交互确认
 go-rotate uninstall -y         # 跳过确认
 # 或
 bash install.sh uninstall      # 通过安装脚本卸载（-y 跳过确认）
+# 手动方式：
+rm -f ~/.config/opencode/plugins/go-rotate.ts ~/.local/bin/go-rotate
+rm -f ~/.config/opencode/go-keys.json   # 可选：删除配置
 ```
 
 会删除：插件、CLI、`go-keys.json` 配置。**不会**改动 `auth.json`（保留你的 opencode-go 凭据）。

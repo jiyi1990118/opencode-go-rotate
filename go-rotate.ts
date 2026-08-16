@@ -7,13 +7,13 @@
  *   - event：监听 session.error，当 opencode-go 配额耗尽 / 401 / 402 / 429 时自动轮换
  *   - 冷却：按滚动窗口让用尽的 key 冷却（默认 300 分钟，可从错误消息解析 reset 时间）
  *   - 持久化：状态写入 go-keys.json，并同步写 auth.json，保证其它路径 / 重启后一致
- *   - Web UI：http://localhost:7793 动态配置 key（只启动一个实例，多 TUI 进程不会重复启动）
+ *   - Web UI：http://localhost:8899 动态配置 key（只启动一个实例，多 TUI 进程不会重复启动）
  *   - 并发安全：所有配置写入走跨进程文件锁 + 原子写（tmp+rename）
  *
  * 安装：~/.config/opencode/plugins/go-rotate.ts（自动加载）
  * 配置：~/.config/opencode/go-keys.json
  * 日志：/tmp/opencode-go-rotate.log
- * Web： http://localhost:7793
+ * Web： http://localhost:8899
  */
 import {
   homedir,
@@ -40,7 +40,8 @@ const AUTH_FILE = process.env.GOROTATE_AUTH_FILE ?? path.join(homedir(), ".local
 const LOG_FILE = "/tmp/opencode-go-rotate.log"
 const LOCK_FILE = CONFIG_FILE + ".lock"
 // 固定端口用于保证"全系统只启动一个 web"（tui-control 占用 7792-7811，故避开）
-const WEB_PORT = 8899
+// GOROTATE_WEB_PORT 仅供测试/隔离实例覆盖端口；非法值回退默认 8899（生产不设行为不变）
+const WEB_PORT = Number(process.env.GOROTATE_WEB_PORT) || 8899
 const WEB_BASE = `http://127.0.0.1:${WEB_PORT}`
 const DEFAULT_COOLDOWN_MIN = 300
 // 日志轮转：超过该大小即归档，最多保留 RETENTION 份，旧档删除（防止 /tmp 无限增长）
@@ -604,7 +605,11 @@ async function handleWeb(req: any): Promise<Response> {
   }
   if (route === "/api/web/on") {
     setAutoWeb(true)
-    return json({ ok: true, auto_web: true })
+    // 基线 ⑧：不仅写 auto_web，若当前 server 未运行则立即拉起（restarted=true）；
+    // 端口被其它实例占用时 startWeb 内部健康检查会记录日志且不重复启动（webStarted 仍 false）
+    const wasRunning = webStarted
+    if (!webStarted) await startWeb()
+    return json({ ok: true, auto_web: true, restarted: !wasRunning && webStarted })
   }
   if (method === "POST") {
     try {
@@ -914,6 +919,7 @@ async function refresh() {
             : '<button data-cooldown="' + k.name + '" data-min="' + st.cooldown_minutes + '">冷却</button>') +
           '<button data-window="' + k.name + '" title="设置该 key 独立冷却窗口（分钟，留空清除回退全局）">窗口</button>' +
           (k.cooldown_minutes ? '<button data-window-clear="' + k.name + '" title="清除独立窗口，回退全局">清窗</button>' : '') +
+          '<button data-edit="' + k.name + '" title="编辑名称 / key 值">编辑</button>' +
           '<button class="danger" data-del="' + k.name + '">删除</button>' +
         '</div></td>'
       tb.appendChild(tr)
@@ -922,6 +928,7 @@ async function refresh() {
     tb.querySelectorAll("[data-cooldown]").forEach(b => b.onclick = () => doOp(() => api("/api/cooldown", { name: b.dataset.cooldown, minutes: Number(b.dataset.min) })))
     tb.querySelectorAll("[data-window]").forEach(b => b.onclick = () => editKeyWindow(b.dataset.window))
     tb.querySelectorAll("[data-window-clear]").forEach(b => b.onclick = () => doOp(() => api("/api/cooldown/window", { name: b.dataset.windowClear, minutes: null })))
+    tb.querySelectorAll("[data-edit]").forEach(b => b.onclick = () => editKey(b.dataset.edit))
     tb.querySelectorAll("[data-del]").forEach(b => b.onclick = () => {
       if (!confirm('确定删除 key "' + b.dataset.del + '"？此操作不可恢复。')) return
       doOp(() => api("/api/keys/delete", { name: b.dataset.del }))
@@ -954,8 +961,11 @@ async function webOff() {
   } catch (e) { showErr(e.message) }
 }
 async function webOn() {
-  try { await api("/api/web/on", {}); showMsg("已开启 Web 自动启动"); refresh() }
-  catch (e) { showErr(e.message) }
+  try {
+    const r = await api("/api/web/on", {})
+    showMsg(r.restarted ? "Web 已重新启动（立即生效）" : "已开启 Web 自动启动")
+    refresh()
+  } catch (e) { showErr(e.message) }
 }
 async function checkKeys() {
   const hint = document.getElementById("check-hint")
@@ -973,6 +983,21 @@ function showErr(m) { const el = document.getElementById("msg"); el.textContent 
 function showMsg(m) { const el = document.getElementById("msg"); el.textContent = m; el.className = "msg" }
 
 /* ---- 独立冷却窗口 / 全局窗口编辑 ---- */
+async function editKey(name) {
+  const newName = prompt('修改 key "' + name + '" 的名称（留空 = 不改）', "")
+  if (newName === null) return
+  const newKey = prompt('修改 key "' + name + '" 的 key 值（留空 = 不改）', "")
+  if (newKey === null) return
+  const patch = {}
+  if (newName.trim()) patch.name = newName.trim()
+  if (newKey.trim()) patch.key = newKey.trim()
+  if (!patch.name && !patch.key) return showMsg('未修改：名称与 key 值均为空')
+  try {
+    await api("/api/keys/update", { name, patch })
+    showMsg('已更新 key "' + name + '"' + (patch.name ? ' → "' + patch.name + '"' : ""))
+    refresh()
+  } catch (e) { showErr(e.message) }
+}
 async function editKeyWindow(name) {
   const v = prompt('设置 key "' + name + '" 的独立冷却窗口（分钟，正整数；留空或取消 = 清除，回退全局窗口）', "")
   if (v === null) return
@@ -1103,6 +1128,7 @@ document.getElementById("log-filter").oninput = applyLogFilter;
 /* ---------------- 测试导出（2026-08-16 追加，仅命名导出不改变行为；供 tests/go-rotate-plugin.test.ts 使用） ---------------- */
 export {
   atomicWrite,
+  WEB_HTML,
   loadConfig,
   saveConfig,
   mutateConfig,

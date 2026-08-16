@@ -21,6 +21,7 @@
  *   ZEN_GATEWAY_HOST    （默认 127.0.0.1，仅本地）
  *   ZEN_GATEWAY_TOKEN   （可选，设置后所有请求需 Authorization: Bearer <token>）
  *   ZEN_CONFIG          （可选，go-keys.json 路径覆盖，默认 ~/.config/opencode/go-keys.json）
+ *   ZEN_AUTH_FILE       （可选，auth.json 路径覆盖，默认 ~/.local/share/opencode/auth.json；测试/多实例隔离用）
  *   ZEN_DEFAULT_MODEL   （可选，未知名映射到的模型，默认 hy3）
  *   ZEN_UPSTREAM_BASE   （可选，上游端点覆盖，默认 https://opencode.ai/zen/go/v1）
  *   ZEN_USAGE_FILE      （可选，用量持久化趋势文件覆盖，默认 ~/.local/share/zen-gateway/usage.jsonl）
@@ -53,7 +54,8 @@ const DEFAULT_PORT = 18888
 const DEFAULT_HOST = "127.0.0.1"
 const DATA_DIR = path.join(os.homedir(), ".config", "opencode")
 const CONFIG_FILE = process.env.ZEN_CONFIG || path.join(DATA_DIR, "go-keys.json")
-const AUTH_FILE = path.join(os.homedir(), ".local", "share", "opencode", "auth.json")
+const AUTH_FILE =
+  process.env.ZEN_AUTH_FILE || path.join(os.homedir(), ".local", "share", "opencode", "auth.json")
 const LOCK_FILE = CONFIG_FILE + ".lock"
 const LOG_FILE = "/tmp/opencode-go-rotate.log"
 const UPSTREAM_BASE = process.env.ZEN_UPSTREAM_BASE || "https://opencode.ai/zen/go/v1"
@@ -1640,7 +1642,7 @@ if (!process.env.ZEN_TEST) {
     const cfg = loadConfig()
     log(
       `🚀  zen-gateway 启动 http://${HOST}:${PORT}  默认模型=${DEFAULT_MODEL}  key数=${cfg.keys.length}  ` +
-        `当前=${cfg.current}  config=${CONFIG_FILE}`,
+        `当前=${cfg.current}  config=${CONFIG_FILE}  auth=${AUTH_FILE}`,
     )
     console.log(`zen-gateway listening on http://${HOST}:${PORT}`)
     console.log(`  POST /v1/chat/completions   POST /v1/messages   POST /v1/responses   GET /v1/models   GET /healthz`)
@@ -1783,5 +1785,8 @@ export {
   readUsageFile,
   utcDateKey,
   windowDays,
+  rotate,
+  syncAuth,
+  AUTH_FILE,
   __setDynamicModels,
 }

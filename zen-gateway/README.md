@@ -108,6 +108,7 @@ nohup node gateway.mjs >/tmp/zen-gateway.log 2>&1 &
 | `ZEN_GATEWAY_HOST` | `127.0.0.1` | 监听地址（仅本地；内网共享可改 `0.0.0.0`） |
 | `ZEN_GATEWAY_TOKEN` | 无 | 设置后所有请求需 `Authorization: Bearer <token>` |
 | `ZEN_CONFIG` | `~/.config/opencode/go-keys.json` | key 配置文件路径覆盖（测试/多实例用） |
+| `ZEN_AUTH_FILE` | `~/.local/share/opencode/auth.json` | auth.json 路径覆盖（测试/多实例隔离用；不设则行为不变，轮换仍同步真实 auth.json） |
 | `ZEN_DEFAULT_MODEL` | `hy3` | 未知名模型映射到的真实模型 |
 | `ZEN_UPSTREAM_BASE` | `https://opencode.ai/zen/go/v1` | 上游端点覆盖 |
 | `ZEN_USAGE_FILE` | `~/.local/share/zen-gateway/usage.jsonl` | 用量趋势追加日志路径覆盖（测试用） |

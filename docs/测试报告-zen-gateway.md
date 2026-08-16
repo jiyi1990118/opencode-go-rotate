@@ -3,7 +3,7 @@
 - 日期：2026-08-16
 - 测试文件：`zen-gateway/tests/run-tests.mjs`（零 npm 依赖，node 内置 `node:assert`）
 - 被测对象：`zen-gateway/gateway.mjs`（v24.14.1 实测）
-- 结果：**144/144 PASS（exit 0）**（2026-08-16 追加 `/api/usage/trend` 纯函数 16 用例，原 120 用例未删改）
+- 结果：**150/150 PASS（exit 0）**（2026-08-16 追加 `/api/usage/trend` 纯函数 16 用例 + `ZEN_AUTH_FILE` 隔离 6 用例，原 120 用例未删改）
 
 ## 运行方式
 
@@ -14,7 +14,8 @@ cd zen-gateway/tests && node run-tests.mjs
 
 脚本自身会 `process.env.ZEN_TEST = "1"` 再动态 `import("../gateway.mjs")`；
 测试前固定 `ZEN_DEFAULT_MODEL=hy3`、`ZEN_NOTIFY=0`、`ZEN_CONFIG/ZEN_USAGE_FILE` 指向 /tmp，
-并清除 `ZEN_GATEWAY_HOST/TOKEN/PROBE_INTERVAL_MIN/UPSTREAM_BASE` —— **绝不触碰真实
+并清除 `ZEN_GATEWAY_HOST/TOKEN/PROBE_INTERVAL_MIN/UPSTREAM_BASE`；`ZEN_AUTH_FILE` 隔离组
+仅在组内临时设置并指向 /tmp（组尾清理）—— **绝不触碰真实
 go-keys.json / auth.json / 18888 常驻服务**。
 
 ## 导出钩子方案（gateway.mjs 唯一两处改动）
@@ -22,7 +23,9 @@ go-keys.json / auth.json / 18888 常驻服务**。
 | 位置 | 改动 | 说明 |
 |---|---|---|
 | L1592-1611 | `server.listen(...)` 包进 `if (!process.env.ZEN_TEST) { ... }` | 测试时跳过 listen；正常启动路径逐字节等价 |
-| L1628-1655 | 文件末尾新增顶层命名 `export { ... }` + 测试钩子 `__setDynamicModels` | 导出 16 个纯函数 |
+| L1628-1655 | 文件末尾新增顶层命名 `export { ... }` + 测试钩子 `__setDynamicModels` | 导出 19 个纯函数（16 原有 + usage/trend 4 + `rotate`/`syncAuth`/`AUTH_FILE` 3） |
+| L56 | `AUTH_FILE` 支持 `ZEN_AUTH_FILE` env 覆盖（默认不变） | 轮换类测试可隔离 auth.json，不再写真实凭据 |
+| L1642-1644 | 启动日志追加 `auth=<AUTH_FILE>` | 运行时可见当前实例使用的 auth 路径（多实例/测试可观测） |
 
 **关键工程决策（与任务建议方案的偏差及理由）**：任务建议 `module.exports = {...}`，
 但 gateway.mjs 是 **ESM（.mjs）**，实测 `module.exports` 直接抛
@@ -35,7 +38,8 @@ go-keys.json / auth.json / 18888 常驻服务**。
 
 导出清单：`parseResetTime / isQuotaStatus / isQuotaError / mapModel / pickNext / currentKey /
 cooldownUntilDefault / maskToken / parseErrorBody / combineSignals / anthropicToOpenAI /
-openAIToAnthropic / responsesToOpenAI / openAIToResponse / allModelIds / __setDynamicModels`。
+openAIToAnthropic / responsesToOpenAI / openAIToResponse / allModelIds / aggregateUsage /
+readUsageFile / utcDateKey / windowDays / rotate / syncAuth / AUTH_FILE / __setDynamicModels`。
 
 ## 覆盖清单
 
@@ -56,7 +60,8 @@ openAIToAnthropic / responsesToOpenAI / openAIToResponse / allModelIds / __setDy
 | pickNext | 6 | 下一可用/跳过冷却/过期可用/全冷却/current 不在 keys/空 keys | PASS |
 | allModelIds | 2 | 26 内置升序、动态合并去重 | PASS |
 | aggregateUsage / readUsageFile | 16 | 空文件空结构、坏行计数（非JSON/缺字段/非法时间）、按 key 汇总+lastTs、按日归日（+08:00 偏移折算 UTC）、按 endpoint（含 unknown）、days 窗口过滤、key 筛选、全局成功/失败/轮换、days 非法回退 7、readUsageFile 不存在/空/正常 | PASS |
-| **合计** | **144** | **182+ 个断言点** | **144/144 PASS** |
+| ZEN_AUTH_FILE 隔离 | 6 | 不设 env→AUTH_FILE 指向真实路径（字符串断言）；设 env（import 前）→指向临时路径；syncAuth 写临时不写真实（字节对比）；保留既有 opencode-go 结构；损坏 JSON 静默容错；rotate() 全链路（假 key 429→临时 config 切换+临时 auth 更新+真实 auth 字节不变） | PASS |
+| **合计** | **150** | **182+ 个断言点** | **150/150 PASS** |
 
 ## `/api/usage/trend` 追加（2026-08-16）
 
@@ -138,3 +143,58 @@ openAIToAnthropic / responsesToOpenAI / openAIToResponse / allModelIds / __setDy
   未纳入本单测（任务允许），建议后续以 mock 上游做集成级验证。
 - `rotate()` / `saveConfig()` / `syncAuth()` 涉及真实文件与锁，未纳入本纯逻辑单测
   （会写 auth.json/go-keys.json，违背「绝不触碰真实配置」约束）。
+
+## `ZEN_AUTH_FILE` 隔离（2026-08-16，修复「轮换测试写真实 auth.json」事故根因）
+
+**背景**：此前 `AUTH_FILE` 是硬编码常量（`~/.local/share/opencode/auth.json`），`ZEN_CONFIG`
+只能隔离 go-keys.json；轮换类集成测试触发 `rotate()→syncAuth()` 必然把假 key 写进**真实
+auth.json**（见上文 §事故记录）。本次为 `AUTH_FILE` 补 env 覆盖，实现测试隔离闭环。
+
+### 生产改动（gateway.mjs，最小化）
+
+1. **`AUTH_FILE` env 覆盖**（L56）：`process.env.ZEN_AUTH_FILE || path.join(homedir(), ".local", "share", "opencode", "auth.json")` —— 不设 env 行为逐字节不变。
+2. **导出 3 项**（与既有 16+4 并列）：`rotate` / `syncAuth` / `AUTH_FILE`（供单测 import）。
+3. **启动日志追加 `auth=<AUTH_FILE>`**（L1642-1644）：运行时可见当前实例实际使用的 auth 路径，
+   多实例/测试可观测（纯追加日志，无行为变化）。
+
+### 新增单测（6 用例，总 144 → 150）
+
+| 用例 | 断言要点 |
+|---|---|
+| 不设 `ZEN_AUTH_FILE` → `AUTH_FILE` 指向真实路径 | 字符串含 homedir + `.local/share/opencode/auth.json` 结尾（**只断言不写**） |
+| 设 `ZEN_AUTH_FILE`（import 前，查询串 fresh 实例）→ 指向临时路径 | `gwA.AUTH_FILE === process.env.ZEN_AUTH_FILE` |
+| `syncAuth` 写临时 auth.json | 临时文件 `opencode-go.key` 更新；**真实 auth.json 字节不变**（快照对比） |
+| `syncAuth` 保留既有结构 | 既有 `opencode-go{type,key}` 仅 key 更新，其它 provider 字段不动 |
+| `syncAuth` 损坏 JSON 容错 | 静默失败不抛错、文件原样保留（当前实现实际行为） |
+| `rotate()` 全链路隔离 | 假 key 429 → 临时 config `current` 切换 + `cooldown_until`（时区解析）+ 临时 auth 更新为轮换后新 key；**真实 auth.json 字节不变** |
+
+> 技术要点：设 env 的实例用 `import("../gateway.mjs?zauth-isolation=1")` 查询串强制重新执行
+> 模块顶层（ESM 缓存按完整标识符区分），模拟「import 前设 env」；`rotate` 为 async，在
+> `t()` 同步 harness 外手动执行并计数，保证汇总准确。
+
+### 集成验证（真实执行，铁证）
+
+1. `node --check gateway.mjs` → OK（exit 0）
+2. `ZEN_TEST=1 node run-tests.mjs` → **150/150 PASS（exit 0）**（144 原有未删改）
+3. **轮换写隔离**（临时端口 18931 + 临时 `ZEN_CONFIG` 假 key×2 + 临时
+   `ZEN_AUTH_FILE=/tmp/gr-ga-*/auth.json`（预置占位内容）+ mock 上游 18932 固定 401）：
+   - 启动日志：`auth=/tmp/gr-ga-*/auth.json`（env 生效）
+   - `POST /v1/chat/completions`（假 key）→ mock 401 → `✅ 轮换到 key "k2"`（日志）
+   - **临时 auth.json 被更新为 k2 假 key**（`sk-FAKE-k2-...`）
+   - **真实 `~/.local/share/opencode/auth.json` md5 前后一致**：`e4e9a727d22bc1535129f1b62fc9237c`（key 前缀 `sk-epyPd50wz...` 不变）
+4. **不设 `ZEN_AUTH_FILE` 回归**（临时端口 18933 + 仅 `ZEN_CONFIG` 隔离 + mock 上游 18934 固定 200）：
+   - 启动日志：`auth=/Users/jary/.local/share/opencode/auth.json`（**真实路径**，默认行为不变）
+   - healthz 200、chat 200（mock 200 → 不触发轮换）→ 无写操作
+   - 真实 auth.json md5 前后一致（同上）
+5. 测试进程已 kill、临时文件/端口已清理；真实 18888 常驻服务未重启、未触碰
+   （验证窗口内 18888 healthz TCP 可握手但 HTTP 超时——与本次改动无关，运行中的是旧安装副本
+   且并行 Team 活动频繁，交主线程观察）。
+
+### 遗留（本轮）
+
+- 运行中的 18888 安装副本（`~/.local/share/zen-gateway/gateway.mjs`）未同步本次改动
+  （`ZEN_AUTH_FILE` 覆盖 + 启动日志 auth 行），待主线程 install 同步并 restart。
+- 真实 `~/.config/opencode/go-keys.json` 在验证窗口（11:26:24）被并行活动写入一个
+  `name` 为 Client 对象的脏 key（md5 `70aa1342…` → `ae596e0e…`），与本次测试无关
+  （隔离铁证：真实 auth.json md5 全程稳定、测试仅写临时 ZEN_CONFIG/ZEN_AUTH_FILE），
+  交主线程清理（历史同类污染曾用 python 过滤修复）。

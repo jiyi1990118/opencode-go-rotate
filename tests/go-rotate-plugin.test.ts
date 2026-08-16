@@ -612,4 +612,19 @@ describe("日志与 Web（只读，不 bind 8899）", () => {
     expect(st2.keys[0].remainMin).toBeGreaterThan(0)
     expect(st2.availableCount).toBe(1)
   })
+  test("WEB_HTML 含 key 编辑 UI（data-edit 按钮 + editKey 函数 + /api/keys/update 调用）", () => {
+    const html: string = (mod as any).WEB_HTML
+    expect(typeof html).toBe("string")
+    // 行内「编辑」按钮（data-edit 挂 key 名）
+    expect(html).toContain('data-edit="')
+    expect(html).toContain("title=\"编辑名称 / key 值\"")
+    // editKey 函数：两个 prompt（名称/key 可空）+ patch 组装 + 双空不调 API + update 调用
+    expect(html).toContain("function editKey")
+    expect(html).toContain('修改 key "')
+    expect(html).toContain("留空 = 不改")
+    expect(html).toContain("未修改：名称与 key 值均为空")
+    expect(html).toContain('api("/api/keys/update", { name, patch })')
+    // webOn 显示 restarted（基线 ⑧ 立即重启）
+    expect(html).toContain("r.restarted ? \"Web 已重新启动（立即生效）\" : \"已开启 Web 自动启动\"")
+  })
 })

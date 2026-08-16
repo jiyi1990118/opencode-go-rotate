@@ -60,6 +60,9 @@ qwen3.5-plus  qwen3.6-plus  qwen3.7-max  qwen3.7-plus  qwen3.8-max
 - 写操作走**同一把文件锁** `go-keys.json.lock`（`wx` 创建 + 陈旧锁 15s + 超时 5s 降级）+ **原子写**（tmp+rename）。
 - 轮换后同步 `~/.local/share/opencode/auth.json`，与 go-rotate 插件路径保持一致。
 - 该文件锁与 go-rotate 的完全兼容（同一路径、同一创建/清理协议），两者可安全并发。
+- **测试/多实例隔离**：`ZEN_CONFIG` 覆盖 go-keys.json 路径，`ZEN_AUTH_FILE` 覆盖 auth.json 路径
+  （2026-08-16 新增，独立可只设一个）。轮换类集成测试必须同时设两者，避免假 key 写进真实
+  go-keys.json / auth.json（此前曾发生轮换测试把假 key 写进真实 auth.json 的事故，见测试报告）。
 
 ### 3.3 模型映射（请求任意模型名 → 真实 zen 模型）
 
