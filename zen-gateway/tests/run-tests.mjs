@@ -1106,9 +1106,10 @@ const _statusCfg = {
   ],
 }
 
-t("基本字段齐全：running/port/defaultModel/modelCount/keys/current/usageFile/upstreamBase/models", () => {
+t("基本字段齐全：running/version/port/defaultModel/modelCount/keys/current/usageFile/upstreamBase/models", () => {
   const s = gw.gatewayStatusSummary(_statusCfg)
   assert.equal(s.running, true)
+  assert.equal(s.version, "1.1.0")
   assert.equal(s.port, 18888) // 测试 env 未设 ZEN_GATEWAY_PORT → DEFAULT_PORT
   assert.equal(s.defaultModel, "hy3")
   assert.equal(s.modelCount, 26)
@@ -1145,6 +1146,11 @@ t("空/损坏 cfg 容错：keys=0 current='' 不抛错", () => {
   assert.equal(gw.gatewayStatusSummary({}).keys, 0)
   assert.equal(gw.gatewayStatusSummary({}).current, "")
   assert.equal(gw.gatewayStatusSummary(null).keys, 0)
+})
+
+t("version === '1.1.0'（契约 5.3 GATEWAY_VERSION，空/损坏 cfg 亦恒定）", () => {
+  assert.equal(gw.gatewayStatusSummary(_statusCfg).version, "1.1.0")
+  assert.equal(gw.gatewayStatusSummary(null).version, "1.1.0")
 })
 
 group("gatewayConfigSummary（/api/gateway/config 摘要不泄漏 key）")

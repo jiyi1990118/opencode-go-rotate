@@ -28,6 +28,9 @@ opencode 的 opencode-go 多 key 自动轮换插件 + Web 管理界面。
 ### 一键安装（推荐）
 
 ```bash
+# 全量安装：插件 + CLI + zen-gateway 网关服务（OpenAI/Anthropic/Responses 兼容，端口 18888）
+curl -fsSL https://raw.githubusercontent.com/jiyi1990118/opencode-go-rotate/main/install.sh | bash -s -- --all
+# 仅插件 + CLI（不开网关）
 curl -fsSL https://raw.githubusercontent.com/jiyi1990118/opencode-go-rotate/main/install.sh | bash
 ```
 

@@ -646,6 +646,7 @@ describe("网关管理 UI（WEB_HTML 内嵌）", () => {
     expect(html).toContain("网关管理")
     expect(html).toContain('id="gw-badge"')
     expect(html).toContain('id="gw-mcount"')
+    expect(html).toContain('id="gw-version"')
     expect(html).toContain('id="gw-start" onclick="gwManage(\'start\')"')
     expect(html).toContain('id="gw-stop" onclick="gwManage(\'stop\')"')
     expect(html).toContain('id="gw-restart" onclick="gwManage(\'restart\')"')
@@ -740,5 +741,25 @@ describe("网关管理路由（POST /api/gateway/start|stop|restart，假脚本�
     expect(res.status).toBe(404)
     const j = await res.json()
     expect(j.error).toBe("unknown route")
+  })
+})
+
+describe("key 健康探测路由（/api/keys/check 仅 POST，防呆）", () => {
+  test("GET → 404 不触发探测；POST → 正常返回 results（空 keys 零网络请求）", async () => {
+    // 空 key 配置：checkAllKeys 不循环、不探测、不写 last_status，零真实网络请求
+    seed({ provider_id: "opencode-go", cooldown_minutes: 300, current: "", keys: [], auto_web: false })
+    // GET：防呆——不得进入探测逻辑（404 not found）
+    const g = new Request("http://127.0.0.1:8899/api/keys/check")
+    const gr = await mod.handleWeb(g)
+    expect(gr.status).toBe(404)
+    const gj = await gr.json()
+    expect(gj.error).toBe("not found")
+    // POST：正常探测路径，返回 {results}
+    const p = new Request("http://127.0.0.1:8899/api/keys/check", { method: "POST", body: "{}" })
+    const pr = await mod.handleWeb(p)
+    expect(pr.status).toBe(200)
+    const pj = await pr.json()
+    expect(pj.results).toBeDefined()
+    expect(Object.keys(pj.results).length).toBe(0)
   })
 })

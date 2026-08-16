@@ -7,11 +7,17 @@
 #     curl -fsSL <REPO>/install.sh | bash
 #   方式二（克隆/下载仓库后本地运行）:
 #     bash install.sh
+#   完整安装（插件 + CLI + 配置 + zen-gateway 网关服务）:
+#     bash install.sh --all
+#   卸载:
+#     bash install.sh uninstall [-y]               # 仅卸载插件/CLI/配置
+#     bash install.sh uninstall --gateway [-y]     # 同时卸载 zen-gateway 网关服务
 #
 # 安装内容:
 #   1. 插件 go-rotate.ts  -> ~/.config/opencode/plugins/
 #   2. CLI  go-rotate     -> ~/.local/bin/  (并加入 PATH)
 #   3. 默认配置 go-keys.json (若不存在)
+#   4. [--all] zen-gateway 网关服务（launchd 常驻，开机自启）
 # 可重复运行（幂等，不会覆盖已有配置）。
 # ============================================================
 set -euo pipefail
@@ -48,36 +54,11 @@ pick_bin_dir() {
 }
 BIN_DIR="$(pick_bin_dir)"
 
-# ================== 卸载模式 ==================
-# 用法: bash install.sh uninstall  或  bash install.sh -u
-if [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "-u" ]; then
-  echo ""
-  warn "正在卸载 go-rotate ..."
-  PLUGIN="$PLUGIN_DIR/go-rotate.ts"
-  CLI="$BIN_DIR/go-rotate"
-  CONFIG="$DATA_DIR/go-keys.json"
-  echo "  将删除:"
-  [ -f "$PLUGIN" ] && echo "    $PLUGIN"
-  [ -f "$CLI" ] && echo "    $CLI"
-  [ -f "$CONFIG" ] && echo "    $CONFIG"
-  ans=""
-  if [ "${2:-}" != "-y" ]; then
-    printf "确认卸载？删除配置会丢失 key 列表 [y/N]: "
-    read -r ans
-  else
-    ans="y"
-  fi
-  if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
-    [ -f "$PLUGIN" ] && rm -f "$PLUGIN" && ok "已删除插件 $PLUGIN"
-    [ -f "$CLI" ] && rm -f "$CLI" && ok "已删除 CLI $CLI"
-    [ -f "$CONFIG" ] && rm -f "$CONFIG" && ok "已删除配置 $CONFIG"
-    ok "卸载完成。auth.json 未改动（保留你的 opencode-go 凭据）。"
-  else
-    warn "已取消卸载。"
-  fi
-  exit 0
-fi
-# ==================================================
+# --all 标记：默认安装完成后追加安装 zen-gateway 网关服务（任意位置识别）
+ALL_FLAG="no"
+for arg in "$@"; do
+  [ "$arg" = "--all" ] && ALL_FLAG="yes"
+done
 
 # 判断是"本地运行"还是"curl|bash"
 THIS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
@@ -196,6 +177,50 @@ uninstall_zen_gateway() {
   exit 0
 }
 
+# ================== 卸载模式 ==================
+# 用法: bash install.sh uninstall [--gateway] [-y]  或  bash install.sh -u
+if [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "-u" ]; then
+  echo ""
+  warn "正在卸载 go-rotate ..."
+  PLUGIN="$PLUGIN_DIR/go-rotate.ts"
+  CLI="$BIN_DIR/go-rotate"
+  CONFIG="$DATA_DIR/go-keys.json"
+  GW_FLAG="no"
+  UNINSTALL_Y="no"
+  for arg in "$@"; do
+    [ "$arg" = "--gateway" ] && GW_FLAG="yes"
+    [ "$arg" = "-y" ] && UNINSTALL_Y="yes"
+  done
+  echo "  将删除:"
+  [ -f "$PLUGIN" ] && echo "    $PLUGIN"
+  [ -f "$CLI" ] && echo "    $CLI"
+  [ -f "$CONFIG" ] && echo "    $CONFIG"
+  if [ "$GW_FLAG" = "yes" ]; then
+    echo "    zen-gateway 网关服务（launchd 任务 + 程序 + 管理脚本）"
+  fi
+  ans=""
+  if [ "$UNINSTALL_Y" != "yes" ]; then
+    printf "确认卸载？删除配置会丢失 key 列表 [y/N]: "
+    read -r ans
+  else
+    ans="y"
+  fi
+  if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
+    [ -f "$PLUGIN" ] && rm -f "$PLUGIN" && ok "已删除插件 $PLUGIN"
+    [ -f "$CLI" ] && rm -f "$CLI" && ok "已删除 CLI $CLI"
+    [ -f "$CONFIG" ] && rm -f "$CONFIG" && ok "已删除配置 $CONFIG"
+    if [ "$GW_FLAG" = "yes" ]; then
+      # 主卸载已确认；传 -y 给网关函数跳过其内部二次确认（该函数检查 $2 位）
+      ( uninstall_zen_gateway -y -y )
+    fi
+    ok "卸载完成。auth.json 未改动（保留你的 opencode-go 凭据）。"
+  else
+    warn "已取消卸载。"
+  fi
+  exit 0
+fi
+# ==================================================
+
 # zen-gateway 子命令分发
 if [ "${1:-}" = "zen-gateway" ] || [ "${1:-}" = "--zen-gateway" ]; then
   install_zen_gateway
@@ -263,6 +288,11 @@ if [ ! -f "$AUTH_DIR/auth.json" ]; then
   mkdir -p "$AUTH_DIR" 2>/dev/null || true
   printf '{\n  "opencode-go": {\n    "type": "api",\n    "key": ""\n  }\n}\n' > "$AUTH_DIR/auth.json" 2>/dev/null || \
     warn "无法创建 auth.json（ $AUTH_DIR ），将由 opencode 首次启动时自动创建。"
+fi
+
+# 6) --all 模式：追加安装 zen-gateway 网关服务（幂等，重复运行不覆盖已有配置/服务）
+if [ "$ALL_FLAG" = "yes" ]; then
+  install_zen_gateway
 fi
 
 echo ""

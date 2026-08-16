@@ -71,6 +71,8 @@ const PROBE_TIMEOUT_MS = 15000
 const UPSTREAM_TIMEOUT_MS = 300000 // 流式可能持续较久，放宽到 5 分钟
 const MAX_BODY_BYTES = 8 * 1024 * 1024 // 请求体上限 8MB（防内存 DoS）
 const LOG_RING_MAX = 200 // 内存环形日志上限（/api/gateway/log 只读端点用）
+// 网关版本号：/api/gateway/status 只读端点的 version 字段（契约 docs/整合设计方案-渐进整合.md §5.3 承诺 "1.1.0"）
+const GATEWAY_VERSION = "1.1.0"
 
 /* 用量持久化趋势：usage.jsonl 追加日志（重启不清零，供 tail -f / 后续分析）。
  * 与 gateway 安装目录同族：~/.local/share/zen-gateway/ 不含 opencode 凭据。 */
@@ -1723,6 +1725,7 @@ process.on("uncaughtException", (err) => {
 function gatewayStatusSummary(cfg, opts = {}) {
   return {
     running: opts.running !== false,
+    version: GATEWAY_VERSION,
     port: opts.port ?? PORT,
     defaultModel: DEFAULT_MODEL,
     modelCount: ZEN_MODELS.length,

@@ -174,14 +174,18 @@ function saveConfig(cfg: Config) {
 }
 
 function syncAuth(key: string) {
-  const data = existsSync(AUTH_FILE) ? JSON.parse(readFileSync(AUTH_FILE, "utf8")) : {}
-  const auth = data["opencode-go"]
-  if (auth && typeof auth === "object") {
-    auth.key = key
-  } else {
-    data["opencode-go"] = { type: "api", key }
+  try {
+    const data = existsSync(AUTH_FILE) ? JSON.parse(readFileSync(AUTH_FILE, "utf8")) : {}
+    const auth = data["opencode-go"]
+    if (auth && typeof auth === "object" && !Array.isArray(auth)) {
+      auth.key = key
+    } else {
+      data["opencode-go"] = { type: "api", key }
+    }
+    atomicWrite(AUTH_FILE, JSON.stringify(data, null, 2), 0o600)
+  } catch (e: any) {
+    log(`⚠️  syncAuth 失败（auth.json 损坏？）: ${e.message}`)
   }
-  atomicWrite(AUTH_FILE, JSON.stringify(data, null, 2), 0o600)
 }
 
 /** 在锁内执行一次配置变更，返回新的配置 */
@@ -559,12 +563,15 @@ async function gatewayStatus(): Promise<{
   usage?: any
   models?: string[]
   modelCount?: number
+  version?: string
   error?: string
 }> {
-  const [h, u, m] = await Promise.allSettled([
+  const [h, u, m, s] = await Promise.allSettled([
     fetch(GATEWAY_BASE + "/healthz", { signal: AbortSignal.timeout(2000) }).then((r) => r.json()),
     fetch(GATEWAY_BASE + "/api/usage", { signal: AbortSignal.timeout(2000) }).then((r) => r.json()),
     fetch(GATEWAY_BASE + "/v1/models", { signal: AbortSignal.timeout(2000) }).then((r) => r.json()),
+    // 网关只读状态端点：透传 version（旧网关无此端点/字段时缺失，前端容错显示 '—'）
+    fetch(GATEWAY_BASE + "/api/gateway/status", { signal: AbortSignal.timeout(2000) }).then((r) => r.json()),
   ])
   const out: any = { running: h.status === "fulfilled", ctlExists: gatewayCtlExists() }
   if (h.status === "fulfilled") out.healthz = h.value
@@ -573,6 +580,7 @@ async function gatewayStatus(): Promise<{
     out.models = m.value.data.map((x: any) => x?.id).filter(Boolean)
     out.modelCount = out.models.length
   }
+  if (s.status === "fulfilled" && typeof s.value?.version === "string") out.version = s.value.version
   if (h.status === "rejected") out.error = String(h.reason?.message ?? h.reason)
   return out
 }
@@ -659,7 +667,8 @@ async function handleWeb(req: any): Promise<Response> {
   }
   if (method === "GET" && route === "/api/gateway") return json(await gatewayStatus())
   if (method === "GET" && route === "/api/gateway/log") return json(await gatewayLog())
-  if (route === "/api/keys/check") {
+  // key 健康探测：仅 POST（GET 会意外触发真实探测消耗配额，防呆 405/404）
+  if (method === "POST" && route === "/api/keys/check") {
     return json({ results: await checkAllKeys() })
   }
   // Web 开关：/api/web/off 关闭并停止 server；/api/web/on 开启自动启动
@@ -923,7 +932,7 @@ const WEB_HTML = `<!doctype html>
   <div class="card" id="gateway-card">
     <div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between">
       <b>网关管理 <span id="gw-badge"></span></b>
-      <span class="muted">127.0.0.1:18888</span>
+      <span class="muted">127.0.0.1:18888 <span id="gw-version" class="muted"></span></span>
     </div>
     <div class="stats" style="margin-bottom:8px">
       <div class="stat"><div class="v" id="gw-current">-</div><div class="l">当前 key</div></div>
@@ -1071,8 +1080,8 @@ async function checkKeys() {
   const hint = document.getElementById("check-hint")
   hint.textContent = "检测中…"
   try {
-    const r = await fetch("/api/keys/check")
-    const j = await r.json()
+    // 探测会真实消耗配额（~1 token/key）：显式 POST（api 带 body 即 POST），避免 GET 意外触发
+    const j = await api("/api/keys/check", {})
     health = j.results || {}
     hint.textContent = "检测完成（每次消耗约 1 token）"
     refresh()
@@ -1151,6 +1160,7 @@ async function refreshGateway() {
     document.getElementById("gw-rot").textContent = "-"
     document.getElementById("gw-req").textContent = "-"
     document.getElementById("gw-mcount").textContent = "-"
+    document.getElementById("gw-version").textContent = "—"
   }
   // 管理按钮：start 在未运行且已安装时可用；stop/restart 在运行中可用
   const setBtns = (running, installed) => {
@@ -1189,6 +1199,8 @@ async function refreshGateway() {
     document.getElementById("gw-rot").textContent = h.rotations ?? "-"
     document.getElementById("gw-req").textContent = u.totalRequests ?? "-"
     document.getElementById("gw-mcount").textContent = g.modelCount ?? "-"
+    // 网关版本：旧网关无 /api/gateway/status 端点/字段时容错显示 '—'
+    document.getElementById("gw-version").textContent = g.version ? "v" + g.version : "—"
     const pk = u.perKey || {}
     const names = Object.keys(pk)
     let html = '<span class="muted">暂无用量记录</span>'
