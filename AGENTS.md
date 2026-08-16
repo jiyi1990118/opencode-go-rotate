@@ -125,7 +125,7 @@ session.error 事件
 
 ## CLI 命令
 
-`status` / `list` / `init`(交互式) / `web`(独立启动 Web，无需 opencode) / `add <name> <key>` / `set <name>` / `next [min]` / `cooldown <name> [min]` / `check [name]` / `stats`(从 /tmp/opencode-go-rotate.log 统计每 key 轮换/冷却次数) / `uninstall [-y]`
+`status` / `list` / `init`(交互式) / `web`(独立启动 Web，无需 opencode) / `web restart`(重启管理端：kill 占用 8899 进程后独立拉起新版 Web，用于 opencode 旧插件加载新版) / `add <name> <key>` / `set <name>` / `next [min]` / `cooldown <name> [min]` / `check [name]` / `stats`(从 /tmp/opencode-go-rotate.log 统计每 key 轮换/冷却次数) / `gateway {start|stop|restart|status|logs|plan|token}` / `uninstall [-y] [--gateway]`
 
 > **CLI 跨进程锁（2026-08-16 已加）**：写命令（set/next/add/cooldown/web on|off/init 的 save）走 `_with_lock()`——与插件 `withLockSync` 同机制同参数（`go-keys.json.lock` O_EXCL + 15s 陈旧锁检测 + 5s 超时降级警告继续）；`save()` 改原子写（.tmp+`os.replace`）。status/list/check 只读不锁；check 的 last_status 写不持锁（探测耗时，避免长锁阻塞插件轮换，且该字段非关键）。并发实测：60 个写命令并行 JSON 无损、无锁残留。
 > **stats 限制**：只统计主日志文件（归档 .1/.2/.3 不计）、日志轮转只保留近期 → 统计为「近期」非全历史。
@@ -133,6 +133,7 @@ session.error 事件
 > `go-rotate web` 通过 `bun -e` 加载插件模块并调用 `GoRotate()` 起 Web，复用插件同一套逻辑（不复制代码）。端口仍固定 8899，若已有 go-rotate web 在跑会自动跳过（只启一个）。
 > Web 自动启动由配置 `auto_web`（默认 true）控制：`go-rotate web off` 关闭、`on` 开启、`status` 查看。
 > 关闭后 opencode 启动不占 8899 端口，轮换功能不受影响；`go-rotate web` 独立启动会通过 `GOROTATE_FORCE_WEB=1` 强制起 Web。
+> **`go-rotate web restart`（2026-08-16 已加）**：kill 占用 8899 的进程（若为 opencode 则其下次会话重载新插件）→ 独立模式拉起新版 Web。用于 opencode 旧插件场景下快速加载 Web 新版（如管理端）。已验证：真实 8899 由 opencode 20126 持有 → `web restart` 后 8899 转由独立 bun 进程监听并加载最新插件（主导航 5 区块/套餐卡/token 卡全生效）。
 > `uninstall` 删除插件、CLI 自身、`go-keys.json`；**不碰 auth.json**。install.sh 也支持 `bash install.sh uninstall [-y]`。
 
 ## 验证方法（重要：改完必测）

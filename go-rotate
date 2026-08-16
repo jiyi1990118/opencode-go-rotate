@@ -308,6 +308,7 @@ def do_web(cfg, mode=None):
        go-rotate web on     开启随 opencode 自动启动 Web
        go-rotate web off    关闭自动启动 Web（轮换仍可用，避免占用端口）
        go-rotate web status 查看当前 auto_web 状态
+       go-rotate web restart 重启管理端（kill 占用 8899 的进程后独立拉起新版 Web）
     """
     if mode == "on" or mode == "off":
         cfg["auto_web"] = (mode == "on")
@@ -319,6 +320,10 @@ def do_web(cfg, mode=None):
         print("  开启 = opencode 启动时自动起 Web (localhost:8899)")
         print("  关闭 = 不自动起 Web，避免占用端口；轮换功能仍可用")
         return
+    if mode == "restart":
+        # 重启管理端：kill 占用 8899 的进程 → 独立模式拉起新 Web（加载最新插件）
+        _web_kill_8899()
+        return _web_standalone(force=True)
     # 独立启动（强制）
     import shutil
     plugin = os.path.join(os.path.expanduser("~"), ".config", "opencode", "plugins", "go-rotate.ts")
@@ -337,6 +342,52 @@ def do_web(cfg, mode=None):
     print("  Ctrl+C 停止\n")
     env = os.environ.copy()
     env["GOROTATE_FORCE_WEB"] = "1"  # 独立启动强制起 Web，忽略 auto_web
+    os.execvpe(bun, [bun, "-e", code], env)
+
+
+def _web_kill_8899():
+    """查找并终止占用 8899 端口的进程（若占用者是 opencode，kill 后其下次会话重载新插件）。"""
+    import subprocess as sp
+    try:
+        out = sp.check_output(["lsof", "-ti", ":8899", "-sTCP:LISTEN"], text=True, timeout=5).strip()
+    except Exception:
+        out = ""
+    if not out:
+        print("8899 未被占用，无需 kill")
+        return
+    for pid in out.splitlines():
+        try:
+            name = sp.check_output(["ps", "-p", pid, "-o", "comm="], text=True, timeout=5).strip()
+        except Exception:
+            name = "?"
+        print(f"终止占用 8899 的进程: PID {pid} ({name})")
+        try:
+            sp.run(["kill", pid], timeout=5, check=True)
+            print(f"  ✅ 已终止")
+        except Exception as e:
+            print(f"  ⚠️  kill 失败: {e}")
+
+
+def _web_standalone(force=False):
+    """以独立模式拉起 Web（os.execvpe 替换当前进程）。"""
+    import shutil
+    plugin = os.path.join(os.path.expanduser("~"), ".config", "opencode", "plugins", "go-rotate.ts")
+    if not os.path.exists(plugin):
+        sys.exit(f"插件未安装：{plugin}\n请先运行安装脚本 install.sh。")
+    bun = shutil.which("bun")
+    if not bun:
+        sys.exit("未找到 bun。opencode 自带 bun 运行时，或 brew install bun。")
+    code = (
+        'import("' + plugin + '").then(async m => { '
+        'await m.GoRotate({ directory: "go-rotate-web" }); '
+        '})'
+    )
+    print("== go-rotate Web 管理界面 ==")
+    print("  地址: http://localhost:8899")
+    print("  Ctrl+C 停止\n")
+    env = os.environ.copy()
+    if force:
+        env["GOROTATE_FORCE_WEB"] = "1"
     os.execvpe(bun, [bun, "-e", code], env)
 
 

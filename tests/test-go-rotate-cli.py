@@ -26,10 +26,12 @@ CLI_PATH = os.path.join(ROOT, "go-rotate")
 
 # ---------- 公共工具 ----------
 
-def run_cli(args, home, stdin_text=None, timeout=90):
+def run_cli(args, home, stdin_text=None, timeout=90, extra_env=None):
     """在临时 HOME 下跑真实 CLI。"""
     env = dict(os.environ)
     env["HOME"] = home
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         [sys.executable, CLI_PATH] + args,
         env=env, input=stdin_text,
@@ -497,6 +499,17 @@ class TestWeb(_CliCase):
     def test_web独立启动无插件退出1(self):
         """web（独立启动）在无插件 HOME → 退出 1「插件未安装」，不碰 bun/8899"""
         r = run_cli(["web"], self.home)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("插件未安装", r.stdout + r.stderr)
+
+    def test_web_restart无插件退出1(self):
+        """web restart：注入假 lsof（空输出→不 kill）→ 无插件 → 退出 1「插件未安装」"""
+        fake = os.path.join(self.home, "bin")
+        os.makedirs(fake, exist_ok=True)
+        with open(os.path.join(fake, "lsof"), "w") as f:
+            f.write("#!/bin/sh\necho -n ''\n")
+        os.chmod(os.path.join(fake, "lsof"), 0o755)
+        r = run_cli(["web", "restart"], self.home, extra_env={"PATH": fake + os.pathsep + os.environ["PATH"]})
         self.assertEqual(r.returncode, 1)
         self.assertIn("插件未安装", r.stdout + r.stderr)
 
