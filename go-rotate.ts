@@ -31,6 +31,9 @@ import {
   statSync,
 } from "node:fs"
 import path from "node:path"
+// 同步执行管理脚本（zen-gateway start/stop/restart/logs）：管理操作低频，同步调用可被
+// withLockSync 直接包裹（异步 execFile 无法在同步锁内）。bun 兼容 node:child_process。
+import { execFileSync } from "node:child_process"
 
 // 测试隔离：bun 的 homedir() 不尊重 $HOME（实测固定返回真实 home），故支持环境变量覆盖。
 // 生产环境不设这两个变量，行为与之前完全一致。
@@ -493,20 +496,83 @@ function parseStatsLog(text: string): {
 
 // 生产默认 18888；测试可用 GOROTATE_GATEWAY_BASE 指向不可达端口验证降级
 const GATEWAY_BASE = process.env.GOROTATE_GATEWAY_BASE ?? "http://127.0.0.1:18888"
+// zen-gateway 管理脚本（bash）。GOROTATE_GATEWAY_CTL 仅供测试隔离覆盖（生产不设行为不变）
+const GATEWAY_CTL = process.env.GOROTATE_GATEWAY_CTL ?? path.join(homedir(), ".local", "bin", "zen-gateway")
+// 管理操作（start 含 15s 健康等待）与日志读取的超时
+const GATEWAY_CTL_TIMEOUT_MS = 20000
+
+/** zen-gateway 管理脚本是否存在（区分「未安装」与「已安装未运行」，供前端灰卡/按钮禁用） */
+function gatewayCtlExists(): boolean {
+  return existsSync(GATEWAY_CTL)
+}
+
+/** 同步执行 zen-gateway 管理脚本（start/stop/restart/logs）。走 withLockSync 跨进程锁，
+ * 避免与插件轮换 / CLI 并发写配置。脚本不存在 / 执行失败均容错返回 {ok:false, output}。 */
+function runGatewayCtl(args: string[], timeoutMs = GATEWAY_CTL_TIMEOUT_MS): { ok: boolean; output: string } {
+  if (!gatewayCtlExists()) {
+    return {
+      ok: false,
+      output: `zen-gateway 管理脚本不存在: ${GATEWAY_CTL}（未安装？用 bash install.sh zen-gateway 安装）`,
+    }
+  }
+  try {
+    const out = execFileSync(GATEWAY_CTL, args, {
+      encoding: "utf8",
+      timeout: timeoutMs,
+      maxBuffer: 4 * 1024 * 1024,
+    })
+    return { ok: true, output: String(out).trim() }
+  } catch (e: any) {
+    const detail = e?.stderr ? String(e.stderr) : String(e?.message ?? e)
+    return { ok: false, output: detail.trim() }
+  }
+}
+
+/** 网关管理操作：start / stop / restart（真实启停 launchd 服务），withLockSync 保护 */
+function gatewayManage(action: "start" | "stop" | "restart"): { ok: boolean; output: string } {
+  return withLockSync(() => {
+    const r = runGatewayCtl([action])
+    log(`🛠️  [gateway] ${action} ${r.ok ? "成功" : "失败"}: ${(r.output || "(no output)").slice(0, 200)}`)
+    return r
+  })
+}
+
+/** 网关日志（只读）：优先 gateway 新端点 /api/gateway/log（并行团队已加则直接用），
+ * 未就绪回退 zen-gateway logs 300（bash 脚本只读命令）。失败容错，不抛异常。 */
+async function gatewayLog(): Promise<{ ok: boolean; text: string; source: string }> {
+  try {
+    const r = await fetch(GATEWAY_BASE + "/api/gateway/log", { signal: AbortSignal.timeout(2000) })
+    if (r.ok) {
+      const text = await r.text()
+      if (text && text.length > 0) return { ok: true, text, source: "gateway" }
+    }
+  } catch {}
+  // 回退：管理脚本 logs <n>（只读 tail，默认 100 行，传 300 取更多）
+  const r = runGatewayCtl(["logs", "300"], 5000)
+  return { ok: r.ok, text: r.output, source: r.ok ? "zen-gateway logs" : "none" }
+}
 
 async function gatewayStatus(): Promise<{
   running: boolean
+  ctlExists: boolean
   healthz?: any
   usage?: any
+  models?: string[]
+  modelCount?: number
   error?: string
 }> {
-  const [h, u] = await Promise.allSettled([
+  const [h, u, m] = await Promise.allSettled([
     fetch(GATEWAY_BASE + "/healthz", { signal: AbortSignal.timeout(2000) }).then((r) => r.json()),
     fetch(GATEWAY_BASE + "/api/usage", { signal: AbortSignal.timeout(2000) }).then((r) => r.json()),
+    fetch(GATEWAY_BASE + "/v1/models", { signal: AbortSignal.timeout(2000) }).then((r) => r.json()),
   ])
-  const out: any = { running: h.status === "fulfilled" }
+  const out: any = { running: h.status === "fulfilled", ctlExists: gatewayCtlExists() }
   if (h.status === "fulfilled") out.healthz = h.value
   if (u.status === "fulfilled") out.usage = u.value
+  if (m.status === "fulfilled" && Array.isArray(m.value?.data)) {
+    out.models = m.value.data.map((x: any) => x?.id).filter(Boolean)
+    out.modelCount = out.models.length
+  }
   if (h.status === "rejected") out.error = String(h.reason?.message ?? h.reason)
   return out
 }
@@ -592,6 +658,7 @@ async function handleWeb(req: any): Promise<Response> {
     return json(parseStatsLog(text))
   }
   if (method === "GET" && route === "/api/gateway") return json(await gatewayStatus())
+  if (method === "GET" && route === "/api/gateway/log") return json(await gatewayLog())
   if (route === "/api/keys/check") {
     return json({ results: await checkAllKeys() })
   }
@@ -632,10 +699,16 @@ async function handleWeb(req: any): Promise<Response> {
         if (route === "/api/settings") return setGlobalCooldown(Number(body.cooldown_minutes))
         if (route === "/api/rotate") return manualRotate()
         if (route === "/api/log/clear") return clearLog()
+        // 网关管理：start/stop/restart → {ok, output}，透传不套统一包装
+        if (route === "/api/gateway/start") return gatewayManage("start")
+        if (route === "/api/gateway/stop") return gatewayManage("stop")
+        if (route === "/api/gateway/restart") return gatewayManage("restart")
         return null
       }
       const res = run()
       if (res === null) return json({ error: "unknown route" }, 404)
+      // 网关管理返回 {ok, output}，直接透传（含失败信息供前端展示）
+      if (route.startsWith("/api/gateway/")) return json(res)
       // 添加 key 后立即探测其状态，返回给前端
       if (route === "/api/keys/add") {
         const health = await probeKey(String(body.key))
@@ -781,6 +854,14 @@ const WEB_HTML = `<!doctype html>
   .b-available { background: #1b3a2a; color: #4ade80; }
   .b-cooling { background: #3a2f1b; color: #fbbf24; }
   .b-current { background: #1e3a5f; color: #60a5fa; margin-left: 6px; }
+  .b-running { background: #1b3a2a; color: #4ade80; }
+  .b-stopped { background: #333b46; color: #9aa3ad; }
+  .b-error { background: #3b1d1d; color: #f87171; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  button:disabled:hover { background: #242a33; }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .small { font-size: 12px; }
+  .model-list { font-size: 12px; color: #9aa3ad; word-break: break-all; }
   button { background: #242a33; color: #e6e8eb; border: 1px solid #333b46; border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 13px; }
   button:hover { background: #2e3642; }
   button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
@@ -841,16 +922,35 @@ const WEB_HTML = `<!doctype html>
 
   <div class="card" id="gateway-card">
     <div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between">
-      <b>zen-gateway 状态 <span id="gw-badge"></span></b>
+      <b>网关管理 <span id="gw-badge"></span></b>
       <span class="muted">127.0.0.1:18888</span>
     </div>
     <div class="stats" style="margin-bottom:8px">
       <div class="stat"><div class="v" id="gw-current">-</div><div class="l">当前 key</div></div>
-      <div class="stat"><div class="v" id="gw-avail">-</div><div class="l">可用</div></div>
+      <div class="stat"><div class="v" id="gw-avail">-</div><div class="l">可用 / key 数</div></div>
       <div class="stat"><div class="v" id="gw-rot">-</div><div class="l">轮换数</div></div>
       <div class="stat"><div class="v" id="gw-req">-</div><div class="l">总请求</div></div>
+      <div class="stat"><div class="v" id="gw-mcount">-</div><div class="l">模型数</div></div>
+    </div>
+    <div class="row" style="margin-bottom:10px">
+      <span class="muted" style="flex:1">管理操作（启停 launchd 服务，走跨进程锁）：</span>
+      <button id="gw-start" onclick="gwManage('start')">启动</button>
+      <button id="gw-stop" onclick="gwManage('stop')">停止</button>
+      <button id="gw-restart" onclick="gwManage('restart')">重启</button>
     </div>
     <div id="gw-body"><span class="muted">加载中…</span></div>
+    <div id="gw-ctl-msg" class="msg" style="margin-top:6px"></div>
+  </div>
+
+  <div class="card">
+    <div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between">
+      <b>网关日志</b>
+      <div class="row">
+        <span class="muted" id="gwlog-src"></span>
+        <button onclick="refreshGwLog()">刷新</button>
+      </div>
+    </div>
+    <pre id="gwlogview"></pre>
   </div>
 
   <div class="card">
@@ -1041,35 +1141,54 @@ async function refreshStats() {
   } catch (e) { document.getElementById("st-total").textContent = "n/a" }
 }
 
-/* ---- zen-gateway 跨进程状态（/api/gateway，失败灰卡降级） ---- */
+/* ---- zen-gateway 网关管理（/api/gateway + 管理路由，失败灰卡降级） ---- */
 async function refreshGateway() {
   const card = document.getElementById("gateway-card")
   const badge = document.getElementById("gw-badge")
+  const setDash = () => {
+    document.getElementById("gw-current").textContent = "-"
+    document.getElementById("gw-avail").textContent = "-"
+    document.getElementById("gw-rot").textContent = "-"
+    document.getElementById("gw-req").textContent = "-"
+    document.getElementById("gw-mcount").textContent = "-"
+  }
+  // 管理按钮：start 在未运行且已安装时可用；stop/restart 在运行中可用
+  const setBtns = (running, installed) => {
+    document.getElementById("gw-start").disabled = running || !installed
+    document.getElementById("gw-stop").disabled = !running || !installed
+    document.getElementById("gw-restart").disabled = !running || !installed
+  }
   try {
     const g = await api("/api/gateway")
-    const setDash = () => {
-      document.getElementById("gw-current").textContent = "-"
-      document.getElementById("gw-avail").textContent = "-"
-      document.getElementById("gw-rot").textContent = "-"
-      document.getElementById("gw-req").textContent = "-"
-    }
+    const installed = !!g.ctlExists
     if (!g.running) {
       card.style.opacity = "0.55"
-      badge.innerHTML = '<span class="badge b-cooling">未运行</span>'
       setDash()
-      document.getElementById("gw-body").innerHTML =
-        '<span class="muted">zen-gateway 服务未运行' + (g.error ? '（' + g.error + '）' : '') +
-        '。可用 <code>zen-gateway start</code> 启动。</span>'
+      if (!installed) {
+        badge.innerHTML = '<span class="badge b-stopped">未安装</span>'
+        setBtns(false, false)
+        document.getElementById("gw-body").innerHTML =
+          '<span class="muted">未检测到 zen-gateway 管理脚本' +
+          '（<code>~/.local/bin/zen-gateway</code>）。可用 <code>bash install.sh zen-gateway</code> 安装。</span>'
+      } else {
+        badge.innerHTML = '<span class="badge b-stopped">未运行</span>'
+        setBtns(false, true)
+        document.getElementById("gw-body").innerHTML =
+          '<span class="muted">zen-gateway 服务未运行' + (g.error ? '（' + g.error + '）' : '') +
+          '。点「启动」拉起 launchd 服务。</span>'
+      }
       return
     }
     card.style.opacity = "1"
+    badge.innerHTML = '<span class="badge b-running">运行中</span>'
+    setBtns(true, true)
     const h = g.healthz || {}
     const u = g.usage || {}
-    badge.innerHTML = '<span class="badge b-available">运行中</span>'
     document.getElementById("gw-current").textContent = h.current || "-"
     document.getElementById("gw-avail").textContent = (h.available ?? "-") + "/" + (h.keys ?? "-")
     document.getElementById("gw-rot").textContent = h.rotations ?? "-"
     document.getElementById("gw-req").textContent = u.totalRequests ?? "-"
+    document.getElementById("gw-mcount").textContent = g.modelCount ?? "-"
     const pk = u.perKey || {}
     const names = Object.keys(pk)
     let html = '<span class="muted">暂无用量记录</span>'
@@ -1081,11 +1200,58 @@ async function refreshGateway() {
       })
       html += '</tbody></table>'
     }
+    // 模型列表：小字显示数量 + 前几个，details 展开看全部
+    const models = g.models || []
+    if (models.length) {
+      const preview = models.slice(0, 4).join(", ") + (models.length > 4 ? " …" : "")
+      html += '<details class="small" style="margin-top:6px"><summary class="muted" style="cursor:pointer">' +
+        '模型（' + models.length + '）：' + preview + '</summary>' +
+        '<div class="model-list" style="margin-top:4px">' + models.join("<br>") + '</div></details>'
+    }
     document.getElementById("gw-body").innerHTML = html
   } catch (e) {
     card.style.opacity = "0.55"
-    badge.innerHTML = '<span class="badge b-cooling">未运行</span>'
+    badge.innerHTML = '<span class="badge b-error">状态获取失败</span>'
+    setDash()
+    setBtns(false, false)
     document.getElementById("gw-body").innerHTML = '<span class="muted">获取失败：' + e.message + '</span>'
+  }
+}
+/* 管理操作：start/stop/restart（真实启停）。成功后 800ms 刷新状态（launchd 拉起有延迟）。 */
+async function gwManage(action) {
+  const btn = document.getElementById("gw-" + action)
+  const msg = document.getElementById("gw-ctl-msg")
+  const label = { start: "启动", stop: "停止", restart: "重启" }[action] || action
+  btn.disabled = true
+  msg.textContent = label + "中（可能需数秒）…"
+  msg.className = "msg"
+  try {
+    const r = await api("/api/gateway/" + action, {})
+    msg.textContent = r.ok ? (r.output || label + "成功") : (r.output || label + "失败")
+    msg.className = r.ok ? "msg" : "msg err"
+    showMsg("网关" + label + (r.ok ? "完成" : "失败"))
+    setTimeout(refreshGateway, 800)
+  } catch (e) {
+    msg.textContent = e.message
+    msg.className = "msg err"
+    btn.disabled = false
+  }
+}
+
+/* ---- 网关日志（/api/gateway/log，只读文本 + 手动刷新） ---- */
+async function refreshGwLog() {
+  const pre = document.getElementById("gwlogview")
+  pre.textContent = "加载中…"
+  try {
+    const r = await api("/api/gateway/log")
+    document.getElementById("gwlog-src").textContent =
+      r.source === "gateway" ? "来源: gateway /api/gateway/log" :
+      r.source === "zen-gateway logs" ? "来源: zen-gateway logs 300" : ""
+    pre.textContent = r.text || "(空)"
+    pre.style.color = r.ok ? "" : "#f87171"
+  } catch (e) {
+    pre.textContent = "获取失败: " + e.message
+    pre.style.color = "#f87171"
   }
 }
 
@@ -1114,7 +1280,7 @@ async function clearLog() {
   try { await api("/api/log/clear", {}); refreshLog(); showMsg("日志已清空") }
   catch (e) { showErr(e.message) }
 }
-refresh(); refreshLog(); refreshStats(); refreshGateway();
+refresh(); refreshLog(); refreshStats(); refreshGateway(); refreshGwLog();
 setInterval(refresh, 5000);
 setInterval(refreshStats, 10000);
 // gateway 拉取带 2s 超时，独立异步刷新避免阻塞 status 轮询
@@ -1155,5 +1321,8 @@ export {
   setGlobalCooldown,
   parseStatsLog,
   gatewayStatus,
+  gatewayManage,
+  gatewayLog,
+  gatewayCtlExists,
   handleWeb,
 }

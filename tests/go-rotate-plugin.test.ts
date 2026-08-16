@@ -27,6 +27,8 @@ import {
   renameSync,
   rmSync,
   utimesSync,
+  chmodSync,
+  unlinkSync,
 } from "node:fs"
 import path from "node:path"
 
@@ -43,6 +45,11 @@ const AUTH_FILE = path.join(AUTH_DIR, "auth.json")
 
 process.env.GOROTATE_CONFIG_FILE = CFG_FILE
 process.env.GOROTATE_AUTH_FILE = AUTH_FILE
+// 网关管理隔离：GOROTATE_GATEWAY_CTL 指向临时假脚本（真实启停绝不在测试里执行）；
+// GOROTATE_GATEWAY_BASE 指向不可达端口，强制 gatewayStatus/gatewayLog 走降级/回退分支。
+const FAKE_CTL = path.join(TMP_ROOT, "zen-gateway")
+process.env.GOROTATE_GATEWAY_CTL = FAKE_CTL
+process.env.GOROTATE_GATEWAY_BASE = "http://127.0.0.1:59999"
 mkdirSync(CFG_DIR, { recursive: true })
 mkdirSync(AUTH_DIR, { recursive: true })
 writeFileSync(CFG_FILE, JSON.stringify({ provider_id: "opencode-go", cooldown_minutes: 300, current: "", keys: [], auto_web: false }))
@@ -626,5 +633,112 @@ describe("日志与 Web（只读，不 bind 8899）", () => {
     expect(html).toContain('api("/api/keys/update", { name, patch })')
     // webOn 显示 restarted（基线 ⑧ 立即重启）
     expect(html).toContain("r.restarted ? \"Web 已重新启动（立即生效）\" : \"已开启 Web 自动启动\"")
+  })
+})
+
+/* ================= 网关管理（Web 面板 + 管理路由，隔离假脚本，绝不真实启停） ================= */
+
+const FAKE_CTL_BODY = "#!/bin/sh\n# fake zen-gateway for isolated tests (never touches real launchd)\necho \"fake zen-gateway $*\"\n"
+
+describe("网关管理 UI（WEB_HTML 内嵌）", () => {
+  test("WEB_HTML 含网关管理卡片元素：管理按钮 / 状态徽标 / 模型数 / 管理消息 / 网关日志区", () => {
+    const html: string = (mod as any).WEB_HTML
+    expect(html).toContain("网关管理")
+    expect(html).toContain('id="gw-badge"')
+    expect(html).toContain('id="gw-mcount"')
+    expect(html).toContain('id="gw-start" onclick="gwManage(\'start\')"')
+    expect(html).toContain('id="gw-stop" onclick="gwManage(\'stop\')"')
+    expect(html).toContain('id="gw-restart" onclick="gwManage(\'restart\')"')
+    expect(html).toContain('id="gw-ctl-msg"')
+    // 网关日志区（独立卡片 + 刷新按钮 + 只读 pre）
+    expect(html).toContain("网关日志")
+    expect(html).toContain('onclick="refreshGwLog()"')
+    expect(html).toContain('id="gwlogview"')
+    // 管理 JS：gwManage 调 /api/gateway/<action>，成功后 800ms 刷新状态
+    expect(html).toContain("async function gwManage(action)")
+    expect(html).toContain('api("/api/gateway/" + action, {})')
+    expect(html).toContain("setTimeout(refreshGateway, 800)")
+    expect(html).toContain("async function refreshGwLog()")
+    // 徽标三态样式（running 绿 / stopped 灰 / error 红）
+    expect(html).toContain(".b-running")
+    expect(html).toContain(".b-stopped")
+    expect(html).toContain(".b-error")
+    // 启动序列包含 refreshGwLog
+    expect(html).toContain("refresh(); refreshLog(); refreshStats(); refreshGateway(); refreshGwLog();")
+  })
+})
+
+describe("网关管理路由（POST /api/gateway/start|stop|restart，假脚本隔离）", () => {
+  test("有管理脚本时 start/stop/restart 均返回 {ok:true, output}（假脚本 echo）", async () => {
+    // 写假脚本（import 前已设 GOROTATE_GATEWAY_CTL=FAKE_CTL 固化 GATEWAY_CTL）
+    writeFileSync(FAKE_CTL, FAKE_CTL_BODY, { mode: 0o755 })
+    chmodSync(FAKE_CTL, 0o755)
+    for (const action of ["start", "stop", "restart"]) {
+      const req = new Request(`http://127.0.0.1:8899/api/gateway/${action}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      })
+      const res = await mod.handleWeb(req)
+      expect(res.status).toBe(200)
+      const j = await res.json()
+      expect(j.ok).toBe(true)
+      expect(j.output).toBe(`fake zen-gateway ${action}`)
+      expect(j.status).toBeUndefined() // 管理路由透传 {ok,output}，不套统一包装
+    }
+  })
+  test("无管理脚本（未安装）→ {ok:false} 且 output 提示脚本不存在，不抛异常", async () => {
+    unlinkSync(FAKE_CTL) // 模拟未安装：删除脚本
+    expect(mod.gatewayCtlExists()).toBe(false)
+    const req = new Request("http://127.0.0.1:8899/api/gateway/start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    })
+    const res = await mod.handleWeb(req)
+    expect(res.status).toBe(200)
+    const j = await res.json()
+    expect(j.ok).toBe(false)
+    expect(j.output).toContain("不存在")
+    expect(j.output).toContain("install.sh zen-gateway")
+  })
+  test("脚本存在但 18888 不可达 → GET /api/gateway 降级 running=false + ctlExists=true", async () => {
+    writeFileSync(FAKE_CTL, FAKE_CTL_BODY, { mode: 0o755 })
+    const req = new Request("http://127.0.0.1:8899/api/gateway")
+    const res = await mod.handleWeb(req)
+    expect(res.status).toBe(200)
+    const j = await res.json()
+    expect(j.running).toBe(false)
+    expect(j.ctlExists).toBe(true)
+    expect(typeof j.error).toBe("string") // fetch 59999 失败的错误原因
+  })
+  test("GET /api/gateway/log 有响应：fetch 不可达回退假脚本 logs（source=zen-gateway logs）", async () => {
+    const req = new Request("http://127.0.0.1:8899/api/gateway/log")
+    const res = await mod.handleWeb(req)
+    expect(res.status).toBe(200)
+    const j = await res.json()
+    expect(j.ok).toBe(true)
+    expect(j.source).toBe("zen-gateway logs")
+    expect(j.text).toContain("fake zen-gateway logs 300")
+  })
+  test("未安装（无脚本）时 GET /api/gateway/log 回退也失败，text 提示脚本不存在", async () => {
+    unlinkSync(FAKE_CTL)
+    const req = new Request("http://127.0.0.1:8899/api/gateway/log")
+    const res = await mod.handleWeb(req)
+    expect(res.status).toBe(200)
+    const j = await res.json()
+    expect(j.ok).toBe(false)
+    expect(j.text).toContain("不存在")
+  })
+  test("未知网关 POST 路由 → 404 unknown route", async () => {
+    const req = new Request("http://127.0.0.1:8899/api/gateway/frobnicate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    })
+    const res = await mod.handleWeb(req)
+    expect(res.status).toBe(404)
+    const j = await res.json()
+    expect(j.error).toBe("unknown route")
   })
 })

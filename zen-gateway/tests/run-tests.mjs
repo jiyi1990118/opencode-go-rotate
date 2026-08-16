@@ -1093,6 +1093,171 @@ try {
   rmSync(zauthTmp, { recursive: true, force: true })
 } catch {}
 
+/* ================= 16. /api/gateway/* 只读管理端点组装纯函数 ================= */
+group("gatewayStatusSummary（/api/gateway/status 组装）")
+
+const _statusCfg = {
+  provider_id: "opencode-go",
+  cooldown_minutes: 30,
+  current: "act1",
+  keys: [
+    { name: "act1", key: "sk-fake-act1", cooldown_until: null },
+    { name: "act2", key: "sk-fake-act2", cooldown_until: "2026-08-16T00:00:00.000Z" },
+  ],
+}
+
+t("基本字段齐全：running/port/defaultModel/modelCount/keys/current/usageFile/upstreamBase/models", () => {
+  const s = gw.gatewayStatusSummary(_statusCfg)
+  assert.equal(s.running, true)
+  assert.equal(s.port, 18888) // 测试 env 未设 ZEN_GATEWAY_PORT → DEFAULT_PORT
+  assert.equal(s.defaultModel, "hy3")
+  assert.equal(s.modelCount, 26)
+  assert.equal(s.keys, 2)
+  assert.equal(s.current, "act1")
+  assert.ok(s.usageFile.endsWith("usage.jsonl"))
+  assert.equal(s.upstreamBase, "https://opencode.ai/zen/go/v1")
+  assert.ok(Array.isArray(s.models))
+})
+
+t("models 数组与 modelCount 一致且含真实模型（hy3 / grok-4.5）", () => {
+  const s = gw.gatewayStatusSummary(_statusCfg)
+  assert.equal(s.models.length, s.modelCount)
+  assert.ok(s.models.includes("hy3"))
+  assert.ok(s.models.includes("grok-4.5"))
+})
+
+t("models 返回拷贝：push 不污染模块常量（再取 modelCount 仍 26）", () => {
+  const s = gw.gatewayStatusSummary(_statusCfg)
+  s.models.push("__POLLUTED__")
+  assert.equal(gw.gatewayStatusSummary(_statusCfg).modelCount, 26)
+  assert.ok(!gw.gatewayStatusSummary(_statusCfg).models.includes("__POLLUTED__"))
+})
+
+t("opts.port 可注入（路由传模块 PORT，单测可覆盖 env 覆盖语义）", () => {
+  assert.equal(gw.gatewayStatusSummary(_statusCfg, { port: 18900 }).port, 18900)
+})
+
+t("opts.running=false 可注入", () => {
+  assert.equal(gw.gatewayStatusSummary(_statusCfg, { running: false }).running, false)
+})
+
+t("空/损坏 cfg 容错：keys=0 current='' 不抛错", () => {
+  assert.equal(gw.gatewayStatusSummary({}).keys, 0)
+  assert.equal(gw.gatewayStatusSummary({}).current, "")
+  assert.equal(gw.gatewayStatusSummary(null).keys, 0)
+})
+
+group("gatewayConfigSummary（/api/gateway/config 摘要不泄漏 key）")
+
+t("keys 仅含 name/cooldown_until 两键（无 key 明文字段）", () => {
+  const c = gw.gatewayConfigSummary(_statusCfg)
+  assert.equal(c.keys.length, 2)
+  for (const k of c.keys) assert.deepEqual(Object.keys(k).sort(), ["cooldown_until", "name"])
+})
+
+t("序列化后不含 key 明文（sk- 前缀与 key 字段绝不出现）", () => {
+  const json = JSON.stringify(gw.gatewayConfigSummary(_statusCfg))
+  assert.ok(!json.includes("sk-fake"))
+  assert.ok(!json.includes('"key"'))
+})
+
+t("cooldownMinutes 透传 cfg.cooldown_minutes；缺省回退 300；0 保留", () => {
+  assert.equal(gw.gatewayConfigSummary(_statusCfg).cooldownMinutes, 30)
+  assert.equal(gw.gatewayConfigSummary({}).cooldownMinutes, 300)
+  assert.equal(gw.gatewayConfigSummary({ cooldown_minutes: 0 }).cooldownMinutes, 0)
+})
+
+t("current 透传", () => {
+  assert.equal(gw.gatewayConfigSummary(_statusCfg).current, "act1")
+})
+
+t("autoWeb：raw.auto_web=true/false → 对应值；raw 无该字段/非布尔/缺失 → 键不存在", () => {
+  assert.equal(gw.gatewayConfigSummary(_statusCfg, { auto_web: true }).autoWeb, true)
+  assert.equal(gw.gatewayConfigSummary(_statusCfg, { auto_web: false }).autoWeb, false)
+  assert.ok(!("autoWeb" in gw.gatewayConfigSummary(_statusCfg, {})))
+  assert.ok(!("autoWeb" in gw.gatewayConfigSummary(_statusCfg, { auto_web: "yes" })))
+  assert.ok(!("autoWeb" in gw.gatewayConfigSummary(_statusCfg, null)))
+  assert.ok(!("autoWeb" in gw.gatewayConfigSummary(_statusCfg)))
+})
+
+t("空 cfg 容错：keys=[] current='' cooldownMinutes=300", () => {
+  const c = gw.gatewayConfigSummary(null)
+  assert.deepEqual(c.keys, [])
+  assert.equal(c.current, "")
+  assert.equal(c.cooldownMinutes, 300)
+})
+
+t("readRawConfig：临时配置含 auto_web 可读回；损坏 JSON → null（不抛错）", () => {
+  const cfgPath = process.env.ZEN_CONFIG
+  writeFileSync(cfgPath, JSON.stringify({ auto_web: false, keys: [{ name: "x", key: "sk-x" }] }, null, 2))
+  const raw = gw.readRawConfig()
+  assert.equal(raw.auto_web, false)
+  assert.equal(raw.keys[0].name, "x")
+  writeFileSync(cfgPath, "{ broken json")
+  assert.equal(gw.readRawConfig(), null)
+  // 恢复合理内容，避免影响后续（若有）
+  writeFileSync(
+    cfgPath,
+    JSON.stringify({ provider_id: "opencode-go", current: "good", keys: [{ name: "good", key: "sk-fake-good" }] }, null, 2),
+  )
+})
+
+group("gatewayModelsSummary（/api/gateway/models 组装）")
+
+t("models 26 个真实内置模型 + 别名映射含 grok-code→hy3 / gpt-4o→glm-5.2", () => {
+  const m = gw.gatewayModelsSummary()
+  assert.equal(m.models.length, 26)
+  assert.ok(m.models.includes("hy3"))
+  assert.equal(m.aliases["grok-code"], "hy3")
+  assert.equal(m.aliases["gpt-4o"], "glm-5.2")
+})
+
+t("拷贝语义：push models / 改 aliases 不污染模块常量", () => {
+  const m = gw.gatewayModelsSummary()
+  m.models.push("__POLLUTED__")
+  m.aliases["__POLLUTED__"] = "x"
+  const m2 = gw.gatewayModelsSummary()
+  assert.ok(!m2.models.includes("__POLLUTED__"))
+  assert.ok(!("__POLLUTED__" in m2.aliases))
+})
+
+group("getLogRing（内存环形日志缓冲）")
+
+t("LOG_RING_MAX === 200", () => {
+  assert.equal(gw.LOG_RING_MAX, 200)
+})
+
+t("初始结构：lines 数组、total 数字、lines.length === Math.min(total, 200)", () => {
+  const r = gw.getLogRing()
+  assert.ok(Array.isArray(r.lines))
+  assert.equal(typeof r.total, "number")
+  assert.equal(r.lines.length, Math.min(r.total, 200))
+})
+
+t("FIFO 顺序：追加 3 条后 total +3、末条为最近 marker", () => {
+  const before = gw.getLogRing().total
+  for (let i = 1; i <= 3; i++) gw.log(`__RING_FIFO_${i}__`)
+  const r = gw.getLogRing()
+  assert.equal(r.total, before + 3)
+  assert.ok(r.lines[r.lines.length - 1].includes("__RING_FIFO_3__"))
+})
+
+t("上限 200：追加 250 条唯一 marker → lines 保持 200、total 累计 +250、首条为第 51 条、末条为第 250 条", () => {
+  const before = gw.getLogRing().total
+  for (let i = 1; i <= 250; i++) gw.log(`__RING_TEST_${i}__`)
+  const r = gw.getLogRing()
+  assert.equal(r.total, before + 250)
+  assert.equal(r.lines.length, 200)
+  assert.ok(r.lines[0].includes("__RING_TEST_51__"), "环形缓冲首条应为第 51 条（前 50 条被挤出）")
+  assert.ok(r.lines[199].includes("__RING_TEST_250__"), "末条应为最近一条")
+})
+
+t("max 参数：getLogRing(5) 只返回最近 5 条", () => {
+  const r = gw.getLogRing(5)
+  assert.equal(r.lines.length, 5)
+  assert.ok(r.lines[4].includes("__RING_TEST_250__"))
+})
+
 /* ================= 汇总 ================= */
 console.log(`\n${"=".repeat(64)}`)
 const total = passed + failures.length

@@ -8,6 +8,7 @@ Usage:
   go-rotate init             interactive first-time setup
   go-rotate web              start the web UI standalone (no opencode needed)
   go-rotate web on|off|status  toggle auto-start web on opencode launch (off = no port, rotation still works)
+  go-rotate gateway {start|stop|restart|status|logs [n]}  manage zen-gateway service (launchd LaunchAgent)
   go-rotate set <name>       switch to a named key (and sync auth.json)
   go-rotate next [minutes]   rotate to next available key (optional cooldown minutes)
   go-rotate add <name> <key> add a key
@@ -23,6 +24,7 @@ Sync target: ~/.local/share/opencode/auth.json -> opencode-go.key
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -32,6 +34,15 @@ CONFIG_FILE = os.path.join(DATA_DIR, "go-keys.json")
 AUTH_FILE = os.path.join(os.path.expanduser("~"), ".local", "share", "opencode", "auth.json")
 LOG_FILE = "/tmp/opencode-go-rotate.log"
 DEFAULT_COOLDOWN_MIN = 300
+
+# zen-gateway 服务（launchd LaunchAgent）路径与端口（与 zen-gateway 管理脚本语义一致）
+GATEWAY_LABEL = "com.go-rotate.zen-gateway"
+GATEWAY_PLIST = os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents", GATEWAY_LABEL + ".plist")
+GATEWAY_LOG = os.path.join(os.path.expanduser("~"), "Library", "Logs", "zen-gateway.log")
+try:
+    GATEWAY_PORT = int(os.environ.get("ZEN_GATEWAY_PORT") or "18888")
+except ValueError:
+    GATEWAY_PORT = 18888
 
 # 与 go-rotate.ts 插件一致的锁参数
 LOCK_FILE = CONFIG_FILE + ".lock"
@@ -136,6 +147,9 @@ def do_status(cfg):
         else:
             stshow = ""
         print(f"{mark}{k['name']:<12} {k['key'][:16]}...{stshow}  {fmt_until(k.get('cooldown_until'))}")
+    # 网关状态（容错：网关没装/没跑不报错，2s 超时）
+    ok, _ = _gateway_healthz()
+    print(f"网关: running ({GATEWAY_PORT})" if ok else "网关: stopped")
 
 
 def do_set(cfg, name):
@@ -472,6 +486,175 @@ def do_stats():
         print(f"{name:<12} 被切到 {rotated.get(name, 0):<3} 次   进冷却 {cooling.get(name, 0):<3} 次   最近切换 {last_switch.get(name, '-')}")
 
 
+# ---------- gateway 子命令（统一管理 zen-gateway launchd 服务） ----------
+# 与 zen-gateway/zen-gateway（bash 管理脚本）语义一致，但用 Python + subprocess 调 launchctl。
+# 用户域操作：bootstrap gui/$(id -u) <plist> / bootout gui/$(id -u)/<label> / print / kickstart。
+
+GATEWAY_USAGE = (
+    "用法: go-rotate gateway {start|stop|restart|status|logs [行数]}\n"
+    "  start    幂等启动 zen-gateway 服务（launchd LaunchAgent，已加载则跳过）\n"
+    "  stop     停止服务（launchctl bootout）\n"
+    "  restart  重启服务（stop + start）\n"
+    "  status   查看运行状态（stopped/running/健康检查未通过）+ 端口 + key 数\n"
+    "  logs     查看网关日志（默认 ~/Library/Logs/zen-gateway.log，行数默认 100）\n"
+)
+
+
+def _launchctl(args):
+    """执行 launchctl 命令，返回 (returncode, stdout, stderr)。异常容错：找不到/崩溃返回 -1。"""
+    try:
+        p = subprocess.run(["launchctl"] + list(args), capture_output=True, text=True, timeout=10)
+        return p.returncode, p.stdout, p.stderr
+    except FileNotFoundError:
+        return -1, "", "launchctl not found"
+    except Exception as e:
+        return -1, "", str(e)
+
+
+def _gateway_healthz():
+    """探测网关 /healthz（2s 超时），返回 (ok, info)。网关没装/没跑不报错。"""
+    import urllib.request
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 本地探测不走代理
+    try:
+        with opener.open(f"http://127.0.0.1:{GATEWAY_PORT}/healthz", timeout=2) as r:
+            if r.status != 200:
+                return False, {}
+            return True, json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return False, {}
+
+
+def _gateway_loaded():
+    """launchctl print 成功 = LaunchAgent 已加载（返回非 0 = 未加载）。"""
+    rc, _, _ = _launchctl(["print", f"gui/{os.getuid()}/{GATEWAY_LABEL}"])
+    return rc == 0
+
+
+def _gateway_boot():
+    """加载 LaunchAgent：优先新版 bootstrap，回退旧版 load（幂等）。"""
+    rc, _, _ = _launchctl(["bootstrap", f"gui/{os.getuid()}", GATEWAY_PLIST])
+    if rc == 0:
+        return True
+    rc, _, _ = _launchctl(["load", GATEWAY_PLIST])
+    return rc == 0
+
+
+def _gateway_bootout():
+    """卸载 LaunchAgent：优先 bootout label，回退 bootout plist / unload（幂等）。"""
+    rc, _, _ = _launchctl(["bootout", f"gui/{os.getuid()}/{GATEWAY_LABEL}"])
+    if rc == 0:
+        return True
+    _launchctl(["bootout", f"gui/{os.getuid()}", GATEWAY_PLIST])
+    _launchctl(["unload", GATEWAY_PLIST])
+    return False
+
+
+def _gateway_key_count():
+    """读 go-keys.json 的 key 数；读不到返回 None（容错，不影响服务管理）。"""
+    try:
+        with open(CONFIG_FILE) as f:
+            return len(json.load(f).get("keys", []))
+    except Exception:
+        return None
+
+
+def _gateway_wait_health(timeout_sec=15):
+    """轮询 /healthz 直到通过（每 0.25s 一次，默认最多 15s，与 bash 管理脚本一致）。"""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        if _gateway_healthz()[0]:
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def _gateway_start():
+    """幂等启动：plist 不存在报错；已加载则跳过（健康失败给警告）；否则 bootstrap + 健康等待。"""
+    if not os.path.exists(GATEWAY_PLIST):
+        sys.exit(f"未安装服务（找不到 {GATEWAY_PLIST} ）。\n请先: bash install.sh zen-gateway")
+    if _gateway_loaded():
+        if _gateway_healthz()[0]:
+            print(f"✅ 已在运行（{GATEWAY_LABEL}，端口 {GATEWAY_PORT}）")
+        else:
+            print(f"⚠️  服务已加载但健康检查未通过（http://127.0.0.1:{GATEWAY_PORT}/healthz）")
+            print("   请查看日志: go-rotate gateway logs")
+        return
+    print(f"启动 {GATEWAY_LABEL} ...")
+    _gateway_boot()
+    if _gateway_wait_health():
+        print(f"✅ 启动成功 → http://127.0.0.1:{GATEWAY_PORT}/healthz")
+    else:
+        print(f"⚠️  已加载但健康检查未通过（可能端口 {GATEWAY_PORT} 被占用或依赖未就绪）。")
+        print("   请查看日志: go-rotate gateway logs")
+
+
+def _gateway_stop():
+    """停止服务：未加载提示；已加载 bootout（幂等）。"""
+    if not _gateway_loaded():
+        print("⚠️  未在运行（服务已停止或未加载）")
+        return
+    print(f"停止 {GATEWAY_LABEL} ...")
+    _gateway_bootout()
+    print("✅ 已停止")
+
+
+def _gateway_restart():
+    """重启 = stop + start（未运行则直接 start）。"""
+    if _gateway_loaded():
+        print(f"停止 {GATEWAY_LABEL} ...")
+        _gateway_bootout()
+        print("✅ 已停止")
+    else:
+        print("服务未运行，直接启动")
+    _gateway_start()
+
+
+def _gateway_status():
+    """打印运行状态（stopped / running / 健康检查未通过）+ 端口 + key 数。"""
+    if _gateway_loaded():
+        ok, _ = _gateway_healthz()
+        state = "running" if ok else "running（健康检查未通过）"
+    else:
+        state = "stopped"
+    print(f"状态: {state}")
+    print(f"端口: {GATEWAY_PORT}")
+    n = _gateway_key_count()
+    print(f"key 数: {n if n is not None else '未知'}")
+
+
+def _gateway_logs(n_str="100"):
+    """tail 网关日志（纯 Python 读末 n 行，无 tail 命令依赖）。"""
+    if not os.path.exists(GATEWAY_LOG):
+        print(f"⚠️  日志文件不存在: {GATEWAY_LOG}")
+        return
+    try:
+        n = max(1, int(n_str))
+    except (TypeError, ValueError):
+        n = 100
+    with open(GATEWAY_LOG, encoding="utf-8", errors="replace") as f:
+        lines = f.readlines()
+    sys.stdout.write("".join(lines[-n:]))
+
+
+def do_gateway(action, argv=None):
+    """zen-gateway 服务管理：go-rotate gateway {start|stop|restart|status|logs [n]}"""
+    argv = argv or []
+    if action == "start":
+        _gateway_start()
+    elif action == "stop":
+        _gateway_stop()
+    elif action == "restart":
+        _gateway_restart()
+    elif action == "status":
+        _gateway_status()
+    elif action == "logs":
+        _gateway_logs(argv[0] if argv else "100")
+    else:
+        print(GATEWAY_USAGE)
+        if action is not None:
+            sys.exit(1)
+
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -497,6 +680,14 @@ def main():
         return
     if cmd == "stats":
         do_stats()
+        return
+    if cmd == "gateway":
+        sub = args[1] if len(args) > 1 else None
+        # start/stop/restart 是启停操作 → 持配置锁（避免与插件轮换并发写配置）；status/logs 只读不锁
+        if sub in ("start", "stop", "restart"):
+            _with_lock(lambda: do_gateway(sub, args[2:]))
+        else:
+            do_gateway(sub, args[2:])
         return
     if cmd in ("status", "list"):
         do_status(load())

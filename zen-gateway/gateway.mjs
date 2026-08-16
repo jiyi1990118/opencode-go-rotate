@@ -70,6 +70,7 @@ const LOG_KEEP = 3
 const PROBE_TIMEOUT_MS = 15000
 const UPSTREAM_TIMEOUT_MS = 300000 // 流式可能持续较久，放宽到 5 分钟
 const MAX_BODY_BYTES = 8 * 1024 * 1024 // 请求体上限 8MB（防内存 DoS）
+const LOG_RING_MAX = 200 // 内存环形日志上限（/api/gateway/log 只读端点用）
 
 /* 用量持久化趋势：usage.jsonl 追加日志（重启不清零，供 tail -f / 后续分析）。
  * 与 gateway 安装目录同族：~/.local/share/zen-gateway/ 不含 opencode 凭据。 */
@@ -107,12 +108,25 @@ function rotateLogIfNeeded() {
   } catch {}
 }
 
+const _logRing = [] // 内存环形日志（只读端点 /api/gateway/log 用；launchd 下日志文件在 ~/Library/Logs 进程内不可靠，故维护内存副本）
+let _logTotal = 0 // 自进程启动以来 log 调用累计条数（环形缓冲被截断后仍可看总量）
+
 const log = (m) => {
+  const line = `[${new Date().toISOString()}] [gateway] ${m}`
+  _logRing.push(line)
+  if (_logRing.length > LOG_RING_MAX) _logRing.shift()
+  _logTotal++
   try {
     rotateLogIfNeeded()
-    appendFileSync(LOG_FILE, `[${new Date().toISOString()}] [gateway] ${m}\n`)
+    appendFileSync(LOG_FILE, line + "\n")
   } catch {}
 }
+
+/** 内存环形日志读取（只读端点用）：返回最近 max 条 + 累计条数。不读文件（仅内存副本）。 */
+const getLogRing = (max = LOG_RING_MAX) => ({
+  lines: _logRing.slice(-max),
+  total: _logTotal,
+})
 
 /* ---------------- 用量持久化趋势（usage.jsonl） ----------------
  * 每次 sendWithRotation 完成后追加一行 JSON。零依赖、appendFileSync 简单可靠。
@@ -277,6 +291,17 @@ function loadConfig() {
 function saveConfig(cfg) {
   mkdirSync(DATA_DIR, { recursive: true })
   atomicWrite(CONFIG_FILE, JSON.stringify(cfg, null, 2))
+}
+
+/** 读 go-keys.json 原始 JSON（不校验/过滤），供只读端点取 loadConfig 未透传的扩展字段（如 auto_web）。
+ *  文件缺失/损坏 → null（调用方无需 try/catch）。绝不返回 key 值。 */
+function readRawConfig() {
+  try {
+    if (!existsSync(CONFIG_FILE)) return null
+    return JSON.parse(readFileSync(CONFIG_FILE, "utf8"))
+  } catch {
+    return null
+  }
 }
 
 function syncAuth(key) {
@@ -1541,6 +1566,18 @@ const server = http.createServer(async (req, res) => {
   if (method === "GET" && route === "/api/usage/trend") {
     return handleUsageTrend(res, url)
   }
+  if (method === "GET" && route === "/api/gateway/status") {
+    return sendJson(res, 200, gatewayStatusSummary(loadConfig()))
+  }
+  if (method === "GET" && route === "/api/gateway/log") {
+    return sendJson(res, 200, getLogRing())
+  }
+  if (method === "GET" && route === "/api/gateway/models") {
+    return sendJson(res, 200, gatewayModelsSummary())
+  }
+  if (method === "GET" && route === "/api/gateway/config") {
+    return sendJson(res, 200, gatewayConfigSummary(loadConfig(), readRawConfig()))
+  }
   if (method === "POST" && route === "/v1/chat/completions") {
     log(`➡️  POST /v1/chat/completions`)
     return handleChatCompletions(req, res)
@@ -1677,6 +1714,47 @@ process.on("uncaughtException", (err) => {
  * `ZEN_TEST=1` 时跳过 listen（见上），测试可 import 这些纯函数且不启动服务器。
  * 纯函数实现一律未改动；`__setDynamicModels` 是唯一新增的测试钩子（重置运行时动态模型表）。 */
 
+/* ---------------- /api/gateway/* 只读管理端点组装纯函数 ----------------
+ * 路由只负责 sendJson；组装逻辑全部是纯函数（opts/raw 可注入，单测确定性）。
+ * 铁律：绝不返回 key 明文（密钥只存在于 loadConfig 内部，config 摘要仅透出 name/cooldown_until）。 */
+
+/** GET /api/gateway/status 响应组装：网关运行态 + 模型清单（不含任何 key 值）。
+ *  running 默认 true（端点能被请求到即网关在跑）；port 默认模块 PORT，可注入便于单测。 */
+function gatewayStatusSummary(cfg, opts = {}) {
+  return {
+    running: opts.running !== false,
+    port: opts.port ?? PORT,
+    defaultModel: DEFAULT_MODEL,
+    modelCount: ZEN_MODELS.length,
+    keys: Array.isArray(cfg?.keys) ? cfg.keys.length : 0,
+    current: cfg?.current ?? "",
+    usageFile: USAGE_FILE,
+    upstreamBase: UPSTREAM_BASE,
+    models: [...ZEN_MODELS],
+  }
+}
+
+/** GET /api/gateway/models 响应组装：内置模型 + 别名映射（拷贝引用，防调用方污染模块常量）。 */
+function gatewayModelsSummary() {
+  return { models: [...ZEN_MODELS], aliases: { ...MODEL_ALIAASES } }
+}
+
+/** GET /api/gateway/config 响应组装：只读配置摘要。keys 仅含 name/cooldown_until（绝不含 key 明文）。
+ *  raw 为 go-keys.json 原始 JSON（readRawConfig），用于透传 loadConfig 未携带的扩展字段 auto_web。 */
+function gatewayConfigSummary(cfg, raw = null) {
+  const keys = Array.isArray(cfg?.keys)
+    ? cfg.keys.map((k) => ({ name: k.name, cooldown_until: k.cooldown_until ?? null }))
+    : []
+  const autoWeb =
+    raw && typeof raw === "object" && typeof raw.auto_web === "boolean" ? raw.auto_web : undefined
+  return {
+    cooldownMinutes: cfg?.cooldown_minutes ?? DEFAULT_COOLDOWN_MIN,
+    current: cfg?.current ?? "",
+    keys,
+    ...(autoWeb !== undefined ? { autoWeb } : {}),
+  }
+}
+
 /* ---------------- /api/usage/trend 聚合纯函数 ----------------
  * 与 usage-report.mjs 同语义（UTC 归日 / 坏行跳过 / 空行不算坏行），供 HTTP 端点与单测共用。
  * 纯函数：不读文件、不碰全局，`opts.now` 可注入保证测试确定性。 */
@@ -1789,4 +1867,11 @@ export {
   syncAuth,
   AUTH_FILE,
   __setDynamicModels,
+  log,
+  getLogRing,
+  LOG_RING_MAX,
+  gatewayStatusSummary,
+  gatewayConfigSummary,
+  gatewayModelsSummary,
+  readRawConfig,
 }
