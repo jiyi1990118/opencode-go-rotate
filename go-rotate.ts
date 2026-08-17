@@ -962,6 +962,13 @@ const WEB_HTML = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>go-rotate · opencode-go keys</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%233b82f6'/><circle cx='8' cy='8' r='3' fill='%230b0d10'/></svg>">
+<script>
+/* 主题防闪烁：渲染前按 localStorage 设置 data-theme（默认深色） */
+try {
+  var grTheme = localStorage.getItem("gr-theme") || "dark"
+  document.documentElement.setAttribute("data-theme", grTheme)
+} catch (e) {}
+</script>
 <style>
   /* ============ go-rotate 管理端设计系统 v1.0（深色 · 零依赖） ============ */
   :root {
@@ -977,6 +984,8 @@ const WEB_HTML = `<!doctype html>
     --warning-soft: rgba(251,191,36,.12);
     --danger-soft: rgba(248,113,113,.12);
     --info-soft: rgba(96,165,250,.12);
+    /* 运行日志前景（深色下偏绿，浅色下深绿） */
+    --log: #9ceba8;
     /* 字体 */
     --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI",
                  "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
@@ -993,6 +1002,23 @@ const WEB_HTML = `<!doctype html>
     /* 动效 */
     --dur: 150ms;
     --ease: cubic-bezier(.2,.8,.2,1);
+  }
+
+  /* ============ 浅色主题（html[data-theme="light"] 覆盖，默认深色不变） ============ */
+  html[data-theme="light"] {
+    color-scheme: light;
+    --bg-0: #f4f6f8;  --bg-1: #ffffff;  --bg-2: #eef1f4;  --bg-3: #e3e8ed;
+    --bd-1: #d9dee4;  --bd-2: #c2c9d2;  --bd-3: #a6afba;
+    --tx-1: #16181c;  --tx-2: #525c68;  --tx-3: #8a94a0;
+    --success-soft: rgba(22,163,74,.10);
+    --warning-soft: rgba(202,138,4,.12);
+    --danger-soft: rgba(220,38,38,.08);
+    --info-soft: rgba(37,99,235,.10);
+    --log: #1a7f37;
+    --shadow-sm: 0 1px 2px rgba(16,24,40,.08);
+    --shadow-md: 0 4px 12px rgba(16,24,40,.10), 0 1px 2px rgba(16,24,40,.06);
+    --shadow-lg: 0 8px 24px rgba(16,24,40,.12);
+    --ring: 0 0 0 3px rgba(59,130,246,.25);
   }
 
   /* ============ 基础 ============ */
@@ -1147,7 +1173,7 @@ const WEB_HTML = `<!doctype html>
   /* ============ 日志 / 代码 ============ */
   pre { margin: 0; background: var(--bg-0); border: 1px solid var(--bd-1);
         border-radius: var(--r-sm); padding: 12px; font-family: var(--font-mono);
-        font-size: 12px; line-height: 1.6; overflow: auto; max-height: 260px; color: #9ceba8; }
+        font-size: 12px; line-height: 1.6; overflow: auto; max-height: 260px; color: var(--log); }
   code { font-family: var(--font-mono); font-size: 12px; background: var(--bg-2);
          border: 1px solid var(--bd-1); border-radius: 4px; padding: 1px 5px; color: var(--tx-1); }
   .model-list { font-size: 12px; color: var(--tx-2); word-break: break-all; line-height: 1.7; }
@@ -1191,15 +1217,14 @@ const WEB_HTML = `<!doctype html>
   <div class="sub">多 key 自动轮换 · 修改会自动同步到 auth.json 并立即生效</div>
 
   <div class="nav" id="main-nav">
-    <button class="nav-btn active" data-nav="overview" onclick="switchNav('overview')">概览</button>
-    <button class="nav-btn" data-nav="keys" onclick="switchNav('keys')">Key 管理</button>
-    <button class="nav-btn" data-nav="gateway" onclick="switchNav('gateway')">网关管理</button>
+    <button class="nav-btn active" data-nav="keys" onclick="switchNav('keys')">Key 管理</button>
+    <button class="nav-btn" data-nav="settings" onclick="switchNav('settings')">网关与设置</button>
     <button class="nav-btn" data-nav="stats" onclick="switchNav('stats')">统计</button>
-    <button class="nav-btn" data-nav="settings" onclick="switchNav('settings')">设置</button>
+    <button class="nav-btn" id="theme-btn" style="margin-left:auto" onclick="toggleTheme()">浅色</button>
   </div>
 
-  <!-- ============ 概览：只读状态面板（编辑动作下沉到设置 / Key 管理） ============ -->
-  <div class="block" id="nav-overview">
+  <!-- ============ Key 管理：概览状态条 + 主操作区（新增卡 + 表格卡） ============ -->
+  <div class="block" id="nav-keys">
   <div class="card">
     <div class="stats ov-strip">
       <div class="stat"><div class="v" id="s-current">-</div><div class="l">当前 key</div></div>
@@ -1210,14 +1235,10 @@ const WEB_HTML = `<!doctype html>
       <div class="stat"><div class="v" id="s-autoweb">-</div><div class="l">Web 自动启动 <a href="javascript:void(0)" onclick="switchNav('settings')" style="color:#60a5fa">去设置</a></div></div>
     </div>
     <div class="muted banner" id="ov-hint" style="margin-top:12px">
-      <span id="ov-hint-full"><b>①</b> 添加 key → <a href="javascript:void(0)" onclick="switchNav('keys')" style="color:#60a5fa">Key 管理</a>　<b>②</b> （可选）启动网关 → <a href="javascript:void(0)" onclick="switchNav('gateway')" style="color:#60a5fa">网关管理</a>　<b>③</b> （可选）生成 token → 网关管理</span>
+      <span id="ov-hint-full"><b>①</b> 添加 key → 下方输入框　<b>②</b> （可选）启动网关 → <a href="javascript:void(0)" onclick="switchNav('settings')" style="color:#60a5fa">网关与设置</a>　<b>③</b> （可选）生成 token → 网关与设置</span>
       <span id="ov-hint-min" style="display:none">当前状态健康。</span>
     </div>
   </div>
-  </div>
-
-  <!-- ============ Key 管理：主操作区（新增卡 + 表格卡） ============ -->
-  <div class="block" id="nav-keys" style="display:none">
   <div class="card" id="keys-add-card">
     <div class="row" style="margin-bottom:10px"><input id="new-name" placeholder="名称，如 act2">&nbsp;<input id="new-key" placeholder="sk-xxxx 完整的 API key"><button class="primary" onclick="addKey()">新增 key</button></div>
     <div class="muted banner" id="keys-empty" style="display:none">还没有 key：粘贴第一个 opencode-go key，添加后自动探测健康。</div>
@@ -1276,8 +1297,8 @@ const WEB_HTML = `<!doctype html>
   </div>
   </div>
 
-  <!-- ============ 网关管理：状态主卡（首位）+ 配置子区（套餐 / Token 并排） ============ -->
-  <div class="block" id="nav-gateway" style="display:none">
+  <!-- ============ 网关与设置：网关状态主卡 + 配置子区 + 全局设置（合并区块） ============ -->
+  <div class="block" id="nav-settings" style="display:none">
   <div class="card" id="gateway-card">
     <div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between">
       <b>网关管理 <span id="gw-badge"></span></b>
@@ -1327,10 +1348,7 @@ const WEB_HTML = `<!doctype html>
     <div id="token-msg" class="msg" style="margin-top:6px"></div>
   </div>
   </div>
-  </div>
 
-  <!-- ============ 设置：全局配置（冷却窗口 + Web 自动启动，唯一可操作点） ============ -->
-  <div class="block" id="nav-settings" style="display:none">
   <div class="card">
     <b>设置</b>
     <div class="row" style="margin-top:10px">
@@ -1342,7 +1360,7 @@ const WEB_HTML = `<!doctype html>
       <button id="web-on-btn" onclick="webOn()">开启</button>
       <button id="web-off-btn" class="danger" onclick="webOff()">关闭</button>
     </div>
-    <div class="muted" style="margin-top:8px">套餐切换与网关 token 见「网关管理」区块；每 key 独立冷却窗口在 Key 表格内联。</div>
+    <div class="muted" style="margin-top:8px">套餐切换与网关 token 见上方网关卡片；每 key 独立冷却窗口在 Key 表格内联。</div>
   </div>
   </div>
 </div>
@@ -1455,6 +1473,14 @@ function pollErr(m) {
   if (m === lastPollErr.msg && now - lastPollErr.at < 30000) return
   lastPollErr = { msg: m, at: now }
   toast(m, "error")
+}
+/* 主题切换：深色/浅色，localStorage 记忆（默认深色，head 防闪烁脚本已预置 data-theme） */
+function toggleTheme() {
+  const cur = document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark"
+  const next = cur === "light" ? "dark" : "light"
+  document.documentElement.setAttribute("data-theme", next)
+  try { localStorage.setItem("gr-theme", next) } catch (e) {}
+  document.getElementById("theme-btn").textContent = next === "light" ? "深色" : "浅色"
 }
 async function addKey() {
   const name = document.getElementById("new-name").value.trim()
@@ -1872,7 +1898,10 @@ async function clearLog() {
   try { await api("/api/log/clear", {}); refreshLog(); showMsg("日志已清空") }
   catch (e) { showErr(e.message) }
 }
-refresh(); refreshLog(); refreshStats(); refreshGateway(); refreshGwLog(); switchNav("overview");
+refresh(); refreshLog(); refreshStats(); refreshGateway(); refreshGwLog(); switchNav("keys");
+/* 主题按钮文字按当前主题显示目标（head 脚本已预置 data-theme，防闪烁） */
+document.getElementById("theme-btn").textContent =
+  document.documentElement.getAttribute("data-theme") === "light" ? "深色" : "浅色"
 refreshPlans(); refreshGatewayConfig();
 /* P1-2：定时器句柄存入 timers 对象，webOff() 可整体清理 */
 var timers = {}

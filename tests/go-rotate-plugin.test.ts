@@ -900,15 +900,22 @@ describe("网关配置路由（/api/gateway/plans + /api/gateway/config）", () 
 })
 
 describe("WEB_HTML 网关管理区块（主导航 + 套餐卡 + Token 卡）", () => {
-  test("主导航区块（main-nav + 5 区块 id + switchNav）", () => {
+  test("主导航区块（main-nav + 3 区块 id + switchNav + 主题按钮）", () => {
     const html: string = (mod as any).WEB_HTML
     expect(html).toContain('id="main-nav"')
-    for (const b of ["overview", "keys", "gateway", "stats", "settings"]) {
+    for (const b of ["keys", "settings", "stats"]) {
       expect(html).toContain('data-nav="' + b + '"')
       expect(html).toContain('id="nav-' + b + '"')
     }
+    expect(html).not.toContain('data-nav="overview"')
+    expect(html).not.toContain('data-nav="gateway"')
     expect(html).toContain("function switchNav(block)")
-    expect(html).toContain('onclick="switchNav(\'overview\')"')
+    expect(html).toContain('onclick="switchNav(\'keys\')"')
+    /* 主题切换：按钮 + toggleTheme + localStorage 记忆 + 浅色变量覆盖 */
+    expect(html).toContain('id="theme-btn"')
+    expect(html).toContain("function toggleTheme()")
+    expect(html).toContain('localStorage.getItem("gr-theme")')
+    expect(html).toContain('html[data-theme="light"]')
   })
   test("套餐切换卡（gw-plan-card + 单选 + 保存函数 + plans 拉取）", () => {
     const html: string = (mod as any).WEB_HTML
