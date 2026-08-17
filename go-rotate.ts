@@ -1177,7 +1177,7 @@ const WEB_HTML = `<!doctype html>
     .ov-strip .stat + .stat { border-left: none; padding-left: 0; }
     .stats { gap: var(--sp-4); }
     pre { max-height: 160px; }
-    .table-wrap table { min-width: 720px; }
+    .table-wrap table { min-width: 860px; }
   }
   /* P3-4 修复：断点提到 780px 才去 .ov-strip 分隔线，消除 721-780px 区间 flex wrap 后第二行首格残留 border-left */
   @media (max-width: 780px) {
@@ -1225,7 +1225,7 @@ const WEB_HTML = `<!doctype html>
   </div>
   <div class="card" id="keys-table-card">
     <div class="table-wrap">
-    <table style="min-width:720px">
+    <table style="min-width:860px">
       <thead><tr><th>名称</th><th>Key</th><th>状态</th><th>健康</th><th>操作</th></tr></thead>
       <tbody id="tbody"></tbody>
     </table>
@@ -1358,6 +1358,8 @@ async function api(path, body) {
   return j
 }
 var health = {}
+/* P2-3：Key 表格渲染签名缓存（5s 轮询全量重建守卫） */
+var lastKeysSig = ""
 /* P1-1 XSS 修复：统一转义 HTML 特殊字符（用户可控字段拼 innerHTML / 属性前必须过 esc） */
 function esc(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]))
@@ -1388,8 +1390,14 @@ async function refresh() {
     } else {
       hintEl.style.display = "none"
     }
+    /* P2-3：表格增量守卫——keys 列表（含健康/冷却/当前状态）无变化时跳过 5s 全量重建，
+       避免打断表格 hover/滚动等交互；状态卡字段已在上面无条件更新 */
+    const sig = JSON.stringify(st.keys.map(k =>
+      [k.name, k.state, k.cooldown_until, k.isCurrent, health[k.name]?.status ?? "", k.masked]))
     const tb = document.getElementById("tbody")
-    tb.innerHTML = ""
+    if (sig !== lastKeysSig) {
+      lastKeysSig = sig
+      tb.innerHTML = ""
     for (const k of st.keys) {
       const tr = document.createElement("tr")
       // 状态徽章：优先显示健康状态（余额不足/无效/限流），其次冷却/可用
@@ -1427,17 +1435,26 @@ async function refresh() {
           '<button class="danger" data-del="' + n + '">删除</button>' +
         '</div></td>'
       tb.appendChild(tr)
+      }
+      tb.querySelectorAll("[data-set]").forEach(b => b.onclick = () => doOp(() => api("/api/current", { name: b.dataset.set })))
+      tb.querySelectorAll("[data-cooldown]").forEach(b => b.onclick = () => doOp(() => api("/api/cooldown", { name: b.dataset.cooldown, minutes: Number(b.dataset.min) })))
+      tb.querySelectorAll("[data-window]").forEach(b => b.onclick = () => editKeyWindow(b.dataset.window))
+      tb.querySelectorAll("[data-window-clear]").forEach(b => b.onclick = () => doOp(() => api("/api/cooldown/window", { name: b.dataset.windowClear, minutes: null })))
+      tb.querySelectorAll("[data-edit]").forEach(b => b.onclick = () => editKey(b.dataset.edit))
+      tb.querySelectorAll("[data-del]").forEach(b => b.onclick = () => {
+        if (!confirm('确定删除 key "' + b.dataset.del + '"？此操作不可恢复。')) return
+        doOp(() => api("/api/keys/delete", { name: b.dataset.del }))
+      })
     }
-    tb.querySelectorAll("[data-set]").forEach(b => b.onclick = () => doOp(() => api("/api/current", { name: b.dataset.set })))
-    tb.querySelectorAll("[data-cooldown]").forEach(b => b.onclick = () => doOp(() => api("/api/cooldown", { name: b.dataset.cooldown, minutes: Number(b.dataset.min) })))
-    tb.querySelectorAll("[data-window]").forEach(b => b.onclick = () => editKeyWindow(b.dataset.window))
-    tb.querySelectorAll("[data-window-clear]").forEach(b => b.onclick = () => doOp(() => api("/api/cooldown/window", { name: b.dataset.windowClear, minutes: null })))
-    tb.querySelectorAll("[data-edit]").forEach(b => b.onclick = () => editKey(b.dataset.edit))
-    tb.querySelectorAll("[data-del]").forEach(b => b.onclick = () => {
-      if (!confirm('确定删除 key "' + b.dataset.del + '"？此操作不可恢复。')) return
-      doOp(() => api("/api/keys/delete", { name: b.dataset.del }))
-    })
-  } catch (e) { showErr(e.message) }
+  } catch (e) { pollErr(e.message) }
+}
+/* P2-5：轮询失败节流——同一条错误消息 30s 内只提示一次，避免 5s 轮询失败 toast 风暴 */
+var lastPollErr = { msg: "", at: 0 }
+function pollErr(m) {
+  const now = Date.now()
+  if (m === lastPollErr.msg && now - lastPollErr.at < 30000) return
+  lastPollErr = { msg: m, at: now }
+  toast(m, "error")
 }
 async function addKey() {
   const name = document.getElementById("new-name").value.trim()
