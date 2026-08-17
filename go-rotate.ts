@@ -1181,6 +1181,19 @@ try {
     --btn-primary-spin: rgba(255,255,255,.35);  --btn-primary-spin-top: #ffffff;
     --btn-danger-spin: rgba(252,165,165,.35);  --btn-danger-spin-top: #fca5a5;
     --btn-success-spin: rgba(74,222,128,.35);  --btn-success-spin-top: #4ade80;
+    /* 域色按钮（zen 蓝 / go 紫 / 网关青，soft 底 + 亮字，hover 提亮） */
+    --btn-zen-bg: rgba(96,165,250,.12);  --btn-zen-bd: rgba(96,165,250,.30);  --btn-zen-fg: #93c5fd;
+    --btn-zen-hover-bg: rgba(96,165,250,.22);  --btn-zen-hover-bd: rgba(96,165,250,.48);  --btn-zen-hover-fg: #bfdbfe;
+    --btn-go-bg: rgba(167,139,250,.12);  --btn-go-bd: rgba(167,139,250,.30);  --btn-go-fg: #c4b5fd;
+    --btn-go-hover-bg: rgba(167,139,250,.22);  --btn-go-hover-bd: rgba(167,139,250,.48);  --btn-go-hover-fg: #ddd6fe;
+    --btn-gw-bg: rgba(34,211,238,.12);  --btn-gw-bd: rgba(34,211,238,.30);  --btn-gw-fg: #67e8f9;
+    --btn-gw-hover-bg: rgba(34,211,238,.22);  --btn-gw-hover-bd: rgba(34,211,238,.48);  --btn-gw-hover-fg: #a5f3fc;
+    /* 冷却（warn）：琥珀 soft，表示"进入冷却"操作 */
+    --btn-warn-bg: rgba(251,191,36,.12);  --btn-warn-bd: rgba(251,191,36,.30);  --btn-warn-fg: #fcd34d;
+    --btn-warn-hover-bg: rgba(251,191,36,.22);  --btn-warn-hover-bd: rgba(251,191,36,.48);  --btn-warn-hover-fg: #fde68a;
+    /* 域色徽标（三域当前/健康列 ✓） */
+    --go: #a78bfa;  --go-soft: rgba(167,139,250,.12);
+    --gw: #22d3ee;  --gw-soft: rgba(34,211,238,.12);
     /* 运行日志前景（深色下偏绿，浅色下深绿） */
     --log: #9ceba8;
     /* 字体 */
@@ -1225,6 +1238,18 @@ try {
     --btn-primary-spin: rgba(255,255,255,.35);  --btn-primary-spin-top: #ffffff;
     --btn-danger-spin: rgba(185,28,28,.25);  --btn-danger-spin-top: #b91c1c;
     --btn-success-spin: rgba(21,128,61,.25);  --btn-success-spin-top: #15803d;
+    /* 域色按钮（浅色：淡彩底 + 深字） */
+    --btn-zen-bg: #e8f1fd;  --btn-zen-bd: #b6d2f6;  --btn-zen-fg: #1d4ed8;
+    --btn-zen-hover-bg: #d9e9fb;  --btn-zen-hover-bd: #8db8ef;  --btn-zen-hover-fg: #1e40af;
+    --btn-go-bg: #f0ecfd;  --btn-go-bd: #cfc2f5;  --btn-go-fg: #6d28d9;
+    --btn-go-hover-bg: #e5ddfa;  --btn-go-hover-bd: #b39fe9;  --btn-go-hover-fg: #5b21b6;
+    --btn-gw-bg: #e5f9fc;  --btn-gw-bd: #aee8f1;  --btn-gw-fg: #0e7490;
+    --btn-gw-hover-bg: #d3f2f8;  --btn-gw-hover-bd: #7fd8e6;  --btn-gw-hover-fg: #155e75;
+    --btn-warn-bg: #fdf4e3;  --btn-warn-bd: #eed9a6;  --btn-warn-fg: #b45309;
+    --btn-warn-hover-bg: #faeccc;  --btn-warn-hover-bd: #e3c684;  --btn-warn-hover-fg: #92400e;
+    /* 域色徽标（浅色） */
+    --go: #7c3aed;  --go-soft: #ede9fe;
+    --gw: #0891b2;  --gw-soft: #cffafe;
     --log: #1a7f37;
     --shadow-sm: 0 1px 2px rgba(16,24,40,.08);
     --shadow-md: 0 4px 12px rgba(16,24,40,.10), 0 1px 2px rgba(16,24,40,.06);
@@ -1254,6 +1279,9 @@ try {
   .row { display: flex; gap: var(--sp-2); align-items: center; }
   .row input { flex: 1; }
   .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  /* 操作按钮分组：组间细分隔线 + 留白，按域/管理分块 */
+  .actions .grp { display: inline-flex; gap: 6px; align-items: center; }
+  .actions .grp + .grp { padding-left: 9px; border-left: 1px solid var(--bd-2); margin-left: 3px; }
   /* 单列堆叠：网关配置两块与日志双卡纵向排列，避免并排时内容宽度不足导致布局错乱 */
   .gw-config-grid { display: grid; grid-template-columns: 1fr; gap: var(--sp-4); align-items: start; }
   .log-row { display: grid; grid-template-columns: 1fr; gap: var(--sp-4); align-items: start; }
@@ -1334,6 +1362,16 @@ try {
   button.success:hover { background: var(--btn-success-hover-bg); border-color: var(--btn-success-hover-bd); color: var(--btn-success-hover-fg); }
   button.ghost { background: transparent; border-color: transparent; color: var(--btn-ghost-fg); }
   button.ghost:hover { background: var(--btn-ghost-hover-bg); color: var(--btn-ghost-hover-fg); }
+  /* 域色按钮：zen 蓝 / go 紫 / 网关青（soft 底 + 亮字） */
+  button.zen { background: var(--btn-zen-bg); border-color: var(--btn-zen-bd); color: var(--btn-zen-fg); }
+  button.zen:hover { background: var(--btn-zen-hover-bg); border-color: var(--btn-zen-hover-bd); color: var(--btn-zen-hover-fg); }
+  button.go { background: var(--btn-go-bg); border-color: var(--btn-go-bd); color: var(--btn-go-fg); }
+  button.go:hover { background: var(--btn-go-hover-bg); border-color: var(--btn-go-hover-bd); color: var(--btn-go-hover-fg); }
+  button.gw { background: var(--btn-gw-bg); border-color: var(--btn-gw-bd); color: var(--btn-gw-fg); }
+  button.gw:hover { background: var(--btn-gw-hover-bg); border-color: var(--btn-gw-hover-bd); color: var(--btn-gw-hover-fg); }
+  /* 冷却操作：琥珀，表示将 key 置入冷却 */
+  button.warn { background: var(--btn-warn-bg); border-color: var(--btn-warn-bd); color: var(--btn-warn-fg); }
+  button.warn:hover { background: var(--btn-warn-hover-bg); border-color: var(--btn-warn-hover-bd); color: var(--btn-warn-hover-fg); }
   button.sm, .actions button { height: 26px; padding: 0 8px; font-size: 12px; border-radius: 5px; }
   button.loading { pointer-events: none; opacity: .75; }
   button.loading::before { content: ""; width: 12px; height: 12px;
@@ -1353,6 +1391,10 @@ try {
   .b-current,   .b-info     { background: var(--info-soft);    color: var(--info); }
   .b-stopped,   .b-neutral  { background: rgba(154,163,173,.12); color: var(--tx-2); }
   .b-error,     .b-invalid  { background: var(--danger-soft);  color: var(--danger); }
+  /* 域色徽标：zen 蓝（沿用 info）/ go 紫 / 网关青 */
+  .b-zen { background: var(--info-soft); color: var(--info); }
+  .b-go  { background: var(--go-soft);    color: var(--go); }
+  .b-gw  { background: var(--gw-soft);    color: var(--gw); }
   .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block;
          background: var(--tx-3); flex: none; }
   .dot.ok   { background: var(--success); box-shadow: 0 0 6px rgba(74,222,128,.5); }
@@ -1738,41 +1780,48 @@ async function refresh() {
       } else {
         badge = k.state === "cooling" ? '<span class="badge b-cooling">冷却 ' + esc(k.remainMin) + 'min</span>' : '<span class="badge b-available">可用</span>'
       }
-      if (k.isCurrent) badge += '<span class="badge b-current">Zen 当前</span>'
-      if (k.isCurrentGo) badge += '<span class="badge b-current">Go 当前</span>'
-      if (k.isCurrentGateway) badge += '<span class="badge b-current">网关当前</span>'
-      /* 双套餐健康列：zen:✓/✗（last_status）+ go:✓/✗（last_status_go），title 含探测时间；- = 未探测 */
-      const healthCell = (status, checked) => {
+      if (k.isCurrent) badge += '<span class="badge b-zen">Zen 当前</span>'
+      if (k.isCurrentGo) badge += '<span class="badge b-go">Go 当前</span>'
+      if (k.isCurrentGateway) badge += '<span class="badge b-gw">网关当前</span>'
+      /* 双套餐健康列：zen:✓/✗（last_status）+ go:✓/✗（last_status_go），title 含探测时间；- = 未探测；✓ 用域色区分列 */
+      const healthCell = (status, checked, okCls) => {
         if (!status || status === "ok")
-          return '<span class="badge b-available gr-tip" title="' + esc(checked ? "探测时间 " + checked : "未探测") + '">✓</span>'
+          return '<span class="badge ' + okCls + ' gr-tip" title="' + esc(checked ? "探测时间 " + checked : "未探测") + '">✓</span>'
         const cls = (status === "invalid" || status === "nobalance" || status === "error") ? "b-invalid" : "b-warn"
         return '<span class="badge ' + cls + ' gr-tip" title="' + esc((statusHint[status] || status) + (checked ? " · 探测 " + checked : "")) + '">✗ ' + esc(statusLabel[status] || status) + '</span>'
       }
       const n = esc(k.name), key = esc(k.key), masked = esc(k.masked)
       const zenCooling = k.state === "cooling"
       const goCooling = !!(k.cooldown_until_go && Date.parse(k.cooldown_until_go) > Date.now())
+      /* 操作列分组：检查(主) | 设为当前(三域色) | 冷却(琥珀进入/绿清除) | 管理(ghost+danger) */
       tr.innerHTML =
         '<td class="td-name" title="' + n + '">' + n + '</td>' +
         '<td class="muted" title="' + key + '">' + masked + '</td>' +
         '<td>' + badge + '</td>' +
-        '<td>' + healthCell(k.last_status, k.last_checked_zen) + '</td>' +
-        '<td>' + healthCell(k.last_status_go, k.last_checked_go) + '</td>' +
+        '<td>' + healthCell(k.last_status, k.last_checked_zen, "b-zen") + '</td>' +
+        '<td>' + healthCell(k.last_status_go, k.last_checked_go, "b-go") + '</td>' +
         '<td><div class="actions">' +
-          '<button data-check="' + n + '" title="探测该 key 双套餐健康（consumes ~1 token/端点）">检查</button>' +
-          (k.isCurrent ? '' : '<button data-set="' + n + '" title="设为 zen 免费档当前（同步 auth.json）">Zen 使用</button>') +
-          (k.isCurrentGo ? '' : '<button data-set-go="' + n + '" title="设为 go 套餐当前（不写 auth.json）">Go 使用</button>') +
-          (k.isCurrentGateway ? '' : '<button data-set-gw="' + n + '" title="设为网关当前（不写 auth.json）">网关使用</button>') +
-          (zenCooling
-            ? '<button data-cooldown="' + n + '" data-min="0">Zen 清冷却</button>'
-            : '<button data-cooldown="' + n + '" data-min="' + esc(st.cooldown_minutes) + '">Zen 冷却</button>') +
-          (goCooling
-            ? '<button data-cooldown-go="' + n + '" data-min="0">Go 清冷却</button>'
-            : '<button data-cooldown-go="' + n + '" data-min="' + esc(st.cooldown_minutes) + '">Go 冷却</button>') +
-          '<button data-cooldown-gw="' + n + '" data-min="0" title="清除网关域冷却">网关清冷却</button>' +
-          '<button data-window="' + n + '" title="设置该 key 独立冷却窗口（分钟，留空清除回退全局）">窗口</button>' +
-          (k.cooldown_minutes ? '<button data-window-clear="' + n + '" title="清除独立窗口，回退全局">清窗</button>' : '') +
-          '<button data-edit="' + n + '" title="编辑名称 / key 值">编辑</button>' +
-          '<button class="danger" data-del="' + n + '">删除</button>' +
+          '<button class="primary" data-check="' + n + '" title="探测该 key 双套餐健康（consumes ~1 token/端点）">检查</button>' +
+          '<span class="grp">' +
+            (k.isCurrent ? '' : '<button class="zen" data-set="' + n + '" title="设为 zen 免费档当前（同步 auth.json）">Zen 使用</button>') +
+            (k.isCurrentGo ? '' : '<button class="go" data-set-go="' + n + '" title="设为 go 套餐当前（不写 auth.json）">Go 使用</button>') +
+            (k.isCurrentGateway ? '' : '<button class="gw" data-set-gw="' + n + '" title="设为网关当前（不写 auth.json）">网关使用</button>') +
+          '</span>' +
+          '<span class="grp">' +
+            (zenCooling
+              ? '<button class="success" data-cooldown="' + n + '" data-min="0">Zen 清冷却</button>'
+              : '<button class="warn" data-cooldown="' + n + '" data-min="' + esc(st.cooldown_minutes) + '">Zen 冷却</button>') +
+            (goCooling
+              ? '<button class="success" data-cooldown-go="' + n + '" data-min="0">Go 清冷却</button>'
+              : '<button class="warn" data-cooldown-go="' + n + '" data-min="' + esc(st.cooldown_minutes) + '">Go 冷却</button>') +
+            '<button class="success" data-cooldown-gw="' + n + '" data-min="0" title="清除网关域冷却">网关清冷却</button>' +
+          '</span>' +
+          '<span class="grp">' +
+            '<button class="ghost" data-window="' + n + '" title="设置该 key 独立冷却窗口（分钟，留空清除回退全局）">窗口</button>' +
+            (k.cooldown_minutes ? '<button class="ghost" data-window-clear="' + n + '" title="清除独立窗口，回退全局">清窗</button>' : '') +
+            '<button class="ghost" data-edit="' + n + '" title="编辑名称 / key 值">编辑</button>' +
+            '<button class="danger" data-del="' + n + '">删除</button>' +
+          '</span>' +
         '</div></td>'
       tb.appendChild(tr)
       }
