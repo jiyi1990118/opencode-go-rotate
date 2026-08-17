@@ -506,9 +506,9 @@ class TestGatewayStatusLine(GwCase):
         self.assertEqual(cm.exception.code, 1)
 
     def test_main分发启停持锁status只读(self):
-        """源码结构：start/stop/restart 经 _with_lock；status/logs 直调"""
+        """源码结构：start/stop/restart + 网关域 set/next/cooldown 经 _with_lock；status/logs 直调"""
         src = open(CLI_PATH, encoding="utf-8").read()
-        self.assertIn('if sub in ("start", "stop", "restart"):', src)
+        self.assertIn('if sub in ("start", "stop", "restart", "set", "next", "cooldown"):', src)
         self.assertIn("_with_lock(lambda: do_gateway(sub, args[2:]))", src)
         self.assertIn("do_gateway(sub, args[2:])", src)
 

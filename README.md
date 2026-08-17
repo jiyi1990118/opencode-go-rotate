@@ -63,17 +63,25 @@ go-rotate status            # 查看状态
 {
   "provider_id": "opencode-go",   // 命中的 providerID（前缀匹配 "opencode"）
   "cooldown_minutes": 300,        // 全局冷却窗口（分钟）；缺省 300
-  "current": "act1",              // 当前 key 的 name
+  "current": "act1",              // TUI 域当前 key 的 name（opencode 插件路径，字段名不变）
+  "current_gateway": "act1",      // 网关域当前 key 的 name（新增；未设置时读侧兜底 current）
   "keys": [
     {
       "name": "act1",
       "key": "sk-...",
-      "cooldown_until": null,     // null=可用；ISO 时间=冷却到何时
-      "cooldown_minutes": 30      // 可选：该 key 独立冷却窗口；缺省回退全局 cooldown_minutes
+      "cooldown_until": null,     // TUI 域冷却：null=可用；ISO 时间=冷却到何时
+      "cooldown_until_gateway": null,  // 网关域冷却（新增）：null=可网关轮换；ISO=冷却到何时
+      "cooldown_minutes": 30      // 可选：该 key 独立冷却窗口（两域同用）；缺省回退全局 cooldown_minutes
     }
   ]
 }
 ```
+
+**双域独立轮换**：opencode TUI 与 zen-gateway 共用同一份 key，但各自独立轮换。
+- TUI 域走 `current` / `cooldown_until`（插件/`set`/`next`/`cooldown` 现状行为不变）
+- 网关域走 `current_gateway` / `cooldown_until_gateway`（`gateway set/next/cooldown` 子命令）；未设置时读侧兜底 `current_gateway ?? current`
+- 网关域轮换**不同步 auth.json**（auth.json 单槽仅由 TUI 域维护，网关切 key 不影响 TUI 持久化凭据）
+- 旧配置无需迁移，网关域从 `current` 干净起步
 
 冷却窗口优先级：**该 key 的 `cooldown_minutes` > 全局 `cooldown_minutes` > 默认 300 分钟**。
 通过 `go-rotate cooldown <name> window <min>` 设置独立窗口，`window clear` 删除字段回退全局。
@@ -108,6 +116,9 @@ go-rotate status            # 查看状态
 | `go-rotate gateway {start\|stop\|restart\|status\|logs [n]}` | 管理 zen-gateway 服务（launchd 常驻，端口 18888） |
 | `go-rotate gateway plan [go\|zen]` | 查看/切换网关套餐（Go 订阅 / Zen 免费档，切换后需 restart） |
 | `go-rotate gateway token [gen\|clear\|set <v>]` | 管理网关访问 token（供其它 agent 连接鉴权，只显示掩码） |
+| `go-rotate gateway set <name>` | 网关域设为当前 key（不写 auth.json，不影响 TUI） |
+| `go-rotate gateway next [分钟]` | 网关域轮换（原网关 current 进网关域冷却 + 选下一个未冷却） |
+| `go-rotate gateway cooldown <name> [分钟\|clear]` | 写/清网关域冷却（缺省窗口与 TUI 一致） |
 | `go-rotate uninstall [-y] [--gateway]` | 卸载（`--gateway` 同时卸载网关服务） |
 
 ## 文件

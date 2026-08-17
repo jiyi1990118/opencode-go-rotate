@@ -1175,3 +1175,158 @@ describe("WEB_HTML 使用方式卡（gw-usage-card：地址 + 三配置块 + 一
     expect(html).toContain("onclick=\"copyUsage('claude')\"")
   })
 })
+
+/* ================= 双域独立轮换（TUI / 网关）— 2026-08-17 ================= */
+describe("双域独立轮换（current_gateway / cooldown_until_gateway 域分离）", () => {
+  test("setGatewayCurrent 写 current_gateway 不动 current；setCurrent 反向", () => {
+    seed(twoKeys("a"))
+    seedAuth({})
+    // 网关域 set 绝不 syncAuth（网关域不碰 auth.json）：auth 保持初始空对象
+    mod.setGatewayCurrent("b")
+    let cfg = readCfg()
+    expect(cfg.current).toBe("a")          // TUI 域不动
+    expect(cfg.current_gateway).toBe("b")   // 网关域跟随
+    expect(readAuth()).toEqual({})           // 铁证：网关 set 不动 auth.json
+    // TUI 域 set 正常 syncAuth
+    mod.setCurrent("b")
+    cfg = readCfg()
+    expect(cfg.current).toBe("b")          // TUI 域跟随
+    expect(cfg.current_gateway).toBe("b")   // 网关域保持（不反向覆盖）
+    expect(readAuth()["opencode-go"].key).toBe("sk-bbb") // TUI set 同步 auth
+  })
+
+  test("setGatewayCooldown 写 cooldown_until_gateway 不动 cooldown_until；null 清除各自域", () => {
+    seed({ ...twoKeys("a"), current_gateway: "b" })
+    mod.setGatewayCooldown("b", 60)
+    let cfg = readCfg()
+    expect(near(cfg.keys[1].cooldown_until_gateway!, 60)).toBe(true)
+    expect(cfg.keys[1].cooldown_until).toBeNull() // TUI 域不动
+    // TUI 域冷却独立
+    mod.setCooldown("a", 30)
+    cfg = readCfg()
+    expect(near(cfg.keys[0].cooldown_until!, 30)).toBe(true)
+    expect(cfg.keys[0].cooldown_until_gateway).toBeNull() // 网关域不动
+    // 各自 clear
+    mod.setCooldown("a", null)
+    mod.setGatewayCooldown("b", null)
+    cfg = readCfg()
+    expect(cfg.keys[0].cooldown_until).toBeNull()
+    expect(cfg.keys[1].cooldown_until_gateway).toBeNull()
+  })
+
+  test("loadConfig 旧配置（无 current_gateway）读侧兜底 current", () => {
+    // twoKeys("b") 只写 current，无 current_gateway（旧配置形态）
+    seed(twoKeys("b"))
+    expect(mod.loadConfig().current_gateway).toBe("b")
+    // 写回时保留（mutateConfig 往返不丢）并携网关域字段
+    mod.mutateConfig((c: any) => { c.provider_id = "opencode-go" })
+    const cfg = readCfg()
+    expect(cfg.current_gateway).toBe("b")
+  })
+
+  test("reconcileCurrent 网关域自愈：current_gateway 指向不存在 → 兜底 current 后 keys[0]", () => {
+    // 网关域越界（不像 TUI current）：回退 current
+    const cfg0 = { current: "a", current_gateway: "zzz", keys: [{ name: "a", key: "k" }, { name: "b", key: "k2" }] } as any
+    mod.reconcileCurrent(cfg0)
+    expect(cfg0.current_gateway).toBe("a")
+    // 网关域越界 且 TUI current 也越界 → 回退 keys[0]
+    const cfg1 = { current: "zzz", current_gateway: "yyy", keys: [{ name: "a", key: "k" }, { name: "b", key: "k2" }] } as any
+    mod.reconcileCurrent(cfg1)
+    expect(cfg1.current).toBe("a")
+    expect(cfg1.current_gateway).toBe("a")
+  })
+
+  test("statusPayload 含 current_gateway / isCurrentGateway / cooldown_until_gateway", () => {
+    seed({ ...twoKeys("a"), current_gateway: "b" })
+    const st = mod.statusPayload()
+    expect(st.current).toBe("a")
+    expect(st.current_gateway).toBe("b")
+    expect(st.keys[0].isCurrent).toBe(true)
+    expect(st.keys[0].isCurrentGateway).toBe(false)
+    expect(st.keys[1].isCurrent).toBe(false)
+    expect(st.keys[1].isCurrentGateway).toBe(true)
+    // 每 key 暴露两个域冷却字段
+    seed({ ...twoKeys("a"), current_gateway: "b", keys: [
+      { name: "a", key: "sk-aaa", cooldown_until: new Date(Date.now() + 60_000).toISOString(), cooldown_until_gateway: null },
+      { name: "b", key: "sk-bbb", cooldown_until: null, cooldown_until_gateway: new Date(Date.now() + 120_000).toISOString() },
+    ] })
+    const st2 = mod.statusPayload()
+    expect(st2.keys[0].cooldown_until_gateway).toBeNull()
+    expect(st2.keys[0].cooldown_until).toBeTruthy()
+    expect(st2.keys[1].cooldown_until_gateway).toBeTruthy()
+    expect(st2.keys[1].cooldown_until).toBeNull()
+  })
+
+  test("Web API：/api/current domain=gateway 写磁盘 current_gateway；缺省 domain 走 TUI 域", async () => {
+    seed({ ...twoKeys("a") })
+    // domain=gateway
+    const gwReq = new Request("http://127.0.0.1:8899/api/current", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "b", domain: "gateway" }),
+    })
+    const gwRes = await mod.handleWeb(gwReq)
+    expect(gwRes.status).toBe(200)
+    let cfg = readCfg()
+    expect(cfg.current).toBe("a")
+    expect(cfg.current_gateway).toBe("b")
+    // 缺省 domain（TUI 域，= 无 domain 参数，向后兼容）
+    const tuiReq = new Request("http://127.0.0.1:8899/api/current", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "a" }),
+    })
+    await mod.handleWeb(tuiReq)
+    cfg = readCfg()
+    expect(cfg.current).toBe("a")
+    expect(cfg.current_gateway).toBe("b") // TUI set 不覆盖网关域
+  })
+
+  test("Web API：/api/cooldown domain=gateway 写磁盘 cooldown_until_gateway；null 清除各域", async () => {
+    seed({ ...twoKeys("a"), current_gateway: "b" })
+    const gw = async (minutes: number | null) =>
+      await mod.handleWeb(new Request("http://127.0.0.1:8899/api/cooldown", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "b", minutes, domain: "gateway" }),
+      }))
+    await gw(60)
+    let cfg = readCfg()
+    expect(near(cfg.keys[1].cooldown_until_gateway, 60)).toBe(true)
+    expect(cfg.keys[1].cooldown_until).toBeNull()
+    // TUI 域（缺省 domain）
+    await mod.handleWeb(new Request("http://127.0.0.1:8899/api/cooldown", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "a", minutes: 30 }),
+    }))
+    cfg = readCfg()
+    expect(near(cfg.keys[0].cooldown_until, 30)).toBe(true)
+    expect(cfg.keys[0].cooldown_until_gateway).toBeNull()
+    // null 清除各域
+    await mod.handleWeb(new Request("http://127.0.0.1:8899/api/cooldown", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "a", minutes: null }),
+    }))
+    await gw(null)
+    cfg = readCfg()
+    expect(cfg.keys[0].cooldown_until).toBeNull()
+    expect(cfg.keys[1].cooldown_until_gateway).toBeNull()
+  })
+
+  test("WEB_HTML 双域 UI：TUI/网关当前按钮 + 各自冷却 + 网关当前徽标", () => {
+    const html: string = (mod as any).WEB_HTML
+    // 「设为当前」拆两枚：TUI 使用（data-set，缺省 domain）与 网关使用（data-set-gw + domain:gateway）
+    expect(html).toContain('data-set="')
+    expect(html).toContain("TUI 使用")
+    expect(html).toContain('data-set-gw="')
+    expect(html).toContain("网关使用")
+    expect(html).toContain('api("/api/current", { name: b.dataset.setGw, domain: "gateway" })')
+    // 冷却双域：data-cooldown（TUI）+ data-cooldown-gw（domain=gateway）
+    expect(html).toContain("TUI 冷却")
+    expect(html).toContain("TUI 清冷却")
+    expect(html).toContain('data-cooldown-gw="')
+    expect(html).toContain('api("/api/cooldown", { name: b.dataset.cooldownGw, minutes: Number(b.dataset.min), domain: "gateway" })')
+    // 徽标区分双域当前
+    expect(html).toContain(">TUI 当前</span>")
+    expect(html).toContain(">网关当前</span>")
+    // 网关卡 gw-current 显示 statusPayload 网关域字段
+    expect(html).toContain("(st && st.current_gateway)")
+  })
+})

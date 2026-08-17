@@ -278,22 +278,38 @@ function loadConfig() {
       (k) => k && typeof k.name === "string" && typeof k.key === "string",
     )
     const current = cfg.current ?? ""
-    // X2：reconcileCurrent 自愈 —— current 指向不存在的 name 时修正为 keys[0]
-    // （内存修正即可；持久化由写路径 saveConfig 承担，避免读热路径写盘）
-    if (current && keys.length > 0 && !keys.some((k) => k.name === current)) {
-      const fallback = keys[0].name
-      log(`⚠️  current="${current}" 不存在于 go-keys.json，自愈为 "${fallback}"`)
-      cfg.current = fallback
+    // X2：reconcileCurrent 自愈（TUI 域 current + 网关域 current_gateway）——
+    // 任一游标指向不存在的 name 时修正（内存修正即可；持久化由写路径 saveConfig 承担，避免读热路径写盘）
+    const resolvedCurrent =
+      current && keys.some((k) => k.name === current) ? current : keys[0]?.name ?? ""
+    if (current && current !== resolvedCurrent) {
+      log(`⚠️  current="${current}" 不存在于 go-keys.json，自愈为 "${resolvedCurrent}"`)
+    }
+    // 网关域游标：读侧兜底 `current_gateway ?? current`（旧配置零迁移）；指向不存在 → 兜底 TUI current 或 keys[0]
+    const rawGateway = cfg.current_gateway ?? current
+    const resolvedGateway =
+      rawGateway && keys.some((k) => k.name === rawGateway)
+        ? rawGateway
+        : resolvedCurrent || (keys[0]?.name ?? "")
+    if (rawGateway && rawGateway !== resolvedGateway) {
+      log(`⚠️  current_gateway="${rawGateway}" 不存在于 go-keys.json，自愈为 "${resolvedGateway}"`)
     }
     return {
       provider_id: cfg.provider_id ?? "opencode-go",
       cooldown_minutes: cfg.cooldown_minutes ?? DEFAULT_COOLDOWN_MIN,
-      current: current && keys.some((k) => k.name === current) ? current : keys[0]?.name ?? "",
+      current: resolvedCurrent,
+      current_gateway: resolvedGateway,
       keys,
     }
   } catch (e) {
     log(`⚠️  loadConfig 失败（${CONFIG_FILE}），回退默认配置: ${e.message}`)
-    return { provider_id: "opencode-go", cooldown_minutes: DEFAULT_COOLDOWN_MIN, current: "", keys: [] }
+    return {
+      provider_id: "opencode-go",
+      cooldown_minutes: DEFAULT_COOLDOWN_MIN,
+      current: "",
+      current_gateway: "",
+      keys: [],
+    }
   }
 }
 
@@ -326,7 +342,9 @@ function syncAuth(key) {
 }
 
 function currentKey(cfg) {
-  return cfg.keys.find((k) => k.name === cfg.current) ?? cfg.keys[0]
+  // 网关域：起点 = current_gateway（读侧兜底 current），与 pickNext 一致
+  const gwCurrent = cfg.current_gateway ?? cfg.current
+  return cfg.keys.find((k) => k.name === gwCurrent) ?? cfg.keys[0]
 }
 
 function cooldownUntilDefault(cfg) {
@@ -374,11 +392,13 @@ function classifyGoError(msg, statusCode) {
 /** 选择下一个未冷却的 key（循环轮换，与 go-rotate pickNext 一致） */
 function pickNext(cfg) {
   const now = Date.now()
-  const startIdx = cfg.keys.findIndex((k) => k.name === cfg.current)
+  // 网关域：起点 = 网关域 current；冷却判定读 k.cooldown_until_gateway（null = 网关域干净起步）
+  const gwCurrent = cfg.current_gateway ?? cfg.current
+  const startIdx = cfg.keys.findIndex((k) => k.name === gwCurrent)
   for (let i = 1; i <= cfg.keys.length; i++) {
     const k = cfg.keys[(startIdx + i) % cfg.keys.length]
     if (!k) continue
-    if (!k.cooldown_until || Date.parse(k.cooldown_until) <= now) return k
+    if (!k.cooldown_until_gateway || Date.parse(k.cooldown_until_gateway) <= now) return k
   }
   return undefined
 }
@@ -392,25 +412,27 @@ async function rotate(errBody, status, failedKeyName) {
       : currentKey(cfg)
     const msg = String(errBody?.error?.message ?? errBody?.message ?? "")
     if (cur) {
-      cur.cooldown_until = parseResetTime(msg) ?? cooldownUntilDefault(cfg)
+      cur.cooldown_until_gateway = parseResetTime(msg) ?? cooldownUntilDefault(cfg)
       // X1：与 go-rotate 契约一致，把失败 key 的健康状态写入 last_status（Web/CLI 按此渲染）
       cur.last_status = classifyGoError(msg, status)
-      log(`⚠️  key "${cur.name}" 配额耗尽（status=${status} ${msg.slice(0, 120)}），进冷却 until=${cur.cooldown_until}（last_status=${cur.last_status}）`)
+      log(`⚠️  key "${cur.name}" 配额耗尽（status=${status} ${msg.slice(0, 120)}），进网关域冷却 until=${cur.cooldown_until_gateway}（last_status=${cur.last_status}）`)
     }
     const next = pickNext(cfg)
     if (!next) {
       // X1：无可用 key 也持久化（对齐 go-rotate 插件 mutateConfig 恒保存行为），
-      // 否则失败 key 的 cooldown_until + last_status 只存在于内存、Web 看不到
+      // 否则失败 key 的 cooldown_until_gateway + last_status 只存在于内存、Web 看不到
       saveConfig(cfg)
-      log(`❌  没有可用 key（全部在冷却期），维持当前 key "${cfg.current}"`)
+      log(`❌  没有可用 key（网关域全部在冷却期），维持当前网关 key "${cfg.current_gateway}"`)
       return cfg
     }
-    cfg.current = next.name
+    cfg.current_gateway = next.name
     const nk = currentKey(cfg)
     if (nk) nk.last_status = null // 与插件 rotate 一致：新当前 key 清空状态（视为未探测）
     saveConfig(cfg)
-    syncAuth(next.key)
-    log(`✅  轮换到 key "${next.name}"，已同步 auth.json`)
+    // 🚨 域独立红线（双域独立轮换契约）：网关 rotate 绝不触碰 auth.json。
+    // auth.json 单槽无法同时代表 TUI / 网关两域；auth.json 的 opencode-go.key 仅由 TUI 插件轮换维护，
+    // 网关切 key 后 TUI 持久化凭据不变（TUI 重启后仍用自己域 key）。此前的 syncAuth(next.key) 已移除。
+    log(`✅  轮换到 key "${next.name}"（网关域 current_gateway），不动 auth.json / TUI 域 current`)
     notify("zen-gateway 轮换", `已切换到 key "${next.name}"（配额耗尽自动轮换）`)
     return cfg
   })
@@ -1643,8 +1665,8 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, {
       ok: true,
       keys: cfg.keys.length,
-      available: cfg.keys.filter((k) => !k.cooldown_until || Date.parse(k.cooldown_until) <= Date.now()).length,
-      current: cfg.current,
+      available: cfg.keys.filter((k) => !k.cooldown_until_gateway || Date.parse(k.cooldown_until_gateway) <= Date.now()).length,
+      current: cfg.current_gateway ?? cfg.current,
       defaultModel: DEFAULT_MODEL,
       rotations: usageStats.rotations,
     })
@@ -1775,11 +1797,11 @@ if (!process.env.ZEN_TEST) {
     const cfg = loadConfig()
     log(
       `🚀  zen-gateway 启动 http://${HOST}:${PORT}  默认模型=${DEFAULT_MODEL}  key数=${cfg.keys.length}  ` +
-        `当前=${cfg.current}  config=${CONFIG_FILE}  auth=${AUTH_FILE}`,
+        `当前=${cfg.current_gateway}  config=${CONFIG_FILE}  auth=${AUTH_FILE}`,
     )
     console.log(`zen-gateway listening on http://${HOST}:${PORT}`)
     console.log(`  POST /v1/chat/completions   POST /v1/messages   POST /v1/responses   GET /v1/models   GET /healthz`)
-    console.log(`  default model: ${DEFAULT_MODEL}   keys: ${cfg.keys.length}   current: ${cfg.current}`)
+    console.log(`  default model: ${DEFAULT_MODEL}   keys: ${cfg.keys.length}   current: ${cfg.current_gateway}`)
     if (ACTIVE_TOKEN) console.log(`  auth: Bearer ${maskToken(ACTIVE_TOKEN)}（已掩码）`)
     else console.log(`  auth: none (仅绑定 ${HOST})`)
     // M3：启动即异步拉取上游模型表（失败静默降级为内置表，不阻塞启动）
@@ -1827,7 +1849,7 @@ function gatewayStatusSummary(cfg, opts = {}) {
     authEnabled: !!ACTIVE_TOKEN,
     modelCount: ACTIVE_PLAN.builtinModels.length,
     keys: Array.isArray(cfg?.keys) ? cfg.keys.length : 0,
-    current: cfg?.current ?? "",
+    current: cfg?.current_gateway ?? cfg?.current ?? "",
     usageFile: USAGE_FILE,
     upstreamBase: ACTIVE_PLAN.upstreamBase,
     models: [...ACTIVE_PLAN.builtinModels],
@@ -1849,7 +1871,7 @@ function gatewayConfigSummary(cfg, raw = null) {
     raw && typeof raw === "object" && typeof raw.auto_web === "boolean" ? raw.auto_web : undefined
   return {
     cooldownMinutes: cfg?.cooldown_minutes ?? DEFAULT_COOLDOWN_MIN,
-    current: cfg?.current ?? "",
+    current: cfg?.current_gateway ?? cfg?.current ?? "",
     keys,
     ...(autoWeb !== undefined ? { autoWeb } : {}),
   }
@@ -1973,6 +1995,7 @@ export {
   gatewayStatusSummary,
   gatewayConfigSummary,
   gatewayModelsSummary,
+  loadConfig,
   readRawConfig,
   readGatewayConfig,
   resolvePlan,

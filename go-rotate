@@ -8,7 +8,7 @@ Usage:
   go-rotate init             interactive first-time setup
   go-rotate web              start the web UI standalone (no opencode needed)
   go-rotate web on|off|status  toggle auto-start web on opencode launch (off = no port, rotation still works)
-  go-rotate gateway {start|stop|restart|status|logs [n]|plan [go|zen]|token [gen|clear|set <v>]}  manage zen-gateway service (launchd LaunchAgent)
+  go-rotate gateway {start|stop|restart|status|logs [n]|plan [go|zen]|token [gen|clear|set <v>]|set <name>|next [min]|cooldown <name> [min|clear]}  manage zen-gateway service + gateway-domain key rotation
   go-rotate set <name>       switch to a named key (and sync auth.json)
   go-rotate next [minutes]   rotate to next available key (optional cooldown minutes)
   go-rotate add <name> <key> add a key
@@ -153,9 +153,23 @@ def do_status(cfg):
         else:
             stshow = ""
         print(f"{mark}{k['name']:<12} {k['key'][:16]}...{stshow}  {fmt_until(k.get('cooldown_until'))}")
+    # 双域当前 key（新增：TUI 域游标 current / 网关域游标 current_gateway，读侧兜底 current_gateway ?? current）
+    gw_cur = cfg.get("current_gateway") or cur or ""
+    print(f"TUI 当前: {cur or '(not set)'}{_cur_cooling(cfg, cur, 'cooldown_until')}")
+    print(f"网关当前: {gw_cur or '(not set)'}{_cur_cooling(cfg, gw_cur, 'cooldown_until_gateway')}")
     # 网关状态（容错：网关没装/没跑不报错，2s 超时）
     ok, _ = _gateway_healthz()
     print(f"网关: running ({GATEWAY_PORT})" if ok else "网关: stopped")
+
+
+def _cur_cooling(cfg, name, field):
+    """当前 key 的冷却剩余后缀（含冷却信息可选）。name 空或无冷却 → 空串。"""
+    if not name:
+        return ""
+    for k in cfg["keys"]:
+        if k["name"] == name and k.get(field):
+            return f"  ({fmt_until(k[field])})"
+    return ""
 
 
 def do_set(cfg, name):
@@ -549,13 +563,11 @@ def do_stats():
 
 GATEWAY_USAGE = (
     "用法: go-rotate gateway {start|stop|restart|status|logs [行数]|plan [go|zen]|token [gen|clear|set <值>]}\n"
-    "  start    幂等启动 zen-gateway 服务（launchd LaunchAgent，已加载则跳过）\n"
-    "  stop     停止服务（launchctl bootout）\n"
-    "  restart  重启服务（stop + start）\n"
-    "  status   查看运行状态（stopped/running/健康检查未通过）+ 端口 + key 数\n"
-    "  logs     查看网关日志（默认 ~/Library/Logs/zen-gateway.log，行数默认 100）\n"
-    "  plan     查看当前套餐（无参）或切换 go/zen 套餐（写 gateway-config.json，重启生效）\n"
-    "  token    查看网关 token 掩码（无参）；gen 生成 / clear 清除 / set <值> 设置（重启生效）\n"
+    "        ├ 服务管理: start/stop/restart/status/logs/plan/token（见上）\n"
+    "        ├ 网关域 key 轮换（独立于 TUI 域，写 current_gateway / cooldown_until_gateway，不动 TUI 字段）:\n"
+    "  set <name>         设网关域当前 key（校验存在；不写 auth.json）\n"
+    "  next [分钟]        网关域轮换：原网关 current 进网关域冷却 + 选下一个未冷却写 current_gateway\n"
+    "  cooldown <name> [分钟|clear]  写/清网关域冷却（缺省用该 key 独立窗口或全局窗口）\n"
 )
 
 
@@ -796,6 +808,77 @@ def _gateway_token(action=None, value=None):
     sys.exit(f"未知 token 操作: {action}\n用法: go-rotate gateway token [gen|clear|set <value>]")
 
 
+# ---------- gateway 域 key 轮换（双域独立：写 current_gateway / cooldown_until_gateway，不动 TUI 域 current / cooldown_until） ----------
+# 与 Team A/B 契约对齐：读侧兜底 `current_gateway ?? current`；网关域冷却判定只读 `cooldown_until_gateway`；
+# 网关域轮换绝不同步 auth.json（auth.json 单槽仅由 TUI 域插件/CLI 维护）。
+
+def _gateway_current(cfg):
+    return cfg.get("current_gateway") or cfg.get("current") or ""
+
+
+def _gateway_set(cfg, name):
+    """网关域 set：写 current_gateway（校验存在；不同步 auth.json）。调用方持锁。"""
+    for k in cfg["keys"]:
+        if k["name"] == name:
+            cfg["current_gateway"] = name
+            save(cfg)
+            print(f'gateway switched to key "{name}"')
+            return
+    sys.exit(f'key "{name}" not found')
+
+
+def _gateway_next(cfg, minutes):
+    """网关域轮换：原网关 current 进网关域冷却（写 cooldown_until_gateway，窗口 = minutes 参数 或 key 独立窗口 或 全局）
+    + 选下一个网关域未冷却的 key（判定只读 cooldown_until_gateway）写 current_gateway；全冷却提示并维持。调用方持锁。"""
+    now = datetime.now(timezone.utc).timestamp()
+    ordered = cfg["keys"]
+    cur = _gateway_current(cfg)
+    # 1) 原网关 current 进网关域冷却
+    if cur:
+        old = next((k for k in ordered if k["name"] == cur), None)
+        if old is not None:
+            dst_min = minutes if minutes else (old.get("cooldown_minutes") or cfg.get("cooldown_minutes", DEFAULT_COOLDOWN_MIN))
+            old["cooldown_until_gateway"] = (datetime.now(timezone.utc) + timedelta(minutes=dst_min)).isoformat()
+    # 2) 选下一个未冷却（网关域判定：cooldown_until_gateway）
+    start = next((i for i, k in enumerate(ordered) if k["name"] == cur), -1)
+    for i in range(1, len(ordered) + 1):
+        k = ordered[(start + i) % len(ordered)]
+        cu = k.get("cooldown_until_gateway")
+        if not cu or datetime.fromisoformat(cu.replace("Z", "+00:00")).timestamp() <= now:
+            cfg["current_gateway"] = k["name"]
+            save(cfg)
+            print(f'gateway rotated to key "{k["name"]}"')
+            return
+    save(cfg)  # 全冷却：冷却了旧 current 也需落盘
+    print("no available key (all cooling), keeping current")
+
+
+def _gateway_cooldown(cfg, name, argv):
+    """网关域冷却：写 cooldown_until_gateway。minutes 缺省 = TUI 域现状语义（该 key 独立窗口 > 全局 > DEFAULT）。调用方持锁。"""
+    for k in cfg["keys"]:
+        if k["name"] == name:
+            minutes = argv[0] if argv else None
+            if isinstance(minutes, str) and str(minutes).lower() in ("clear", "off", "0"):
+                k["cooldown_until_gateway"] = None
+                save(cfg)
+                print(f'gateway key "{name}" 冷却已清除（恢复可用）')
+                return
+            if minutes == 0:
+                k["cooldown_until_gateway"] = None
+                save(cfg)
+                print(f'gateway key "{name}" 冷却已清除（恢复可用）')
+                return
+            try:
+                mins = int(minutes) if minutes else k.get("cooldown_minutes") or cfg.get("cooldown_minutes", DEFAULT_COOLDOWN_MIN)
+            except ValueError:
+                sys.exit(f"非法网关冷却分钟值: {minutes}\n用法: go-rotate gateway cooldown <name> <分钟|clear>")
+            k["cooldown_until_gateway"] = (datetime.now(timezone.utc) + timedelta(minutes=mins)).isoformat()
+            save(cfg)
+            print(f'gateway key "{name}" cooling for {mins} min')
+            return
+    sys.exit(f'key "{name}" not found')
+
+
 def do_gateway(action, argv=None):
     """zen-gateway 服务管理：go-rotate gateway {start|stop|restart|status|logs [n]|plan [go|zen]|token ...}"""
     argv = argv or []
@@ -813,6 +896,20 @@ def do_gateway(action, argv=None):
         _gateway_plan(argv[0] if argv else None)
     elif action == "token":
         _gateway_token(argv[0] if argv else None, argv[1] if len(argv) > 1 else None)
+    elif action == "set":
+        if len(argv) < 1:
+            sys.exit("用法: go-rotate gateway set <name>")
+        _gateway_set(load(), argv[0])
+    elif action == "next":
+        try:
+            minutes = int(argv[0]) if argv else None
+        except ValueError:
+            sys.exit(f"非法网关分钟值: {argv[0]}\n用法: go-rotate gateway next [分钟]")
+        _gateway_next(load(), minutes)
+    elif action == "cooldown":
+        if len(argv) < 1:
+            sys.exit("用法: go-rotate gateway cooldown <name> [分钟|clear]")
+        _gateway_cooldown(load(), argv[0], argv[1:])
     else:
         print(GATEWAY_USAGE)
         if action is not None:
@@ -847,8 +944,9 @@ def main():
         return
     if cmd == "gateway":
         sub = args[1] if len(args) > 1 else None
-        # 启停 + 写配置（plan go|zen / token gen|clear|set）持配置锁（避免与插件并发写配置）；只读（status/logs/plan 无参/token 无参）不锁
-        if sub in ("start", "stop", "restart"):
+        # 写命令走配置锁（避免与插件并发写配置）：服务启停 + plan/token 写 gateway-config、网关域 set/next/cooldown 写 go-keys.json。
+        # 只读（status/logs/plan 无参/token 无参）不锁。
+        if sub in ("start", "stop", "restart", "set", "next", "cooldown"):
             _with_lock(lambda: do_gateway(sub, args[2:]))
         elif sub == "plan" and len(args) > 2:
             _with_lock(lambda: do_gateway(sub, args[2:]))

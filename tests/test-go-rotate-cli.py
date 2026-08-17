@@ -69,12 +69,14 @@ def read_cfg(home):
         return json.load(f)
 
 
-def key(name, val, cooldown_until=None, cooldown_minutes=None, last_status=None):
+def key(name, val, cooldown_until=None, cooldown_minutes=None, last_status=None, cooldown_until_gateway=None):
     k = {"name": name, "key": val, "cooldown_until": cooldown_until}
     if cooldown_minutes is not None:
         k["cooldown_minutes"] = cooldown_minutes
     if last_status is not None:
         k["last_status"] = last_status
+    if cooldown_until_gateway is not None:
+        k["cooldown_until_gateway"] = cooldown_until_gateway
     return k
 
 
@@ -704,6 +706,234 @@ class TestAuthSync(_CliCase):
             auth = json.load(f)
         self.assertEqual(auth["codeplan"]["key"], "sk-other")
         self.assertEqual(auth["opencode-go"]["key"], "sk-act1-key-0001")
+
+
+# ---------- 12. gateway 双域独立轮换（current_gateway / cooldown_until_gateway） ----------
+
+class TestGatewayDomain(_CliCase):
+    """gateway {set|next|cooldown} 网关域独立轮换（不动 TUI 域字段）"""
+
+    def setUp(self):
+        super().setUp()
+        write_cfg(self.home,
+                  [key("act1", "sk-act1-key-0001"),
+                   key("act2", "sk-act2-key-0002"),
+                   key("act3", "sk-act3-key-0003")],
+                  current="act1")
+
+    # ---- gateway set ----
+
+    def test_gateway_set写current_gateway不动TUI且不同步auth(self):
+        """gateway set act2 → current_gateway=act2，TUI current 不变，不写 auth.json（网关域轮换不碰 auth）"""
+        r = run_cli(["gateway", "set", "act2"], self.home)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn('gateway switched to key "act2"', r.stdout)
+        cfg = read_cfg(self.home)
+        self.assertEqual(cfg["current_gateway"], "act2")
+        self.assertEqual(cfg["current"], "act1")
+        self.assertFalse(os.path.exists(auth_path(self.home)),
+                         "网关域 set 不得同步 auth.json")
+
+    def test_gateway_set未知key退出1(self):
+        """gateway set nope → 退出 1「not found」，current_gateway 不变"""
+        run_cli(["gateway", "set", "act2"], self.home)
+        r = run_cli(["gateway", "set", "nope"], self.home)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("not found", r.stdout + r.stderr)
+        self.assertEqual(read_cfg(self.home)["current_gateway"], "act2")
+
+    def test_gateway_set缺参数退出1(self):
+        """gateway set（无 name）→ 退出 1，干净用法提示，无 traceback"""
+        r = run_cli(["gateway", "set"], self.home)
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("用法", r.stdout + r.stderr)
+
+    # ---- gateway next ----
+
+    def test_gateway_next独立轮换不动TUI域(self):
+        """网关 current=act2 → next → current_gateway=act3；原网关 current(act2) 进网关域冷却；
+        TUI current/cooldown_until 不动（act1 的 TUI 冷却不影响网关域选择）"""
+        run_cli(["gateway", "set", "act2"], self.home)
+        tui_act1_cd = fut_iso(999)  # TUI 域 act1 冷却，不应被网关域读取
+        cfg = read_cfg(self.home)
+        cfg["keys"][0]["cooldown_until"] = tui_act1_cd
+        with open(cfg_path(self.home), "w") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        r = run_cli(["gateway", "next"], self.home)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn('gateway rotated to key "act3"', r.stdout)
+        out_cfg = read_cfg(self.home)
+        self.assertEqual(out_cfg["current_gateway"], "act3")
+        # 原网关 current(act2) 进网关域冷却
+        self.assertIsNotNone(out_cfg["keys"][1]["cooldown_until_gateway"])
+        # TUI 域字段完全不动
+        self.assertEqual(out_cfg["current"], "act1")
+        self.assertEqual(out_cfg["keys"][0]["cooldown_until"], tui_act1_cd)
+        self.assertIsNone(out_cfg["keys"][0].get("cooldown_until_gateway"),
+                          "act1 未被网关域冷却，其网关域冷却字段应为空")
+
+    def test_gateway_next带分钟参数冷却原网关current(self):
+        """gateway next 10 → 原网关 current 冷却 10min（minutes 覆盖），选下一个"""
+        write_cfg(self.home,
+                  [key("act1", "sk-a"), key("act2", "sk-b")],
+                  current="act1", extra={"current_gateway": "act1"})
+        r = run_cli(["gateway", "next", "10"], self.home)
+        self.assertEqual(r.returncode, 0)
+        out_cfg = read_cfg(self.home)
+        self.assertEqual(out_cfg["current_gateway"], "act2")
+        assert_cooldown_until_near(self, out_cfg["keys"][0]["cooldown_until_gateway"], 10)
+
+    def test_gateway_next跳过网关域冷却的key(self):
+        """网关域内冷却 act2 → next 跳过 act2 到 act3；TUI 域 act1 的 cooldown_until 不被读取"""
+        write_cfg(self.home,
+                  [key("act1", "sk-a", cooldown_until=fut_iso(999)),
+                   key("act2", "sk-b", cooldown_until_gateway=fut_iso(60)),
+                   key("act3", "sk-c")],
+                  current="act1", extra={"current_gateway": "act1"})
+        r = run_cli(["gateway", "next"], self.home)
+        self.assertEqual(r.returncode, 0)
+        out_cfg = read_cfg(self.home)
+        self.assertEqual(out_cfg["current_gateway"], "act3")
+        self.assertEqual(out_cfg["current"], "act1")
+        self.assertIsNotNone(out_cfg["keys"][0].get("cooldown_until"), "TUI 冷却保留")
+        self.assertIsNotNone(out_cfg["keys"][1].get("cooldown_until_gateway"), "act2 网关域冷却保留")
+
+    def test_gateway_next全部冷却保持网关当前(self):
+        """全部网关域冷却 → 「no available key」，current_gateway 不变"""
+        write_cfg(self.home,
+                  [key("act1", "sk-a", cooldown_until_gateway=fut_iso(60)),
+                   key("act2", "sk-b", cooldown_until_gateway=fut_iso(60))],
+                  current="act1", extra={"current_gateway": "act1"})
+        r = run_cli(["gateway", "next"], self.home)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("no available key", r.stdout)
+        self.assertEqual(read_cfg(self.home)["current_gateway"], "act1")
+
+    def test_gateway_next迁移兜底从current起(self):
+        """无 current_gateway 字段 → 网关 next 以 current 为起点轮换并写 current_gateway（读侧兜底）"""
+        write_cfg(self.home, [key("act1", "sk-a"), key("act2", "sk-b")], current="act1")  # 无 current_gateway
+        r = run_cli(["gateway", "next"], self.home)
+        self.assertEqual(r.returncode, 0)
+        out_cfg = read_cfg(self.home)
+        self.assertEqual(out_cfg["current_gateway"], "act2")
+        self.assertEqual(out_cfg["current"], "act1")
+        self.assertIsNotNone(out_cfg["keys"][0].get("cooldown_until_gateway"),
+                             "原网关 current(=current act1) 应进网关域冷却")
+
+    def test_gateway_next非法分钟值退出1(self):
+        """gateway next abc → 退出 1，干净用法提示，无 traceback"""
+        r = run_cli(["gateway", "next", "abc"], self.home)
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("分钟", r.stdout + r.stderr)
+
+    # ---- gateway cooldown ----
+
+    def test_gateway_cooldown写网关域字段不动TUI(self):
+        """gateway cooldown act1 60 → cooldown_until_gateway≈now+60，TUI cooldown_until 不动"""
+        r = run_cli(["gateway", "cooldown", "act1", "60"], self.home)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn('gateway key "act1" cooling for 60 min', r.stdout)
+        cfg = read_cfg(self.home)
+        assert_cooldown_until_near(self, cfg["keys"][0]["cooldown_until_gateway"], 60)
+        self.assertIsNone(cfg["keys"][0].get("cooldown_until"), "TUI 域 cooldown_until 不应被写")
+
+    def test_gateway_cooldown无参用全局窗口(self):
+        """gateway cooldown act1（无参）→ 用全局 300min"""
+        r = run_cli(["gateway", "cooldown", "act1"], self.home)
+        assert_cooldown_until_near(self, read_cfg(self.home)["keys"][0]["cooldown_until_gateway"], 300)
+
+    def test_gateway_cooldown无参优先key独立窗口(self):
+        """key 有 cooldown_minutes=30 → 无参网关冷却用 30min"""
+        write_cfg(self.home, [key("act1", "sk-a", cooldown_minutes=30)], current="act1")
+        run_cli(["gateway", "cooldown", "act1"], self.home)
+        assert_cooldown_until_near(self, read_cfg(self.home)["keys"][0]["cooldown_until_gateway"], 30)
+
+    def test_gateway_cooldown_clear清除(self):
+        """gateway cooldown act1 clear → cooldown_until_gateway 置 null"""
+        write_cfg(self.home, [key("act1", "sk-a", cooldown_until_gateway=fut_iso(60))], current="act1")
+        r = run_cli(["gateway", "cooldown", "act1", "clear"], self.home)
+        self.assertEqual(r.returncode, 0)
+        self.assertIsNone(read_cfg(self.home)["keys"][0]["cooldown_until_gateway"])
+
+    def test_gateway_cooldown_0清除(self):
+        """gateway cooldown act1 0 → cooldown_until_gateway 置 null"""
+        write_cfg(self.home, [key("act1", "sk-a", cooldown_until_gateway=fut_iso(60))], current="act1")
+        run_cli(["gateway", "cooldown", "act1", "0"], self.home)
+        self.assertIsNone(read_cfg(self.home)["keys"][0]["cooldown_until_gateway"])
+
+    def test_gateway_cooldown未知key退出1(self):
+        """gateway cooldown nope → 退出 1「not found」"""
+        r = run_cli(["gateway", "cooldown", "nope"], self.home)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("not found", r.stdout + r.stderr)
+
+    def test_gateway_cooldown非法分钟值退出1(self):
+        """gateway cooldown act1 abc → 退出 1，干净用法提示，无 traceback"""
+        r = run_cli(["gateway", "cooldown", "act1", "abc"], self.home)
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("用法", r.stdout + r.stderr)
+
+    def test_gateway_cooldown缺参数退出1(self):
+        """gateway cooldown（无 name）→ 退出 1"""
+        r = run_cli(["gateway", "cooldown"], self.home)
+        self.assertEqual(r.returncode, 1)
+
+    # ---- status 双域 ----
+
+    def test_status输出TUI与网关当前双域(self):
+        """status 含 TUI 当前 / 网关当前 双域行（各自独立游标）"""
+        write_cfg(self.home,
+                  [key("act1", "sk-a"), key("act2", "sk-b")],
+                  current="act1", extra={"current_gateway": "act2"})
+        r = run_cli(["status"], self.home)
+        self.assertIn("TUI 当前: act1", r.stdout)
+        self.assertIn("网关当前: act2", r.stdout)
+
+    def test_status网关当前迁移兜底(self):
+        """无 current_gateway → 网关当前显示 current（读侧兜底）"""
+        r = run_cli(["status"], self.home)  # current=act1, 无 current_gateway
+        self.assertIn("TUI 当前: act1", r.stdout)
+        self.assertIn("网关当前: act1", r.stdout)
+
+    def test_status当前key冷却剩余可选展示(self):
+        """网关当前 key 有冷却 → 双域行带冷却后缀"""
+        write_cfg(self.home,
+                  [key("act1", "sk-a", cooldown_until_gateway=fut_iso(30))],
+                  current="act1", extra={"current_gateway": "act1"})
+        r = run_cli(["status"], self.home)
+        self.assertIn("网关当前: act1", r.stdout)
+        self.assertIn("cooling", r.stdout)
+
+    # ---- 锁 / 残留 ----
+
+    def test_gateway写命令后无锁无tmp残留(self):
+        """gateway set/next/cooldown 后锁文件已清、无 tmp 残留"""
+        run_cli(["gateway", "set", "act2"], self.home)
+        run_cli(["gateway", "next"], self.home)
+        run_cli(["gateway", "cooldown", "act1", "10"], self.home)
+        d = os.path.dirname(cfg_path(self.home))
+        for f in os.listdir(d):
+            self.assertFalse(f.endswith(".lock") or f.endswith(".tmp"), f"不应残留 {f}")
+
+    def test_gateway写命令走锁(self):
+        """源码结构：main() 中 gateway set/next/cooldown 经 _with_lock 包裹（写 go-keys.json）"""
+        src = open(CLI_PATH, encoding="utf-8").read()
+        self.assertIn('if sub in ("start", "stop", "restart", "set", "next", "cooldown"):', src)
+        self.assertIn("_with_lock(lambda: do_gateway(sub, args[2:]))", src)
+
+    def test_tui写命令不动网关域字段(self):
+        """TUI 域 set/next/cooldown 只动 current/cooldown_until，不写 current_gateway/cooldown_until_gateway"""
+        write_cfg(self.home,
+                  [key("act1", "sk-a"), key("act2", "sk-b")],
+                  current="act1", extra={"current_gateway": "act2"})
+        run_cli(["set", "act2"], self.home)          # TUI set
+        run_cli(["cooldown", "act1", "60"], self.home)  # TUI cooldown
+        cfg = read_cfg(self.home)
+        self.assertEqual(cfg["current_gateway"], "act2")        # 网关域游标不动
+        self.assertIsNone(cfg["keys"][0].get("cooldown_until_gateway"))  # 网关域冷却不动
 
 
 if __name__ == "__main__":

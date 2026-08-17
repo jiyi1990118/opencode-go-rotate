@@ -63,11 +63,15 @@ type KeyEntry = {
   cooldown_minutes?: number
   /** 最近一次探测/轮换得到的健康状态：ok | invalid | nobalance | limited | error | null */
   last_status?: string | null
+  /** 网关域冷却记录（双域独立轮换）：null = 网关域无冷却。TUI 域冷却仍用 cooldown_until */
+  cooldown_until_gateway?: string | null
 }
 type Config = {
   provider_id: string
   cooldown_minutes: number
   current: string
+  /** 网关域游标（双域独立轮换）：读侧兜底 `current_gateway ?? current` */
+  current_gateway?: string
   keys: KeyEntry[]
   /** 是否随 opencode 启动自动起 Web；false 时轮换仍可用，仅不占用端口 */
   auto_web?: boolean
@@ -149,13 +153,16 @@ function loadConfig(): Config {
   try {
     const raw = existsSync(CONFIG_FILE) ? readFileSync(CONFIG_FILE, "utf8") : "{}"
     const cfg = JSON.parse(raw)
-    const keys = (Array.isArray(cfg.keys) ? cfg.keys : []).filter(
-      (k: any) => k && typeof k.name === "string" && typeof k.key === "string",
-    )
+    const keys = (Array.isArray(cfg.keys) ? cfg.keys : [])
+    .filter((k: any) => k && typeof k.name === "string" && typeof k.key === "string")
+    // 归一化：每 key 都显式携带网关域冷却字段（null = 网关域无冷却，schema 一致）
+    .map((k: any) => ({ ...k, cooldown_until_gateway: k.cooldown_until_gateway ?? null }))
     const out: any = {
       provider_id: cfg.provider_id ?? "opencode-go",
       cooldown_minutes: cfg.cooldown_minutes ?? DEFAULT_COOLDOWN_MIN,
       current: cfg.current ?? "",
+      // 网关域游标：读侧兜底 current_gateway ?? current（旧配置无网关域字段=干净起步用 TUI 当前 key）
+      current_gateway: cfg.current_gateway ?? cfg.current ?? "",
       keys,
       auto_web: cfg.auto_web !== false,
     }
@@ -166,7 +173,7 @@ function loadConfig(): Config {
     return out
   } catch (e) {
     log(`loadConfig error: ${(e as Error).message}`)
-    return { provider_id: "opencode-go", cooldown_minutes: DEFAULT_COOLDOWN_MIN, current: "", keys: [], auto_web: true }
+    return { provider_id: "opencode-go", cooldown_minutes: DEFAULT_COOLDOWN_MIN, current: "", current_gateway: "", keys: [], auto_web: true }
   }
 }
 
@@ -201,10 +208,15 @@ function mutateConfig(fn: (cfg: Config) => void): Config {
   })
 }
 
-/** 自愈：若 current 指向不存在的 name，则回退到第一个 key */
+/** 自愈：TUI 域若 current 指向不存在的 name，则回退到第一个 key；
+ *  网关域若 current_gateway 指向不存在的 name，则兜底 current 或 keys[0]（同语义但作用网关域字段） */
 function reconcileCurrent(cfg: Config) {
   if (!cfg.keys.some((k) => k.name === cfg.current)) {
     cfg.current = cfg.keys[0]?.name ?? ""
+  }
+  if (!cfg.keys.some((k) => k.name === cfg.current_gateway)) {
+    cfg.current_gateway =
+      cfg.keys.some((k) => k.name === cfg.current) ? cfg.current : (cfg.keys[0]?.name ?? "")
   }
 }
 
@@ -325,7 +337,7 @@ function setCurrent(name: string): Config {
 function addKey(name: string, key: string): Config {
   return mutateConfig((cfg) => {
     if (cfg.keys.some((x) => x.name === name)) throw new Error(`key "${name}" 已存在`)
-    cfg.keys.push({ name, key, cooldown_until: null })
+    cfg.keys.push({ name, key, cooldown_until: null, cooldown_until_gateway: null })
     log(`➕  添加 key "${name}"`)
   })
 }
@@ -338,8 +350,10 @@ function updateKey(name: string, patch: { key?: string; name?: string }): Config
     if (patch.name && patch.name !== name) {
       if (cfg.keys.some((x) => x.name === patch.name)) throw new Error(`key "${patch.name}" 已存在`)
       const wasCurrent = k.name === cfg.current
+      const wasGatewayCurrent = k.name === cfg.current_gateway
       k.name = patch.name
       if (wasCurrent) cfg.current = patch.name
+      if (wasGatewayCurrent) cfg.current_gateway = patch.name
     }
     if (patch.key) k.key = patch.key
     log(`✏️  更新 key "${name}"`)
@@ -367,6 +381,31 @@ function setCooldown(name: string, minutes: number | null): Config {
     } else {
       k.cooldown_until = new Date(Date.now() + minutes * 60_000).toISOString()
       log(`🧊  key "${name}" 进入冷却 ${minutes} 分钟`)
+    }
+  })
+}
+
+/** 设置网关域当前 key（web 用，domain="gateway"）。绝不 syncAuth（双域独立：网关域轮换不影响 auth.json） */
+function setGatewayCurrent(name: string): Config {
+  return mutateConfig((cfg) => {
+    const k = cfg.keys.find((x) => x.name === name)
+    if (!k) throw new Error(`key "${name}" 不存在`)
+    cfg.current_gateway = k.name
+    log(`🎯  手动设置网关域当前 key 为 "${k.name}"`)
+  })
+}
+
+/** 设置/清除网关域冷却（cooldown_until_gateway；TUI 域冷却用 setCooldown） */
+function setGatewayCooldown(name: string, minutes: number | null): Config {
+  return mutateConfig((cfg) => {
+    const k = cfg.keys.find((x) => x.name === name)
+    if (!k) throw new Error(`key "${name}" 不存在`)
+    if (minutes === null) {
+      k.cooldown_until_gateway = null
+      log(`🧊  清除 key "${name}" 网关域冷却`)
+    } else {
+      k.cooldown_until_gateway = new Date(Date.now() + minutes * 60_000).toISOString()
+      log(`🧊  key "${name}" 网关域进入冷却 ${minutes} 分钟`)
     }
   })
 }
@@ -425,12 +464,15 @@ function statusPayload() {
       cooldown_minutes: k.cooldown_minutes ?? null,
       last_status: k.last_status ?? null,
       isCurrent: k.name === cfg.current,
+      cooldown_until_gateway: k.cooldown_until_gateway ?? null,
+      isCurrentGateway: k.name === cfg.current_gateway,
     }
   })
   return {
     provider_id: cfg.provider_id,
     cooldown_minutes: cfg.cooldown_minutes,
     current: cfg.current,
+    current_gateway: cfg.current_gateway,
     auto_web: cfg.auto_web !== false,
     keyCount: cfg.keys.length,
     availableCount: keys.filter((k) => k.state === "available").length,
@@ -803,9 +845,17 @@ async function handleWeb(req: any): Promise<Response> {
         if (route === "/api/keys/add") return addKey(String(body.name), String(body.key))
         if (route === "/api/keys/update") return updateKey(String(body.name), body.patch ?? {})
         if (route === "/api/keys/delete") return removeKey(String(body.name))
-        if (route === "/api/current") return setCurrent(String(body.name))
-        if (route === "/api/cooldown")
-          return setCooldown(String(body.name), body.minutes === null ? null : Number(body.minutes))
+        // 双域：body.domain 缺省 = "tui"（现状行为不变）；"gateway" 写网关域字段
+        if (route === "/api/current")
+          return body.domain === "gateway"
+            ? setGatewayCurrent(String(body.name))
+            : setCurrent(String(body.name))
+        if (route === "/api/cooldown") {
+          const minutes = body.minutes === null ? null : Number(body.minutes)
+          return body.domain === "gateway"
+            ? setGatewayCooldown(String(body.name), minutes)
+            : setCooldown(String(body.name), minutes)
+        }
         if (route === "/api/cooldown/window")
           return setCooldownWindow(
             String(body.name),
@@ -1500,10 +1550,10 @@ async function refresh() {
     } else {
       hintEl.style.display = "none"
     }
-    /* P2-3：表格增量守卫——keys 列表（含健康/冷却/当前状态）无变化时跳过 5s 全量重建，
+    /* P2-3：表格增量守卫——keys 列表（含健康/冷却/双域当前状态）无变化时跳过 5s 全量重建，
        避免打断表格 hover/滚动等交互；状态卡字段已在上面无条件更新 */
     const sig = JSON.stringify(st.keys.map(k =>
-      [k.name, k.state, k.cooldown_until, k.isCurrent, health[k.name]?.status ?? "", k.masked]))
+      [k.name, k.state, k.cooldown_until, k.cooldown_until_gateway, k.isCurrent, k.isCurrentGateway, health[k.name]?.status ?? "", k.masked]))
     const tb = document.getElementById("tbody")
     if (sig !== lastKeysSig) {
       lastKeysSig = sig
@@ -1521,7 +1571,8 @@ async function refresh() {
       } else {
         badge = k.state === "cooling" ? '<span class="badge b-cooling">冷却 ' + esc(k.remainMin) + 'min</span>' : '<span class="badge b-available">可用</span>'
       }
-      if (k.isCurrent) badge += '<span class="badge b-current">当前</span>'
+      if (k.isCurrent) badge += '<span class="badge b-current">TUI 当前</span>'
+      if (k.isCurrentGateway) badge += '<span class="badge b-current">网关当前</span>'
       const h = health[k.name]
       let hcell = '<span class="muted">-</span>'
       if (h) {
@@ -1529,16 +1580,22 @@ async function refresh() {
         hcell = tip(h.status, statusLabel[h.status] || h.status, h.detail)
       }
       const n = esc(k.name), key = esc(k.key), masked = esc(k.masked)
+      /* 双域：TUI 使用 / 网关使用 分别写 current / current_gateway（/api/current domain 参数）；
+         冷却/清冷却（TUI 域）与网关冷却/网关清冷却（domain=gateway）域独立 */
+      const tuiCooling = k.state === "cooling"
       tr.innerHTML =
         '<td class="td-name" title="' + n + '">' + n + '</td>' +
         '<td class="muted" title="' + key + '">' + masked + '</td>' +
         '<td>' + badge + '</td>' +
         '<td>' + hcell + '</td>' +
         '<td><div class="actions">' +
-          (k.isCurrent ? '' : '<button data-set="' + n + '">启用</button>') +
-          (k.state === "cooling"
-            ? '<button data-cooldown="' + n + '" data-min="0">清除冷却</button>'
-            : '<button data-cooldown="' + n + '" data-min="' + esc(st.cooldown_minutes) + '">冷却</button>') +
+          (k.isCurrent ? '' : '<button data-set="' + n + '">TUI 使用</button>') +
+          (k.isCurrentGateway ? '' : '<button data-set-gw="' + n + '">网关使用</button>') +
+          (tuiCooling
+            ? '<button data-cooldown="' + n + '" data-min="0">TUI 清冷却</button>'
+            : '<button data-cooldown="' + n + '" data-min="' + esc(st.cooldown_minutes) + '">TUI 冷却</button>') +
+          '<button data-cooldown-gw="' + n + '" data-min="0" title="清除网关域冷却">网清冷却</button>' +
+          '<button data-cooldown-gw="' + n + '" data-min="' + esc(st.cooldown_minutes) + '" title="网关域冷却（共享窗口分钟）">网冷却</button>' +
           '<button data-window="' + n + '" title="设置该 key 独立冷却窗口（分钟，留空清除回退全局）">窗口</button>' +
           (k.cooldown_minutes ? '<button data-window-clear="' + n + '" title="清除独立窗口，回退全局">清窗</button>' : '') +
           '<button data-edit="' + n + '" title="编辑名称 / key 值">编辑</button>' +
@@ -1547,7 +1604,9 @@ async function refresh() {
       tb.appendChild(tr)
       }
       tb.querySelectorAll("[data-set]").forEach(b => b.onclick = () => doOp(() => api("/api/current", { name: b.dataset.set })))
+      tb.querySelectorAll("[data-set-gw]").forEach(b => b.onclick = () => doOp(() => api("/api/current", { name: b.dataset.setGw, domain: "gateway" })))
       tb.querySelectorAll("[data-cooldown]").forEach(b => b.onclick = () => doOp(() => api("/api/cooldown", { name: b.dataset.cooldown, minutes: Number(b.dataset.min) })))
+      tb.querySelectorAll("[data-cooldown-gw]").forEach(b => b.onclick = () => doOp(() => api("/api/cooldown", { name: b.dataset.cooldownGw, minutes: Number(b.dataset.min), domain: "gateway" })))
       tb.querySelectorAll("[data-window]").forEach(b => b.onclick = () => editKeyWindow(b.dataset.window))
       tb.querySelectorAll("[data-window-clear]").forEach(b => b.onclick = () => doOp(() => api("/api/cooldown/window", { name: b.dataset.windowClear, minutes: null })))
       tb.querySelectorAll("[data-edit]").forEach(b => b.onclick = () => editKey(b.dataset.edit))
@@ -1732,6 +1791,10 @@ async function refreshGateway() {
   try {
     const g = await api("/api/gateway")
     const installed = !!g.ctlExists
+    // 双域：网关卡「当前 key」走本地 statusPayload 网关域字段（current_gateway），
+    // 不用 graft 的 healthz current（网关域名）。失败回退 healthz.current 兜底显示。
+    const st = await api("/api/status").catch(() => null)
+    const gwCur = (st && st.current_gateway) || (g.healthz && g.healthz.current) || "-"
     if (!g.running) {
       card.style.opacity = "0.55"
       setDash()
@@ -1758,7 +1821,7 @@ async function refreshGateway() {
     setBtns(true, true)
     const h = g.healthz || {}
     const u = g.usage || {}
-    document.getElementById("gw-current").textContent = h.current || "-"
+    document.getElementById("gw-current").textContent = gwCur || "-"
     document.getElementById("gw-avail").textContent = (h.available ?? "-") + "/" + (h.keys ?? "-")
     document.getElementById("gw-rot").textContent = h.rotations ?? "-"
     document.getElementById("gw-req").textContent = u.totalRequests ?? "-"
@@ -2068,6 +2131,8 @@ export {
   removeKey,
   setCurrent,
   setCooldown,
+  setGatewayCurrent,
+  setGatewayCooldown,
   setCooldownWindow,
   setGlobalCooldown,
   parseStatsLog,

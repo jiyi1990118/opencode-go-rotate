@@ -630,6 +630,68 @@ t("current 不存在（X2 自愈语义）→ keys[0]", () => {
 t("空 keys → undefined（== null）", () => {
   assert.equal(gw.currentKey({ current: "", keys: [] }), undefined)
 })
+t("网关域：current_gateway 优先于 current（两域不同游标各自独立）", () => {
+  const cfg = { current: "a", current_gateway: "b", keys: [{ name: "a", key: "k1" }, { name: "b", key: "k2" }] }
+  assert.equal(gw.currentKey(cfg).name, "b")
+})
+t("网关域：仅 current → 兜底 current（旧配置零迁移）", () => {
+  const cfg = { current: "a", keys: [{ name: "a", key: "k1" }, { name: "b", key: "k2" }] }
+  assert.equal(gw.currentKey(cfg).name, "a")
+})
+t("网关域：current_gateway 指向不存在 → keys[0]（自愈）", () => {
+  const cfg = { current: "a", current_gateway: "ghost", keys: [{ name: "a", key: "k1" }, { name: "b", key: "k2" }] }
+  assert.equal(gw.currentKey(cfg).name, "a")
+})
+
+/* ================= 8b. loadConfig（含网关域 reconcile 自愈 + 迁移兜底） ================= */
+group("loadConfig（current_gateway 读侧兜底 / 双域自愈）")
+
+t("默认值含 current_gateway（空配置 → '')", () => {
+  const p = process.env.ZEN_CONFIG
+  writeFileSync(p, "{}", "utf8")
+  const cfg = gw.loadConfig()
+  assert.ok("current_gateway" in cfg, "返回对象必须含 current_gateway 字段")
+  assert.equal(cfg.current_gateway, "")
+})
+t("有 current_gateway → 原样返回（与 current 并列）", () => {
+  const p = process.env.ZEN_CONFIG
+  writeFileSync(
+    p,
+    JSON.stringify({ current: "a", current_gateway: "b", keys: [{ name: "a", key: "k1" }, { name: "b", key: "k2" }] }),
+    "utf8",
+  )
+  const cfg = gw.loadConfig()
+  assert.equal(cfg.current, "a")
+  assert.equal(cfg.current_gateway, "b")
+})
+t("迁移兜底：无 current_gateway → current_gateway ?? current", () => {
+  const p = process.env.ZEN_CONFIG
+  writeFileSync(p, JSON.stringify({ current: "a", keys: [{ name: "a", key: "k1" }, { name: "b", key: "k2" }] }), "utf8")
+  const cfg = gw.loadConfig()
+  assert.equal(cfg.current_gateway, "a")
+})
+t("自愈：current_gateway 指向不存在 → 兜底 current（有效时）", () => {
+  const p = process.env.ZEN_CONFIG
+  writeFileSync(
+    p,
+    JSON.stringify({ current: "a", current_gateway: "ghost", keys: [{ name: "a", key: "k1" }, { name: "b", key: "k2" }] }),
+    "utf8",
+  )
+  const cfg = gw.loadConfig()
+  assert.equal(cfg.current, "a")
+  assert.equal(cfg.current_gateway, "a")
+})
+t("自愈：current_gateway 与 current 均无效 → 归 keys[0]", () => {
+  const p = process.env.ZEN_CONFIG
+  writeFileSync(
+    p,
+    JSON.stringify({ current: "x", current_gateway: "g", keys: [{ name: "a", key: "k1" }, { name: "b", key: "k2" }] }),
+    "utf8",
+  )
+  const cfg = gw.loadConfig()
+  assert.equal(cfg.current, "a")
+  assert.equal(cfg.current_gateway, "a")
+})
 
 /* ================= 9. cooldownUntilDefault ================= */
 group("cooldownUntilDefault（默认冷却窗口）")
@@ -756,45 +818,68 @@ t("下一可用 key（无冷却）", () => {
   const cfg = { current: "a", keys: [{ name: "a", key: "1" }, { name: "b", key: "2" }, { name: "c", key: "3" }] }
   assert.equal(gw.pickNext(cfg).name, "b")
 })
-t("跳过冷却中的 key", () => {
+t("跳过【网关域】冷却中的 key（cooldown_until_gateway）", () => {
   const cfg = {
     current: "a",
     keys: [
       { name: "a", key: "1" },
-      { name: "b", key: "2", cooldown_until: new Date(Date.now() + 999999).toISOString() },
+      { name: "b", key: "2", cooldown_until_gateway: new Date(Date.now() + 999999).toISOString() },
       { name: "c", key: "3" },
     ],
   }
   assert.equal(gw.pickNext(cfg).name, "c")
 })
-t("冷却已过期 → 视为可用", () => {
+t("TUI 域 cooldown_until 不影响网关域 pickNext（b 有 TUI 冷却但仍可选）", () => {
   const cfg = {
     current: "a",
     keys: [
       { name: "a", key: "1" },
-      { name: "b", key: "2", cooldown_until: new Date(Date.now() - 1000).toISOString() },
+      { name: "b", key: "2", cooldown_until: new Date(Date.now() + 999999).toISOString() },
     ],
   }
   assert.equal(gw.pickNext(cfg).name, "b")
 })
-t("全部冷却 → undefined", () => {
+t("【网关域】冷却已过期 → 视为可用", () => {
   const cfg = {
     current: "a",
     keys: [
-      { name: "a", key: "1", cooldown_until: new Date(Date.now() + 999999).toISOString() },
-      { name: "b", key: "2", cooldown_until: new Date(Date.now() + 999999).toISOString() },
+      { name: "a", key: "1" },
+      { name: "b", key: "2", cooldown_until_gateway: new Date(Date.now() - 1000).toISOString() },
+    ],
+  }
+  assert.equal(gw.pickNext(cfg).name, "b")
+})
+t("【网关域】全部冷却 → undefined", () => {
+  const cfg = {
+    current: "a",
+    keys: [
+      { name: "a", key: "1", cooldown_until_gateway: new Date(Date.now() + 999999).toISOString() },
+      { name: "b", key: "2", cooldown_until_gateway: new Date(Date.now() + 999999).toISOString() },
     ],
   }
   assert.equal(gw.pickNext(cfg), undefined)
 })
-t("current 不在 keys → 从 keys[0] 起找可用", () => {
+t("current 不在 keys → 从 keys[0] 起找可用【网关域】", () => {
   const cfg = {
     current: "ghost",
     keys: [
-      { name: "a", key: "1", cooldown_until: new Date(Date.now() + 999999).toISOString() },
+      { name: "a", key: "1", cooldown_until_gateway: new Date(Date.now() + 999999).toISOString() },
       { name: "b", key: "2" },
     ],
   }
+  assert.equal(gw.pickNext(cfg).name, "b")
+})
+t("起点用网关域 current_gateway（a 网关冷却跳过 → 从 c 起）", () => {
+  const cfg = {
+    current: "c", // TUI 域游标
+    current_gateway: "a", // 网关域游标
+    keys: [
+      { name: "a", key: "1", cooldown_until_gateway: new Date(Date.now() + 999999).toISOString() },
+      { name: "b", key: "2" },
+      { name: "c", key: "3" },
+    ],
+  }
+  // start = a（网关域），跳过 a → b（无网关冷却）→ 可选 b
   assert.equal(gw.pickNext(cfg).name, "b")
 })
 t("空 keys → undefined", () => {
@@ -1048,14 +1133,18 @@ t("syncAuth 容错：auth.json 损坏 → 静默失败不抛错、文件原样�
   let err = null
   try {
     const cfgPath = process.env.ZEN_CONFIG
+    const resume = new Date(Date.now() + 99999999).toISOString()
+    // 双域配置：TUI 域 current=bad/cooldown_until=未来冷却；网关域 current_gateway=bad/cooldown_until_gateway 干净。
+    // 预置临时 auth.json 为「旧 key 内容」，用作铁证：网关 rotate 后必须逐字节不变（不再 syncAuth）。
     writeFileSync(
       cfgPath,
       JSON.stringify(
         {
           provider_id: "opencode-go",
           current: "bad",
+          current_gateway: "bad",
           keys: [
-            { name: "bad", key: "sk-fake-bad" },
+            { name: "bad", key: "sk-fake-bad", cooldown_until: resume },
             { name: "good", key: "sk-fake-good" },
           ],
         },
@@ -1063,26 +1152,35 @@ t("syncAuth 容错：auth.json 损坏 → 静默失败不抛错、文件原样�
         2,
       ),
     )
-    // 预置临时 auth.json 为「旧 key 内容」，验证 rotate 会覆盖为轮换后的新 key
     writeFileSync(gwA.AUTH_FILE, JSON.stringify({ "opencode-go": { type: "api", key: "sk-old-before-rotate" } }, null, 2))
+    const authBytesBefore = readFileSync(gwA.AUTH_FILE, "utf8")
     const cfg2 = await gwA.rotate(
       { error: { message: "quota exceeded, reset at 2026-08-16 08:00:00 +0800 CST" } },
       429,
       "bad",
     )
-    assert.equal(cfg2.current, "good")
+    // ① 域分离：返回 cfg 的 current（TUI 域）不动，current_gateway 变为新 key
+    assert.equal(cfg2.current, "bad")
+    assert.equal(cfg2.current_gateway, "good")
     const savedCfg = JSON.parse(readFileSync(cfgPath, "utf8"))
-    assert.equal(savedCfg.current, "good")
-    assert.equal(savedCfg.keys[0].cooldown_until, "2026-08-16T00:00:00.000Z")
-    const authAfter = JSON.parse(readFileSync(gwA.AUTH_FILE, "utf8"))
-    assert.equal(authAfter["opencode-go"].key, "sk-fake-good")
+    // ② 持久化同样域分离：current 仍 bad、current_gateway=good
+    assert.equal(savedCfg.current, "bad")
+    assert.equal(savedCfg.current_gateway, "good")
+    // ③ 冷却只写网关域 cooldown_until_gateway；TUI 域 cooldown_until 原值（未来冷却）不被重置
+    assert.equal(savedCfg.keys[0].cooldown_until_gateway, "2026-08-16T00:00:00.000Z")
+    assert.equal(savedCfg.keys[0].cooldown_until, resume)
+    assert.ok(!("cooldown_until" in savedCfg.keys[1]))
+    // ④ 🚨 auth.json 铁证：网关 rotate 后临时 auth 逐字节不变（域独立红线：不再 syncAuth）
+    assert.equal(readFileSync(gwA.AUTH_FILE, "utf8"), authBytesBefore)
+    // ⑤ 新当前 key last_status 清空；真实 auth.json 字节不变
+    assert.equal(savedCfg.keys[1].last_status, null)
     const realAfter = existsSync(realAuthPath) ? readFileSync(realAuthPath, "utf8") : null
     assert.equal(realAfter, realAuthBefore, "真实 auth.json 必须字节不变")
   } catch (e) {
     ok = false
     err = e
   }
-  const name = "rotate() 全链路隔离：假 key 429 → 临时 config 切换 + 临时 auth 更新 + 真实 auth 字节不变"
+  const name = "rotate() 域分离 + auth 铁证：假 key 429 → 只动 current_gateway/cooldown_until_gateway + 临时 auth 逐字节不变 + TUI current/cooldown_until 不动"
   if (ok) {
     passed++
     groups[groups.length - 1].count++
@@ -1090,6 +1188,90 @@ t("syncAuth 容错：auth.json 损坏 → 静默失败不抛错、文件原样�
   } else {
     failures.push({ group: currentGroup, name, error: err })
     console.log(`  ❌ ${name}\n     ${String((err && err.message) || err).split("\n").join("\n     ")}`)
+  }
+}
+
+{
+  // 复演：无 current_gateway 的旧配置（迁移兜底）→ rotate 后写 current_gateway，current 保持
+  let ok = true
+  let err = null
+  try {
+    const cfgPath = process.env.ZEN_CONFIG
+    writeFileSync(
+      cfgPath,
+      JSON.stringify(
+        {
+          provider_id: "opencode-go",
+          current: "a",
+          keys: [
+            { name: "a", key: "sk-fake-a" },
+            { name: "b", key: "sk-fake-b" },
+          ],
+        },
+        null,
+        2,
+      ),
+    )
+    const cfg2 = await gwA.rotate({ error: { message: "no balance" } }, 402, "a")
+    assert.equal(cfg2.current, "a")
+    assert.equal(cfg2.current_gateway, "b")
+    const savedCfg = JSON.parse(readFileSync(cfgPath, "utf8"))
+    assert.equal(savedCfg.current, "a")
+    assert.equal(savedCfg.current_gateway, "b")
+    assert.equal(savedCfg.keys[0].cooldown_until_gateway, savedCfg.keys[0].cooldown_until_gateway ?? null)
+  } catch (e) {
+    ok = false
+    err = e
+  }
+  const name2 = "rotate() 旧配置迁移兜底：无 current_gateway → 轮换写 current_gateway、current 保持原值"
+  if (ok) {
+    passed++
+    groups[groups.length - 1].count++
+    console.log(`  ✅ ${name2}`)
+  } else {
+    failures.push({ group: currentGroup, name: name2, error: err })
+    console.log(`  ❌ ${name2}\n     ${String((err && err.message) || err).split("\n").join("\n     ")}`)
+  }
+}
+
+{
+  // 复演：无可用 key（网关域全部冷却）→ 维持网关当前 key，仍持久化失败 key 的网关冷却，不触碰 auth
+  let ok = true
+  let err = null
+  try {
+    const cfgPath = process.env.ZEN_CONFIG
+    writeFileSync(
+      cfgPath,
+      JSON.stringify(
+        {
+          current: "a",
+          current_gateway: "a",
+          keys: [
+            { name: "a", key: "sk-fake-a", cooldown_until_gateway: new Date(Date.now() + 99999999).toISOString() },
+            { name: "b", key: "sk-fake-b", cooldown_until_gateway: new Date(Date.now() + 99999999).toISOString() },
+          ],
+        },
+        null,
+        2,
+      ),
+    )
+    const cfg2 = await gwA.rotate({ error: { message: "rate limit" } }, 429, "b")
+    assert.equal(cfg2.current_gateway, "a")
+    const savedCfg = JSON.parse(readFileSync(cfgPath, "utf8"))
+    assert.equal(savedCfg.current_gateway, "a")
+    assert.equal(savedCfg.keys[1].cooldown_until_gateway, savedCfg.keys[1].cooldown_until_gateway ?? null)
+  } catch (e) {
+    ok = false
+    err = e
+  }
+  const name3 = "rotate() 无可用 key（网关域全冷却）→ 维持网关 current_gateway，仍持久化失败 key 网关冷却"
+  if (ok) {
+    passed++
+    groups[groups.length - 1].count++
+    console.log(`  ✅ ${name3}`)
+  } else {
+    failures.push({ group: currentGroup, name: name3, error: err })
+    console.log(`  ❌ ${name3}\n     ${String((err && err.message) || err).split("\n").join("\n     ")}`)
   }
 }
 
@@ -1147,6 +1329,15 @@ t("opts.running=false 可注入", () => {
   assert.equal(gw.gatewayStatusSummary(_statusCfg, { running: false }).running, false)
 })
 
+t("网关域：当前字段返回 current_gateway（两域不同游标）", () => {
+  const s = gw.gatewayStatusSummary({ current: "act1", current_gateway: "act2", keys: [] })
+  assert.equal(s.current, "act2")
+})
+t("网关域：仅 current → status current 兜底 current（旧配置零迁移）", () => {
+  const s = gw.gatewayStatusSummary({ current: "act1", keys: [_statusCfg.keys[0]] })
+  assert.equal(s.current, "act1")
+})
+
 t("空/损坏 cfg 容错：keys=0 current='' 不抛错", () => {
   assert.equal(gw.gatewayStatusSummary({}).keys, 0)
   assert.equal(gw.gatewayStatusSummary({}).current, "")
@@ -1180,6 +1371,10 @@ t("cooldownMinutes 透传 cfg.cooldown_minutes；缺省回退 300；0 保留", (
 
 t("current 透传", () => {
   assert.equal(gw.gatewayConfigSummary(_statusCfg).current, "act1")
+})
+t("网关域：config current 返回 current_gateway（两域不同游标）", () => {
+  const c = gw.gatewayConfigSummary({ current: "act1", current_gateway: "act2", keys: [] })
+  assert.equal(c.current, "act2")
 })
 
 t("autoWeb：raw.auto_web=true/false → 对应值；raw 无该字段/非布尔/缺失 → 键不存在", () => {
