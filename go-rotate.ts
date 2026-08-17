@@ -1051,6 +1051,23 @@ try {
   .log-row pre { max-width: 100%; }
   .gr-tip { cursor: help; border-bottom: 1px dotted var(--tx-3); }
 
+  /* 页头：标题区 + 右上角主题切换（参考常见站点右上角白天/黑夜切换） */
+  .page-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+  .theme-toggle {
+    display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 12px;
+    border-radius: 999px; background: var(--bg-2); border: 1px solid var(--bd-2);
+    color: var(--tx-2); font-size: 13px; cursor: pointer;
+    transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease), background var(--dur) var(--ease);
+  }
+  .theme-toggle:hover { color: var(--tx-1); border-color: var(--bd-3); background: var(--bg-3); }
+  .theme-toggle:active { transform: translateY(0.5px); }
+  #theme-ico-moon, .theme-label-light { display: none; }
+  html[data-theme="light"] #theme-ico-sun { display: none; }
+  html[data-theme="light"] #theme-ico-moon { display: inline-block; }
+  html[data-theme="light"] .theme-label-dark { display: none; }
+  html[data-theme="light"] .theme-label-light { display: inline; }
+  .theme-ico { flex: none; }
+
   /* ============ 导航 ============ */
   .nav { display: flex; gap: 6px; margin-bottom: var(--sp-4); flex-wrap: wrap; }
   .nav-btn { height: 32px; padding: 0 14px; border-radius: var(--r-sm);
@@ -1213,14 +1230,23 @@ try {
 </head>
 <body>
 <div class="wrap">
-  <h1>go-rotate · opencode-go keys</h1>
-  <div class="sub">多 key 自动轮换 · 修改会自动同步到 auth.json 并立即生效</div>
+  <div class="page-head">
+    <div>
+      <h1>go-rotate · opencode-go keys</h1>
+      <div class="sub">多 key 自动轮换 · 修改会自动同步到 auth.json 并立即生效</div>
+    </div>
+    <button class="theme-toggle" id="theme-btn" onclick="toggleTheme()" title="切换深色/浅色主题">
+      <svg class="theme-ico" id="theme-ico-sun" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1 12h2M21 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"/></svg>
+      <svg class="theme-ico" id="theme-ico-moon" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z"/></svg>
+      <span id="theme-btn-label" class="theme-label-dark">浅色</span>
+      <span class="theme-label-light">深色</span>
+    </button>
+  </div>
 
   <div class="nav" id="main-nav">
     <button class="nav-btn active" data-nav="keys" onclick="switchNav('keys')">Key 管理</button>
     <button class="nav-btn" data-nav="settings" onclick="switchNav('settings')">网关与设置</button>
     <button class="nav-btn" data-nav="stats" onclick="switchNav('stats')">统计</button>
-    <button class="nav-btn" id="theme-btn" style="margin-left:auto" onclick="toggleTheme()">浅色</button>
   </div>
 
   <!-- ============ Key 管理：概览状态条 + 主操作区（新增卡 + 表格卡） ============ -->
@@ -1474,13 +1500,12 @@ function pollErr(m) {
   lastPollErr = { msg: m, at: now }
   toast(m, "error")
 }
-/* 主题切换：深色/浅色，localStorage 记忆（默认深色，head 防闪烁脚本已预置 data-theme） */
+/* 主题切换：深色/浅色，localStorage 记忆（默认深色，head 防闪烁脚本已预置 data-theme；图标/文本由 CSS 驱动） */
 function toggleTheme() {
   const cur = document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark"
   const next = cur === "light" ? "dark" : "light"
   document.documentElement.setAttribute("data-theme", next)
   try { localStorage.setItem("gr-theme", next) } catch (e) {}
-  document.getElementById("theme-btn").textContent = next === "light" ? "深色" : "浅色"
 }
 async function addKey() {
   const name = document.getElementById("new-name").value.trim()
@@ -1899,9 +1924,6 @@ async function clearLog() {
   catch (e) { showErr(e.message) }
 }
 refresh(); refreshLog(); refreshStats(); refreshGateway(); refreshGwLog(); switchNav("keys");
-/* 主题按钮文字按当前主题显示目标（head 脚本已预置 data-theme，防闪烁） */
-document.getElementById("theme-btn").textContent =
-  document.documentElement.getAttribute("data-theme") === "light" ? "深色" : "浅色"
 refreshPlans(); refreshGatewayConfig();
 /* P1-2：定时器句柄存入 timers 对象，webOff() 可整体清理 */
 var timers = {}

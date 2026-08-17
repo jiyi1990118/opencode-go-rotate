@@ -911,8 +911,12 @@ describe("WEB_HTML 网关管理区块（主导航 + 套餐卡 + Token 卡）", (
     expect(html).not.toContain('data-nav="gateway"')
     expect(html).toContain("function switchNav(block)")
     expect(html).toContain('onclick="switchNav(\'keys\')"')
-    /* 主题切换：按钮 + toggleTheme + localStorage 记忆 + 浅色变量覆盖 */
+    /* 主题切换：右上角按钮 + 图标 + toggleTheme + localStorage 记忆 + 浅色变量覆盖 */
     expect(html).toContain('id="theme-btn"')
+    expect(html).toContain('class="theme-toggle"')
+    expect(html).toContain('class="page-head"')
+    expect(html).toContain('id="theme-ico-sun"')
+    expect(html).toContain('id="theme-ico-moon"')
     expect(html).toContain("function toggleTheme()")
     expect(html).toContain('localStorage.getItem("gr-theme")')
     expect(html).toContain('html[data-theme="light"]')
