@@ -1278,10 +1278,12 @@ try {
   .small { font-size: 12px; }
   .row { display: flex; gap: var(--sp-2); align-items: center; }
   .row input { flex: 1; }
-  .actions { display: flex; gap: 6px; flex-wrap: wrap; }
-  /* 操作按钮分组：组间细分隔线 + 留白，按域/管理分块 */
+  .actions { display: flex; flex-direction: column; gap: 5px; }
+  /* 操作按钮两行布局：行1 = 检查 + 设为当前(三域)，行2 = 冷却(三域) + 管理 */
+  .actions .row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  /* 操作按钮分组：组间细分隔线 + 留白，按域/管理分块（每行行首组无边框） */
   .actions .grp { display: inline-flex; gap: 6px; align-items: center; }
-  .actions .grp + .grp { padding-left: 9px; border-left: 1px solid var(--bd-2); margin-left: 3px; }
+  .actions .row .grp + .grp { padding-left: 9px; border-left: 1px solid var(--bd-2); margin-left: 3px; }
   /* 单列堆叠：网关配置两块与日志双卡纵向排列，避免并排时内容宽度不足导致布局错乱 */
   .gw-config-grid { display: grid; grid-template-columns: 1fr; gap: var(--sp-4); align-items: start; }
   .log-row { display: grid; grid-template-columns: 1fr; gap: var(--sp-4); align-items: start; }
@@ -1793,7 +1795,7 @@ async function refresh() {
       const n = esc(k.name), key = esc(k.key), masked = esc(k.masked)
       const zenCooling = k.state === "cooling"
       const goCooling = !!(k.cooldown_until_go && Date.parse(k.cooldown_until_go) > Date.now())
-      /* 操作列分组：检查(主) | 设为当前(三域色) | 冷却(琥珀进入/绿清除) | 管理(ghost+danger) */
+      /* 操作列两行分组：行1 检查(主)+设为当前(三域色)；行2 冷却(琥珀进入/绿清除)+管理(ghost+danger) */
       tr.innerHTML =
         '<td class="td-name" title="' + n + '">' + n + '</td>' +
         '<td class="muted" title="' + key + '">' + masked + '</td>' +
@@ -1801,27 +1803,31 @@ async function refresh() {
         '<td>' + healthCell(k.last_status, k.last_checked_zen, "b-zen") + '</td>' +
         '<td>' + healthCell(k.last_status_go, k.last_checked_go, "b-go") + '</td>' +
         '<td><div class="actions">' +
-          '<button class="primary" data-check="' + n + '" title="探测该 key 双套餐健康（consumes ~1 token/端点）">检查</button>' +
-          '<span class="grp">' +
-            (k.isCurrent ? '' : '<button class="zen" data-set="' + n + '" title="设为 zen 免费档当前（同步 auth.json）">Zen 使用</button>') +
-            (k.isCurrentGo ? '' : '<button class="go" data-set-go="' + n + '" title="设为 go 套餐当前（不写 auth.json）">Go 使用</button>') +
-            (k.isCurrentGateway ? '' : '<button class="gw" data-set-gw="' + n + '" title="设为网关当前（不写 auth.json）">网关使用</button>') +
-          '</span>' +
-          '<span class="grp">' +
-            (zenCooling
-              ? '<button class="success" data-cooldown="' + n + '" data-min="0">Zen 清冷却</button>'
-              : '<button class="warn" data-cooldown="' + n + '" data-min="' + esc(st.cooldown_minutes) + '">Zen 冷却</button>') +
-            (goCooling
-              ? '<button class="success" data-cooldown-go="' + n + '" data-min="0">Go 清冷却</button>'
-              : '<button class="warn" data-cooldown-go="' + n + '" data-min="' + esc(st.cooldown_minutes) + '">Go 冷却</button>') +
-            '<button class="success" data-cooldown-gw="' + n + '" data-min="0" title="清除网关域冷却">网关清冷却</button>' +
-          '</span>' +
-          '<span class="grp">' +
-            '<button class="ghost" data-window="' + n + '" title="设置该 key 独立冷却窗口（分钟，留空清除回退全局）">窗口</button>' +
-            (k.cooldown_minutes ? '<button class="ghost" data-window-clear="' + n + '" title="清除独立窗口，回退全局">清窗</button>' : '') +
-            '<button class="ghost" data-edit="' + n + '" title="编辑名称 / key 值">编辑</button>' +
-            '<button class="danger" data-del="' + n + '">删除</button>' +
-          '</span>' +
+          '<div class="row">' +
+            '<button class="primary" data-check="' + n + '" title="探测该 key 双套餐健康（consumes ~1 token/端点）">检查</button>' +
+            '<span class="grp">' +
+              (k.isCurrent ? '' : '<button class="zen" data-set="' + n + '" title="设为 zen 免费档当前（同步 auth.json）">Zen 使用</button>') +
+              (k.isCurrentGo ? '' : '<button class="go" data-set-go="' + n + '" title="设为 go 套餐当前（不写 auth.json）">Go 使用</button>') +
+              (k.isCurrentGateway ? '' : '<button class="gw" data-set-gw="' + n + '" title="设为网关当前（不写 auth.json）">网关使用</button>') +
+            '</span>' +
+          '</div>' +
+          '<div class="row">' +
+            '<span class="grp">' +
+              (zenCooling
+                ? '<button class="success" data-cooldown="' + n + '" data-min="0">Zen 清冷却</button>'
+                : '<button class="warn" data-cooldown="' + n + '" data-min="' + esc(st.cooldown_minutes) + '">Zen 冷却</button>') +
+              (goCooling
+                ? '<button class="success" data-cooldown-go="' + n + '" data-min="0">Go 清冷却</button>'
+                : '<button class="warn" data-cooldown-go="' + n + '" data-min="' + esc(st.cooldown_minutes) + '">Go 冷却</button>') +
+              '<button class="success" data-cooldown-gw="' + n + '" data-min="0" title="清除网关域冷却">网关清冷却</button>' +
+            '</span>' +
+            '<span class="grp">' +
+              '<button class="ghost" data-window="' + n + '" title="设置该 key 独立冷却窗口（分钟，留空清除回退全局）">冷却窗口</button>' +
+              (k.cooldown_minutes ? '<button class="ghost" data-window-clear="' + n + '" title="清除独立窗口，回退全局">清除窗口</button>' : '') +
+              '<button class="ghost" data-edit="' + n + '" title="编辑名称 / key 值">编辑</button>' +
+              '<button class="danger" data-del="' + n + '">删除</button>' +
+            '</span>' +
+          '</div>' +
         '</div></td>'
       tb.appendChild(tr)
       }

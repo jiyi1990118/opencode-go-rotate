@@ -1341,7 +1341,9 @@ describe("双域独立轮换（current_gateway / cooldown_until_gateway 域分�
     expect(html).toContain('healthCell(k.last_status, k.last_checked_zen, "b-zen")')
     expect(html).toContain('healthCell(k.last_status_go, k.last_checked_go, "b-go")')
     // 按钮分组（.grp 分隔线）与域色/语义色 class
-    expect(html).toContain("actions .grp + .grp { padding-left: 9px; border-left: 1px solid var(--bd-2);")
+    expect(html).toContain("actions .row .grp + .grp { padding-left: 9px; border-left: 1px solid var(--bd-2);")
+    expect(html).toContain('<div class="actions">')
+    expect(html).toContain('<div class="row">')
     expect(html).toContain('<button class="primary" data-check=')
     expect(html).toContain('<button class="zen" data-set=')
     expect(html).toContain('<button class="go" data-set-go=')
@@ -1349,6 +1351,9 @@ describe("双域独立轮换（current_gateway / cooldown_until_gateway 域分�
     expect(html).toContain('<button class="warn" data-cooldown=')
     expect(html).toContain('<button class="success" data-cooldown-go=')
     expect(html).toContain('<button class="ghost" data-window=')
+    // 语义化按钮名：冷却窗口 / 清除窗口
+    expect(html).toContain(">冷却窗口</button>")
+    expect(html).toContain(">清除窗口</button>")
     // 域色按钮与徽标 CSS 变量（深/浅双主题）
     expect(html).toContain("--btn-zen-bg: rgba(96,165,250,.12)")
     expect(html).toContain("--btn-go-bg: rgba(167,139,250,.12)")
