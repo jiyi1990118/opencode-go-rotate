@@ -9,12 +9,13 @@ Usage:
   go-rotate web              start the web UI standalone (no opencode needed)
   go-rotate web on|off|status  toggle auto-start web on opencode launch (off = no port, rotation still works)
   go-rotate gateway {start|stop|restart|status|logs [n]|plan [go|zen]|token [gen|clear|set <v>]|set <name>|next [min]|cooldown <name> [min|clear]}  manage zen-gateway service + gateway-domain key rotation
-  go-rotate set <name>       switch to a named key (and sync auth.json)
-  go-rotate next [minutes]   rotate to next available key (optional cooldown minutes)
+  go-rotate go {set <name>|next [min]|cooldown <name> [min|clear]}  go 套餐域 key 轮换（写 current_go / cooldown_until_go，不碰 auth.json）
+  go-rotate set <name>       switch to a named key (zen 域, and sync auth.json)
+  go-rotate next [minutes]   rotate to next available key (zen 域, optional cooldown minutes)
   go-rotate add <name> <key> add a key
-  go-rotate cooldown <name> [minutes|clear]  set cooldown (or 'clear'/0 to cancel)
+  go-rotate cooldown <name> [minutes|clear]  set cooldown (zen 域; or 'clear'/0 to cancel)
   go-rotate cooldown <name> window <min|clear>  set/clear per-key cooldown window (fallback to global)
-  go-rotate check [name]     probe key health (valid/balance/limited)
+  go-rotate check [name] [--plan zen|go]  probe key health dual-endpoint (zen + go; --plan 单端点)
   go-rotate stats            show per-key rotation/cooling stats from the log
   go-rotate uninstall [-y]   uninstall (remove plugin, CLI, config)
 
@@ -153,10 +154,16 @@ def do_status(cfg):
         else:
             stshow = ""
         print(f"{mark}{k['name']:<12} {k['key'][:16]}...{stshow}  {fmt_until(k.get('cooldown_until'))}")
-    # 双域当前 key（新增：TUI 域游标 current / 网关域游标 current_gateway，读侧兜底 current_gateway ?? current）
+    # 三域当前 key（zen 域游标 current / go 域游标 current_go / 网关域游标 current_gateway，读侧各自兜底 current）
     gw_cur = cfg.get("current_gateway") or cur or ""
-    print(f"TUI 当前: {cur or '(not set)'}{_cur_cooling(cfg, cur, 'cooldown_until')}")
+    go_cur = cfg.get("current_go") or cur or ""
+    print(f"zen 当前: {cur or '(not set)'}{_cur_cooling(cfg, cur, 'cooldown_until')}")
+    print(f"go 当前: {go_cur or '(not set)'}{_cur_cooling(cfg, go_cur, 'cooldown_until_go')}")
     print(f"网关当前: {gw_cur or '(not set)'}{_cur_cooling(cfg, gw_cur, 'cooldown_until_gateway')}")
+    # 每域冷却 key 摘要（可选展示）
+    for label, field in (("zen", "cooldown_until"), ("go", "cooldown_until_go"), ("网关", "cooldown_until_gateway")):
+        names = [k["name"] for k in cfg["keys"] if k.get(field)]
+        print(f"{label} 冷却中: {', '.join(names) if names else '(无)'}")
     # 网关状态（容错：网关没装/没跑不报错，2s 超时）
     ok, _ = _gateway_healthz()
     print(f"网关: running ({GATEWAY_PORT})" if ok else "网关: stopped")
@@ -405,14 +412,29 @@ def _web_standalone(force=False):
     os.execvpe(bun, [bun, "-e", code], env)
 
 
-def probe_key(key):
+# 探测端点 base（可被环境变量覆盖供测试/隔离；生产不设行为不变，与 GOROTATE_CONFIG_FILE 对称）
+_PROBE_ZEN_BASE = os.environ.get("GOROTATE_ZEN_BASE") or "https://opencode.ai/zen/v1"
+_PROBE_GO_BASE = os.environ.get("GOROTATE_GO_BASE") or "https://opencode.ai/zen/go/v1"
+# opencode.ai 会拦截 Python-urllib 默认 UA，需伪装成浏览器
+_BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+
+
+def _probe_base(domain):
+    """按域返回探测端点 base。domain: 'zen' (hy3-free 免费档) / 'go' (hy3 套餐档)。"""
+    return _PROBE_ZEN_BASE if domain == "zen" else _PROBE_GO_BASE
+
+
+def probe_key(key, domain="zen"):
     """发 1-token 请求探测 key，返回 (状态, 详情)。
-    状态: ok / invalid / nobalance / limited / error"""
+    状态: ok / invalid / nobalance / limited / error。
+    domain: 'zen'（hy3-free 端点）或 'go'（hy3 端点）。默认 zen（现状语义）。"""
     import urllib.request
+    model = "hy3-free" if domain == "zen" else "hy3"
     req = urllib.request.Request(
-        "https://opencode.ai/zen/go/v1/chat/completions",
+        f"{_probe_base(domain)}/chat/completions",
         data=json.dumps({
-            "model": "hy3",
+            "model": model,
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 1,
             "stream": False,
@@ -420,8 +442,7 @@ def probe_key(key):
         headers={
             "content-type": "application/json",
             "authorization": f"Bearer {key}",
-            # opencode.ai 会拦截 Python-urllib 默认 UA，需伪装成浏览器
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+            "user-agent": _BROWSER_UA,
         },
     )
     try:
@@ -444,24 +465,50 @@ def probe_key(key):
         return "error", f"网络错误: {e}"
 
 
-def do_check(cfg, name=None):
-    """探测指定 key（或全部）健康状态：发 1-token 请求判断是否可用"""
+def do_check(cfg, argv=None):
+    """探测指定 key（或全部）健康状态：默认双端点（zen 免费档 + go 套餐档）。
+    用法: go-rotate check [name] [--plan zen|go]
+    写每 key 双状态字段：zen→last_status / go→last_status_go + last_checked_zen/last_checked_go。"""
+    argv = list(argv or [])
+    name = None
+    domain = "all"
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--plan":
+            if i + 1 >= len(argv) or argv[i + 1] not in ("zen", "go"):
+                sys.exit("用法: go-rotate check [name] [--plan zen|go]")
+            domain = argv[i + 1]
+            i += 2
+        elif a.startswith("--"):
+            sys.exit(f"未知选项: {a}\n用法: go-rotate check [name] [--plan zen|go]")
+        else:
+            name = a
+            i += 1
     targets = [k for k in cfg["keys"] if name is None or k["name"] == name]
     if not targets:
         sys.exit("没有可检测的 key")
-    print(f"探测 {len(targets)} 个 key（每次消耗约 1 token）…")
+    domains = (["zen", "go"] if domain == "all" else [domain])
+    print(f"探测 {len(targets)} 个 key × {len(domains)} 端点（每次消耗约 {len(domains)} token）…")
     labels = {"ok": "✅ 可用", "invalid": "⚠️  key 无效", "nobalance": "⚠️  余额不足",
               "limited": "⚠️  限流", "error": "❌ 异常"}
     changed = False
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
     for k in targets:
-        status, detail = probe_key(k["key"])
-        print(f"  {k['name']:<12} {labels.get(status, status)}: {detail}")
-        if k.get("last_status") != status:
-            k["last_status"] = status
-            changed = True
+        for d in domains:
+            status, detail = probe_key(k["key"], d)
+            # zen 域健康字段 = 现状 last_status（字段名不变）；go 域 = last_status_go
+            field = "last_status" if d == "zen" else "last_status_go"
+            checked_field = "last_checked_zen" if d == "zen" else "last_checked_go"
+            print(f"  {k['name']:<12} [{d}] {labels.get(status, status)}: {detail}")
+            if k.get(field) != status:
+                k[field] = status
+                changed = True
+            k[checked_field] = now_iso
+    save(cfg)
     if changed:
-        save(cfg)
         print("已更新各 key 状态。")
+    print("已更新探测时间。")
 
 
 def do_uninstall(force=False):
@@ -916,6 +963,108 @@ def do_gateway(action, argv=None):
             sys.exit(1)
 
 
+# ---------- go 套餐域 key 轮换（三域独立：写 current_go / cooldown_until_go，绝不动 zen 域 current / cooldown_until 与网关域） ----------
+# 与契约 §Team A/B 对齐：读侧兜底 `current_go ?? current`；go 域冷却判定只读 `cooldown_until_go`；
+# go 域轮换绝不同步 auth.json（auth.json 单槽仅由 zen 域插件/CLI 维护，与网关域一致）。
+
+GO_USAGE = (
+    "用法: go-rotate go {set|next|cooldown}\n"
+    "  set <name>      设 go 套餐域当前 key（校验存在；不写 auth.json）\n"
+    "  next [分钟]     go 域轮换：原 go current 进 go 域冷却 + 选下一个未冷却写 current_go\n"
+    "  cooldown <name> [分钟|clear]  写/清 go 域冷却（缺省用该 key 独立窗口或全局窗口）\n"
+)
+
+
+def _go_current(cfg):
+    return cfg.get("current_go") or cfg.get("current") or ""
+
+
+def _go_set(cfg, name):
+    """go 域 set：写 current_go（校验存在；不同步 auth.json）。调用方持锁。"""
+    for k in cfg["keys"]:
+        if k["name"] == name:
+            cfg["current_go"] = name
+            save(cfg)
+            print(f'go switched to key "{name}"')
+            return
+    sys.exit(f'key "{name}" not found')
+
+
+def _go_next(cfg, minutes):
+    """go 域轮换：原 go current 进 go 域冷却（写 cooldown_until_go，窗口 = minutes 参数 或 key 独立窗口 或 全局）
+    + 选下一个 go 域未冷却的 key（判定只读 cooldown_until_go）写 current_go；全冷却提示并维持。调用方持锁。"""
+    now = datetime.now(timezone.utc).timestamp()
+    ordered = cfg["keys"]
+    cur = _go_current(cfg)
+    # 1) 原 go current 进 go 域冷却
+    if cur:
+        old = next((k for k in ordered if k["name"] == cur), None)
+        if old is not None:
+            dst_min = minutes if minutes else (old.get("cooldown_minutes") or cfg.get("cooldown_minutes", DEFAULT_COOLDOWN_MIN))
+            old["cooldown_until_go"] = (datetime.now(timezone.utc) + timedelta(minutes=dst_min)).isoformat()
+    # 2) 选下一个未冷却（go 域判定：cooldown_until_go）
+    start = next((i for i, k in enumerate(ordered) if k["name"] == cur), -1)
+    for i in range(1, len(ordered) + 1):
+        k = ordered[(start + i) % len(ordered)]
+        cu = k.get("cooldown_until_go")
+        if not cu or datetime.fromisoformat(cu.replace("Z", "+00:00")).timestamp() <= now:
+            cfg["current_go"] = k["name"]
+            save(cfg)
+            print(f'go rotated to key "{k["name"]}"')
+            return
+    save(cfg)  # 全冷却：冷却了旧 current 也需落盘
+    print("no available key (all cooling), keeping current")
+
+
+def _go_cooldown(cfg, name, argv):
+    """go 域冷却：写 cooldown_until_go。minutes 缺省 = zen 域现状语义（该 key 独立窗口 > 全局 > DEFAULT）。调用方持锁。"""
+    for k in cfg["keys"]:
+        if k["name"] == name:
+            minutes = argv[0] if argv else None
+            if isinstance(minutes, str) and str(minutes).lower() in ("clear", "off", "0"):
+                k["cooldown_until_go"] = None
+                save(cfg)
+                print(f'go key "{name}" 冷却已清除（恢复可用）')
+                return
+            if minutes == 0:
+                k["cooldown_until_go"] = None
+                save(cfg)
+                print(f'go key "{name}" 冷却已清除（恢复可用）')
+                return
+            try:
+                mins = int(minutes) if minutes else k.get("cooldown_minutes") or cfg.get("cooldown_minutes", DEFAULT_COOLDOWN_MIN)
+            except ValueError:
+                sys.exit(f"非法 go 冷却分钟值: {minutes}\n用法: go-rotate go cooldown <name> <分钟|clear>")
+            k["cooldown_until_go"] = (datetime.now(timezone.utc) + timedelta(minutes=mins)).isoformat()
+            save(cfg)
+            print(f'go key "{name}" cooling for {mins} min')
+            return
+    sys.exit(f'key "{name}" not found')
+
+
+def do_go(action, argv=None):
+    """go 套餐域 key 轮换：go-rotate go {set|next|cooldown}"""
+    argv = argv or []
+    if action == "set":
+        if len(argv) < 1:
+            sys.exit("用法: go-rotate go set <name>")
+        _go_set(load(), argv[0])
+    elif action == "next":
+        try:
+            minutes = int(argv[0]) if argv else None
+        except ValueError:
+            sys.exit(f"非法 go 分钟值: {argv[0]}\n用法: go-rotate go next [分钟]")
+        _go_next(load(), minutes)
+    elif action == "cooldown":
+        if len(argv) < 1:
+            sys.exit("用法: go-rotate go cooldown <name> [分钟|clear]")
+        _go_cooldown(load(), argv[0], argv[1:])
+    else:
+        print(GO_USAGE)
+        if action is not None:
+            sys.exit(1)
+
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -929,8 +1078,8 @@ def main():
         do_uninstall(force=("-y" in args or "--yes" in args))
         return
     if cmd == "check":
-        cfg = load()
-        do_check(cfg, args[1] if len(args) > 1 else None)
+        # check 写各 key 健康状态/探测时间 → 持锁
+        _with_lock(lambda: do_check(load(), args[1:]))
         return
     if cmd == "web":
         # web on/off 写配置 → 持锁；web（独立启动）不写配置不持锁
@@ -941,6 +1090,14 @@ def main():
         return
     if cmd == "stats":
         do_stats()
+        return
+    if cmd == "go":
+        sub = args[1] if len(args) > 1 else None
+        # go 域写命令（set/next/cooldown 写 go-keys.json）走配置锁；无合法子命令只读打印用法
+        if sub in ("set", "next", "cooldown"):
+            _with_lock(lambda: do_go(sub, args[2:]))
+        else:
+            do_go(sub, args[2:])
         return
     if cmd == "gateway":
         sub = args[1] if len(args) > 1 else None

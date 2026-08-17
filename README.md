@@ -21,6 +21,9 @@ opencode 的 opencode-go 多 key 自动轮换插件 + Web 管理界面。
 - ✅ Web **`/api/web/on` 立即重启**（server 未运行即拉起并返回 `restarted`），支持 `GOROTATE_WEB_PORT` env 覆盖端口（隔离实例/测试用）
 - ✅ 并发安全：跨进程文件锁 + 原子写
 - ✅ 零依赖：插件用 Node 内置模块，CLI 用纯 Python
+- ✅ **三域独立轮换**：zen（免费档）/ go（套餐档）/ 网关 三个域各自独立 current + 冷却 + 轮换，互不干扰；auth.json 仅由 zen 域维护
+- ✅ **双套餐健康检查**：每 key 分别探测 zen 与 go 端点（`check` 或 Web「检查」按钮），状态列展示两行健康 + 探测时间
+- ✅ Web **4 区块导航**：Key 管理（三域健康总览 + key 双套餐健康列）/ TUI（zen+go 子卡设置）/ 网关 / 统计
 - ✅ 测试体系：插件单测（`bun test tests/`）、CLI 单测（`python3 tests/test-go-rotate-cli.py`）、gateway 单测（`ZEN_TEST=1 node zen-gateway/tests/run-tests.mjs`）
 
 ## 安装
@@ -62,26 +65,34 @@ go-rotate status            # 查看状态
 ```jsonc
 {
   "provider_id": "opencode-go",   // 命中的 providerID（前缀匹配 "opencode"）
-  "cooldown_minutes": 300,        // 全局冷却窗口（分钟）；缺省 300
-  "current": "act1",              // TUI 域当前 key 的 name（opencode 插件路径，字段名不变）
-  "current_gateway": "act1",      // 网关域当前 key 的 name（新增；未设置时读侧兜底 current）
+  "cooldown_minutes": 300,        // 全局冷却窗口（分钟）；缺省 300（三域共享）
+  "current": "act1",              // zen 域（opencode 免费档）当前 key 的 name（插件路径，字段名不变）
+  "current_go": "act1",           // go 套餐域当前 key 的 name（新增；未设置时读侧兜底 current_go ?? current）
+  "current_gateway": "act1",      // 网关域当前 key 的 name（新增；未设置时读侧兜底 current_gateway ?? current）
   "keys": [
     {
       "name": "act1",
       "key": "sk-...",
-      "cooldown_until": null,     // TUI 域冷却：null=可用；ISO 时间=冷却到何时
+      "cooldown_until": null,     // zen 域冷却：null=可用；ISO 时间=冷却到何时
+      "cooldown_until_go": null,  // go 套餐域冷却（新增）：null=可 go 轮换；ISO=冷却到何时
       "cooldown_until_gateway": null,  // 网关域冷却（新增）：null=可网关轮换；ISO=冷却到何时
-      "cooldown_minutes": 30      // 可选：该 key 独立冷却窗口（两域同用）；缺省回退全局 cooldown_minutes
+      "last_status": null,            // zen 域健康状态（可用/无效/余额不足/限流；现状字段）
+      "last_status_go": null,         // go 套餐域健康状态（新增）
+      "last_checked_zen": null,       // zen 探测时间（ISO；新增）
+      "last_checked_go": null,        // go 探测时间（ISO；新增）
+      "cooldown_minutes": 30      // 可选：该 key 独立冷却窗口（三域同用）；缺省回退全局 cooldown_minutes
     }
   ]
 }
 ```
 
-**双域独立轮换**：opencode TUI 与 zen-gateway 共用同一份 key，但各自独立轮换。
-- TUI 域走 `current` / `cooldown_until`（插件/`set`/`next`/`cooldown` 现状行为不变）
-- 网关域走 `current_gateway` / `cooldown_until_gateway`（`gateway set/next/cooldown` 子命令）；未设置时读侧兜底 `current_gateway ?? current`
-- 网关域轮换**不同步 auth.json**（auth.json 单槽仅由 TUI 域维护，网关切 key 不影响 TUI 持久化凭据）
-- 旧配置无需迁移，网关域从 `current` 干净起步
+**三域独立轮换**：opencode zen（免费档）/ go 套餐 / zen-gateway 共用同一份 key，但各自独立轮换。
+- **zen 域**（provider `opencode`，模型 hy3-free）走 `current` / `cooldown_until`（插件/`set`/`next`/`cooldown` 现状行为不变）
+- **go 套餐域**（provider `opencode-go`，模型 hy3）走 `current_go` / `cooldown_until_go`（`go set/next/cooldown` 子命令）；未设置时读侧兜底 `current_go ?? current`
+- **网关域**走 `current_gateway` / `cooldown_until_gateway`（`gateway set/next/cooldown` 子命令）；未设置时读侧兜底 `current_gateway ?? current`
+- **auth.json 唯一归属 zen 域**：仅 zen 域轮换（`set`/`next`）写 auth.json；go 域与网关域轮换**均不碰 auth.json**（auth.json 单槽代表 zen 免费档现状语义，opencode 重启后主用 zen 档）
+- 旧配置零迁移，go 域从 `current` 干净起步
+- **健康检查双端点**：`go-rotate check` 默认对每 key 双端探测——zen 档 `https://opencode.ai/zen/v1`+hy3-free / go 档 `https://opencode.ai/zen/go/v1`+hy3（`--plan zen|go` 单端点）
 
 冷却窗口优先级：**该 key 的 `cooldown_minutes` > 全局 `cooldown_minutes` > 默认 300 分钟**。
 通过 `go-rotate cooldown <name> window <min>` 设置独立窗口，`window clear` 删除字段回退全局。
@@ -105,13 +116,16 @@ go-rotate status            # 查看状态
 | `go-rotate init` | 交互式首次配置 |
 | `go-rotate web` | 独立启动 Web 界面（无需 opencode 运行） |
 | `go-rotate web on\|off\|status` | 控制 opencode 启动时是否自动起 Web（off = 不占用端口，轮换仍可用） |
-| `go-rotate status` / `list` | 查看当前 key 与冷却状态 |
+| `go-rotate status` / `list` | 查看当前 key 与**三域（zen/go/网关）当前 key**、每域冷却摘要与各 key 冷却状态 |
 | `go-rotate add <name> <key>` | 新增 key |
-| `go-rotate set <name>` | 启用指定 key |
-| `go-rotate next [分钟]` | 切到下一个可用 key |
-| `go-rotate cooldown <name> [分钟]` | 手动设置/清除冷却（无参用该 key 独立窗口或全局） |
-| `go-rotate cooldown <name> window <分钟\|clear>` | 设置/清除该 key 独立的冷却窗口（clear 回退全局） |
-| `go-rotate check [name]` | 探测 key 健康（可用/无效/余额不足/限流） |
+| `go-rotate set <name>` | 启用指定 key（**zen 域**，会同步 auth.json） |
+| `go-rotate next [分钟]` | 切到下一个可用 key（**zen 域**） |
+| `go-rotate cooldown <name> [分钟]` | 手动设置/清除冷却（**zen 域**；无参用该 key 独立窗口或全局） |
+| `go-rotate cooldown <name> window <分钟\|clear>` | 设置/清除该 key 独立的冷却窗口（clear 回退全局；三域共享） |
+| `go-rotate check [name] [--plan zen\|go]` | 探测 key 健康（**默认双端点** zen+go；`--plan` 单端点；写双套餐状态） |
+| `go-rotate go set <name>` | **go 套餐域**设为当前 key（写 `current_go`，不写 auth.json） |
+| `go-rotate go next [分钟]` | **go 套餐域**轮换（原 go current 进 go 域冷却 + 选下一个未冷却写 `current_go`） |
+| `go-rotate go cooldown <name> [分钟\|clear]` | 写/清 **go 套餐域**冷却（写 `cooldown_until_go`，缺省窗口与字段级语义一致） |
 | `go-rotate stats` | 从日志统计每 key 轮换/冷却次数（近期） |
 | `go-rotate gateway {start\|stop\|restart\|status\|logs [n]}` | 管理 zen-gateway 服务（launchd 常驻，端口 18888） |
 | `go-rotate gateway plan [go\|zen]` | 查看/切换网关套餐（Go 订阅 / Zen 免费档，切换后需 restart） |
@@ -153,10 +167,10 @@ rm -f ~/.config/opencode/go-keys.json   # 可选：删除配置
 opencode-go 是订阅套餐，配额按时间窗口重置。多账号轮换可提升可用时长。
 
 **能查每个 key 的额度吗？**
-opencode-go 没有公开的额度/余额查询 API，**无法主动查额度**。但可以用 `go-rotate check`（或 Web 里的"检测所有 key"）发一个最小请求探测每个 key 当前是否可用——能区分「可用 / key 无效 / 余额不足 / 限流」。注意每次探测消耗约 1 token。
+opencode-go 没有公开的额度/余额查询 API，**无法主动查额度**。但可以用 `go-rotate check`（或 Web 里的"检测所有 key"）发最小请求探测每个 key 当前是否可用——**默认双端点**（zen 免费档 + go 套餐档），能区分「可用 / key 无效 / 余额不足 / 限流」。注意每次探测默认消耗约 2 token（双端点），单端点 `--plan zen|go` 消耗 1 token。
 
 **对我的其它 provider（codeplan/fox-aws 等）有影响吗？**
-没有。插件只在 `providerID` 命中的 opencode-go 请求上注入 key，只处理 opencode-go 的配额错误。
+没有。插件只对 `providerID` 含 `opencode` 的请求注入 key——`opencode-go`（go 套餐）注入 **go 域** current key、`opencode`（zen 免费档）注入 **zen 域** current key；只处理 opencode 端点的配额错误。
 
 ## 相关项目
 

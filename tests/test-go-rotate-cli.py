@@ -8,6 +8,7 @@
   - 绝不触碰真实 ~/.config/opencode/go-keys.json / auth.json / 8899 / /tmp/opencode-go-rotate.log。
 """
 import contextlib
+import http.server
 import importlib.util
 import io
 import json
@@ -16,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -69,7 +71,7 @@ def read_cfg(home):
         return json.load(f)
 
 
-def key(name, val, cooldown_until=None, cooldown_minutes=None, last_status=None, cooldown_until_gateway=None):
+def key(name, val, cooldown_until=None, cooldown_minutes=None, last_status=None, cooldown_until_gateway=None, cooldown_until_go=None, last_status_go=None):
     k = {"name": name, "key": val, "cooldown_until": cooldown_until}
     if cooldown_minutes is not None:
         k["cooldown_minutes"] = cooldown_minutes
@@ -77,6 +79,10 @@ def key(name, val, cooldown_until=None, cooldown_minutes=None, last_status=None,
         k["last_status"] = last_status
     if cooldown_until_gateway is not None:
         k["cooldown_until_gateway"] = cooldown_until_gateway
+    if cooldown_until_go is not None:
+        k["cooldown_until_go"] = cooldown_until_go
+    if last_status_go is not None:
+        k["last_status_go"] = last_status_go
     return k
 
 
@@ -884,18 +890,18 @@ class TestGatewayDomain(_CliCase):
     # ---- status 双域 ----
 
     def test_status输出TUI与网关当前双域(self):
-        """status 含 TUI 当前 / 网关当前 双域行（各自独立游标）"""
+        """status 含 zen 当前 / 网关当前 双域行（各自独立游标）"""
         write_cfg(self.home,
                   [key("act1", "sk-a"), key("act2", "sk-b")],
                   current="act1", extra={"current_gateway": "act2"})
         r = run_cli(["status"], self.home)
-        self.assertIn("TUI 当前: act1", r.stdout)
+        self.assertIn("zen 当前: act1", r.stdout)
         self.assertIn("网关当前: act2", r.stdout)
 
     def test_status网关当前迁移兜底(self):
         """无 current_gateway → 网关当前显示 current（读侧兜底）"""
         r = run_cli(["status"], self.home)  # current=act1, 无 current_gateway
-        self.assertIn("TUI 当前: act1", r.stdout)
+        self.assertIn("zen 当前: act1", r.stdout)
         self.assertIn("网关当前: act1", r.stdout)
 
     def test_status当前key冷却剩余可选展示(self):
@@ -934,6 +940,382 @@ class TestGatewayDomain(_CliCase):
         cfg = read_cfg(self.home)
         self.assertEqual(cfg["current_gateway"], "act2")        # 网关域游标不动
         self.assertIsNone(cfg["keys"][0].get("cooldown_until_gateway"))  # 网关域冷却不动
+
+
+# ---------- 13. go 套餐域独立轮换（current_go / cooldown_until_go，三域之一） ----------
+
+class TestGoDomain(_CliCase):
+    """go {set|next|cooldown} go 套餐域独立轮换（不动 zen 域 current/cooldown_until 与网关域；不写 auth.json）"""
+
+    def setUp(self):
+        super().setUp()
+        write_cfg(self.home,
+                  [key("act1", "sk-act1-key-0001"),
+                   key("act2", "sk-act2-key-0002"),
+                   key("act3", "sk-act3-key-0003")],
+                  current="act1")
+
+    # ---- go set ----
+
+    def test_go_set写current_go不动Zen且不同步auth(self):
+        """go set act2 → current_go=act2，zen current 不变，不写 auth.json"""
+        r = run_cli(["go", "set", "act2"], self.home)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn('go switched to key "act2"', r.stdout)
+        cfg = read_cfg(self.home)
+        self.assertEqual(cfg["current_go"], "act2")
+        self.assertEqual(cfg["current"], "act1")
+        self.assertFalse(os.path.exists(auth_path(self.home)),
+                         "go 域 set 不得同步 auth.json")
+
+    def test_go_set未知key退出1(self):
+        """go set nope → 退出 1「not found」，current_go 不变"""
+        run_cli(["go", "set", "act2"], self.home)
+        r = run_cli(["go", "set", "nope"], self.home)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("not found", r.stdout + r.stderr)
+        self.assertEqual(read_cfg(self.home)["current_go"], "act2")
+
+    def test_go_set缺参数退出1(self):
+        """go set（无 name）→ 退出 1，干净用法提示，无 traceback"""
+        r = run_cli(["go", "set"], self.home)
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("用法", r.stdout + r.stderr)
+
+    # ---- go next ----
+
+    def test_go_next独立轮换不动Zen域(self):
+        """go current=act2 → next → current_go=act3；原 go current(act2) 进 go 域冷却；
+        zen current/cooldown_until 不动（act1 的 zen 冷却不影响 go 域选择）"""
+        run_cli(["go", "set", "act2"], self.home)
+        zen_act1_cd = fut_iso(999)  # zen 域 act1 冷却，不应被 go 域读取
+        cfg = read_cfg(self.home)
+        cfg["keys"][0]["cooldown_until"] = zen_act1_cd
+        with open(cfg_path(self.home), "w") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        r = run_cli(["go", "next"], self.home)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn('go rotated to key "act3"', r.stdout)
+        out_cfg = read_cfg(self.home)
+        self.assertEqual(out_cfg["current_go"], "act3")
+        self.assertIsNotNone(out_cfg["keys"][1]["cooldown_until_go"])  # 原 go current(act2) 进 go 域冷却
+        # zen 域字段完全不动
+        self.assertEqual(out_cfg["current"], "act1")
+        self.assertEqual(out_cfg["keys"][0]["cooldown_until"], zen_act1_cd)
+        self.assertIsNone(out_cfg["keys"][0].get("cooldown_until_go"),
+                          "act1 未被 go 域冷却，其 cooldown_until_go 应为空")
+
+    def test_go_next带分钟参数冷却原go当前(self):
+        """go next 10 → 原 go current 冷却 10min（minutes 覆盖），选下一个"""
+        write_cfg(self.home,
+                  [key("act1", "sk-a"), key("act2", "sk-b")],
+                  current="act1", extra={"current_go": "act1"})
+        r = run_cli(["go", "next", "10"], self.home)
+        self.assertEqual(r.returncode, 0)
+        out_cfg = read_cfg(self.home)
+        self.assertEqual(out_cfg["current_go"], "act2")
+        assert_cooldown_until_near(self, out_cfg["keys"][0]["cooldown_until_go"], 10)
+
+    def test_go_next跳过go域冷却的key(self):
+        """go 域内冷却 act2 → next 跳过 act2 到 act3；zen 域 act1 的 cooldown_until 不被读取"""
+        write_cfg(self.home,
+                  [key("act1", "sk-a", cooldown_until=fut_iso(999)),
+                   key("act2", "sk-b", cooldown_until_go=fut_iso(60)),
+                   key("act3", "sk-c")],
+                  current="act1", extra={"current_go": "act1"})
+        r = run_cli(["go", "next"], self.home)
+        self.assertEqual(r.returncode, 0)
+        out_cfg = read_cfg(self.home)
+        self.assertEqual(out_cfg["current_go"], "act3")
+        self.assertEqual(out_cfg["current"], "act1")
+        self.assertIsNotNone(out_cfg["keys"][0].get("cooldown_until"), "zen 冷却保留")
+        self.assertIsNotNone(out_cfg["keys"][1].get("cooldown_until_go"), "act2 go 域冷却保留")
+
+    def test_go_next全部冷却保持go当前(self):
+        """全部 go 域冷却 →「no available key」，current_go 不变"""
+        write_cfg(self.home,
+                  [key("act1", "sk-a", cooldown_until_go=fut_iso(60)),
+                   key("act2", "sk-b", cooldown_until_go=fut_iso(60))],
+                  current="act1", extra={"current_go": "act1"})
+        r = run_cli(["go", "next"], self.home)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("no available key", r.stdout)
+        self.assertEqual(read_cfg(self.home)["current_go"], "act1")
+
+    def test_go_next迁移兜底从current起(self):
+        """无 current_go 字段 → go next 以 current 为起点轮换并写 current_go（读侧兜底）"""
+        write_cfg(self.home, [key("act1", "sk-a"), key("act2", "sk-b")], current="act1")  # 无 current_go
+        r = run_cli(["go", "next"], self.home)
+        self.assertEqual(r.returncode, 0)
+        out_cfg = read_cfg(self.home)
+        self.assertEqual(out_cfg["current_go"], "act2")
+        self.assertEqual(out_cfg["current"], "act1")
+        self.assertIsNotNone(out_cfg["keys"][0].get("cooldown_until_go"),
+                             "原 go current(=current act1) 应进 go 域冷却")
+
+    def test_go_next非法分钟值退出1(self):
+        """go next abc → 退出 1，干净用法提示，无 traceback"""
+        r = run_cli(["go", "next", "abc"], self.home)
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("分钟", r.stdout + r.stderr)
+
+    # ---- go cooldown ----
+
+    def test_go_cooldown写go域字段不动Zen(self):
+        """go cooldown act1 60 → cooldown_until_go≈now+60，zen cooldown_until 不动"""
+        r = run_cli(["go", "cooldown", "act1", "60"], self.home)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn('go key "act1" cooling for 60 min', r.stdout)
+        cfg = read_cfg(self.home)
+        assert_cooldown_until_near(self, cfg["keys"][0]["cooldown_until_go"], 60)
+        self.assertIsNone(cfg["keys"][0].get("cooldown_until"), "zen 域 cooldown_until 不应被写")
+
+    def test_go_cooldown无参用全局窗口(self):
+        """go cooldown act1（无参）→ 用全局 300min"""
+        r = run_cli(["go", "cooldown", "act1"], self.home)
+        assert_cooldown_until_near(self, read_cfg(self.home)["keys"][0]["cooldown_until_go"], 300)
+
+    def test_go_cooldown无参优先key独立窗口(self):
+        """key 有 cooldown_minutes=30 → 无参 go 冷却用 30min"""
+        write_cfg(self.home, [key("act1", "sk-a", cooldown_minutes=30)], current="act1")
+        run_cli(["go", "cooldown", "act1"], self.home)
+        assert_cooldown_until_near(self, read_cfg(self.home)["keys"][0]["cooldown_until_go"], 30)
+
+    def test_go_cooldown_clear清除(self):
+        """go cooldown act1 clear → cooldown_until_go 置 null"""
+        write_cfg(self.home, [key("act1", "sk-a", cooldown_until_go=fut_iso(60))], current="act1")
+        r = run_cli(["go", "cooldown", "act1", "clear"], self.home)
+        self.assertEqual(r.returncode, 0)
+        self.assertIsNone(read_cfg(self.home)["keys"][0]["cooldown_until_go"])
+
+    def test_go_cooldown_0清除(self):
+        """go cooldown act1 0 → cooldown_until_go 置 null"""
+        write_cfg(self.home, [key("act1", "sk-a", cooldown_until_go=fut_iso(60))], current="act1")
+        run_cli(["go", "cooldown", "act1", "0"], self.home)
+        self.assertIsNone(read_cfg(self.home)["keys"][0]["cooldown_until_go"])
+
+    def test_go_cooldown未知key退出1(self):
+        """go cooldown nope → 退出 1「not found」"""
+        r = run_cli(["go", "cooldown", "nope"], self.home)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("not found", r.stdout + r.stderr)
+
+    def test_go_cooldown非法分钟值退出1(self):
+        """go cooldown act1 abc → 退出 1，干净用法提示，无 traceback"""
+        r = run_cli(["go", "cooldown", "act1", "abc"], self.home)
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("用法", r.stdout + r.stderr)
+
+    def test_go_cooldown缺参数退出1(self):
+        """go cooldown（无 name）→ 退出 1"""
+        r = run_cli(["go", "cooldown"], self.home)
+        self.assertEqual(r.returncode, 1)
+
+    # ---- status 三域 ----
+
+    def test_status输出三域当前(self):
+        """status 含 zen 当前 / go 当前 / 网关当前 三域行（各自独立游标）"""
+        write_cfg(self.home,
+                  [key("act1", "sk-a"), key("act2", "sk-b"), key("act3", "sk-c")],
+                  current="act1", extra={"current_go": "act2", "current_gateway": "act3"})
+        r = run_cli(["status"], self.home)
+        self.assertIn("zen 当前: act1", r.stdout)
+        self.assertIn("go 当前: act2", r.stdout)
+        self.assertIn("网关当前: act3", r.stdout)
+
+    def test_status_go迁移兜底(self):
+        """无 current_go → go 当前显示 current（读侧兜底）"""
+        r = run_cli(["status"], self.home)  # current=act1, 无 current_go
+        self.assertIn("zen 当前: act1", r.stdout)
+        self.assertIn("go 当前: act1", r.stdout)
+
+    def test_status每域冷却key摘要(self):
+        """三域各有冷却 key → 冷却摘要行列出对应 key"""
+        write_cfg(self.home,
+                  [key("act1", "sk-a", cooldown_until=fut_iso(30),
+                       cooldown_until_gateway=fut_iso(30)),
+                   key("act2", "sk-b"),
+                   key("act3", "sk-c", cooldown_until_go=fut_iso(30))],
+                  current="act1", extra={"current_go": "act3", "current_gateway": "act1"})
+        r = run_cli(["status"], self.home)
+        out = r.stdout
+        self.assertIn("zen 冷却中: act1", out)
+        self.assertIn("go 冷却中: act3", out)
+        self.assertIn("网关 冷却中: act1", out)
+
+    # ---- 锁 / 残留 / 域隔离 ----
+
+    def test_go写命令后无锁无tmp残留(self):
+        """go set/next/cooldown 后锁文件已清、无 tmp 残留"""
+        run_cli(["go", "set", "act2"], self.home)
+        run_cli(["go", "next"], self.home)
+        run_cli(["go", "cooldown", "act1", "10"], self.home)
+        d = os.path.dirname(cfg_path(self.home))
+        for f in os.listdir(d):
+            self.assertFalse(f.endswith(".lock") or f.endswith(".tmp"), f"不应残留 {f}")
+
+    def test_go写命令走锁(self):
+        """源码结构：main() 中 go set/next/cooldown 经 _with_lock 包裹（写 go-keys.json）"""
+        src = open(CLI_PATH, encoding="utf-8").read()
+        self.assertIn('if sub in ("set", "next", "cooldown"):', src)
+        self.assertIn("_with_lock(lambda: do_go(sub, args[2:]))", src)
+
+    def test_zen写命令不动go域字段(self):
+        """zen 域 set/next/cooldown 只动 current/cooldown_until，不写 current_go/cooldown_until_go"""
+        write_cfg(self.home,
+                  [key("act1", "sk-a"), key("act2", "sk-b")],
+                  current="act1", extra={"current_go": "act2"})
+        run_cli(["set", "act2"], self.home)               # zen set
+        run_cli(["cooldown", "act1", "60"], self.home)    # zen cooldown
+        cfg = read_cfg(self.home)
+        self.assertEqual(cfg["current_go"], "act2")                   # go 域游标不动
+        self.assertIsNone(cfg["keys"][0].get("cooldown_until_go"))    # go 域冷却不动
+
+    def test_go写命令不动网关域字段(self):
+        """go 域 set/next/cooldown 不写 current_gateway/cooldown_until_gateway"""
+        write_cfg(self.home,
+                  [key("act1", "sk-a"), key("act2", "sk-b")],
+                  current="act1", extra={"current_gateway": "act2"})
+        run_cli(["go", "set", "act1"], self.home)
+        run_cli(["go", "cooldown", "act1", "60"], self.home)
+        cfg = read_cfg(self.home)
+        self.assertEqual(cfg["current_gateway"], "act2")
+        self.assertIsNone(cfg["keys"][0].get("cooldown_until_gateway"))
+
+
+# ---------- 14. check 双端点健康检查（zen + go，双行输出 + 字段写入） ----------
+
+class _BadKeyHandler(http.server.BaseHTTPRequestHandler):
+    """mock OpenAI-compatible 探测端点：Authorization 含 sk-bad → 401 invalid；其它 → 200 ok。
+    记录收到的 Authorization，供断言单端点/双端点路径。"""
+    seen_auths = []
+
+    def do_POST(self):
+        auth = self.headers.get("Authorization", "")
+        type(self).seen_auths.append(auth)
+        if "sk-bad" in auth:
+            body = json.dumps({"error": {"message": "invalid api key"}}).encode()
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        body = json.dumps({"id": "mock", "object": "chat.completion", "model": "hy3",
+                           "choices": [{"message": {"role": "assistant", "content": "ok"}}]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+@contextlib.contextmanager
+def _mock_probe_server():
+    """起一个 mock 探测服务器，yield (base_url, reset_seen)。"""
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _BadKeyHandler)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    _BadKeyHandler.seen_auths[:] = []
+    try:
+        yield f"http://127.0.0.1:{httpd.server_address[1]}", (lambda: _BadKeyHandler.seen_auths[:])
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+class TestCheckDualEndpoint(_CliCase):
+    """check 双端点健康检查（默认 zen+go 双探测；--plan 单端点；字段写入 + 探测时间）"""
+
+    def setUp(self):
+        super().setUp()
+        write_cfg(self.home, [key("act1", "sk-ok-key-0001"), key("act2", "sk-bad-key-0002")], current="act1")
+
+    def test_check默认双端点输出两行并写字段(self):
+        """check（双端点）→ 每 key 输出 zen/go 两行；act1(ok key) 双 ok，act2(bad key) zen ok / go invalid；
+        写 last_status/last_status_go + last_checked_zen/last_checked_go"""
+        with _mock_probe_server() as (base, _):
+            extra = {"GOROTATE_ZEN_BASE": base, "GOROTATE_GO_BASE": base}
+            r = run_cli(["check"], self.home, extra_env=extra)
+        self.assertEqual(r.returncode, 0)
+        out = r.stdout
+        self.assertIn("act1", out)
+        self.assertIn("[zen] ✅ 可用", out)
+        self.assertIn("[go] ✅ 可用", out)
+        self.assertIn("[zen] ⚠️  key 无效", out)   # act2 的 zen 探测（sk-bad）→ 401 invalid
+        self.assertIn("[go] ⚠️  key 无效", out)    # act2 的 go 探测 → 401 invalid
+        cfg = read_cfg(self.home)
+        act1 = next(k for k in cfg["keys"] if k["name"] == "act1")
+        self.assertEqual(act1["last_status"], "ok")
+        self.assertEqual(act1["last_status_go"], "ok")
+        self.assertIn("last_checked_zen", act1)
+        self.assertIn("last_checked_go", act1)
+        act2 = next(k for k in cfg["keys"] if k["name"] == "act2")
+        self.assertEqual(act2["last_status"], "invalid")
+        self.assertEqual(act2["last_status_go"], "invalid")
+
+    def test_check单端点plan_go只写go域字段(self):
+        """check --plan go → 每 key 只输出 go 一行；只写 last_status_go/last_checked_go，zen last_status 不动"""
+        before = read_cfg(self.home)
+        before["keys"][0]["last_status"] = "ok"   # 预置 zen 状态，验证 check --plan go 不改它
+        with open(cfg_path(self.home), "w") as f:
+            json.dump(before, f, ensure_ascii=False, indent=2)
+        with _mock_probe_server() as (base, _):
+            r = run_cli(["check", "--plan", "go"], self.home,
+                        extra_env={"GOROTATE_ZEN_BASE": base, "GOROTATE_GO_BASE": base})
+        self.assertEqual(r.returncode, 0)
+        out = r.stdout
+        self.assertNotIn("[zen]", out)
+        self.assertIn("[go] ✅ 可用", out)
+        cfg = read_cfg(self.home)
+        act1 = next(k for k in cfg["keys"] if k["name"] == "act1")
+        self.assertEqual(act1["last_status"], "ok")        # zen 状态不动
+        self.assertEqual(act1["last_status_go"], "ok")
+        self.assertIn("last_checked_go", act1)
+        self.assertNotIn("last_checked_zen", act1)
+
+    def test_check指定key名(self):
+        """check act2 --plan zen → 只探测 act2 的 zen 端点"""
+        with _mock_probe_server() as (base, seen):
+            run_cli(["check", "act2", "--plan", "zen"], self.home,
+                    extra_env={"GOROTATE_ZEN_BASE": base, "GOROTATE_GO_BASE": base})
+            auths = seen()
+        self.assertEqual(len(auths), 1, "仅应 1 次 zen 探测")
+        self.assertIn("sk-bad-key-0002", auths[0])
+        cfg = read_cfg(self.home)
+        self.assertEqual(next(k for k in cfg["keys"] if k["name"] == "act2")["last_status"], "invalid")
+        self.assertEqual(next(k for k in cfg["keys"] if k["name"] == "act1").get("last_status"), None)
+
+    def test_check非法plan退出1(self):
+        """check --plan xxx → 退出 1 用法提示，无 traceback"""
+        r = run_cli(["check", "--plan", "xxx"], self.home)
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("用法", r.stdout + r.stderr)
+
+    def test_check未知选项退出1(self):
+        """check --bogus → 退出 1 用法提示"""
+        r = run_cli(["check", "--bogus"], self.home)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("用法", r.stdout + r.stderr)
+
+    def test_check无key可检测退出1(self):
+        """配置无 key → 退出 1「没有可检测的 key」"""
+        write_cfg(self.home, [], current="")
+        r = run_cli(["check"], self.home)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("没有可检测的 key", r.stdout + r.stderr)
+
+    def test_check写字段走锁(self):
+        """源码结构：main() 中 check 经 _with_lock 包裹（写 go-keys.json 健康字段）"""
+        src = open(CLI_PATH, encoding="utf-8").read()
+        self.assertIn("_with_lock(lambda: do_check(load(), args[1:]))", src)
 
 
 if __name__ == "__main__":

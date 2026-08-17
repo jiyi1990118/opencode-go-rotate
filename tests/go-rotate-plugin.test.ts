@@ -900,15 +900,16 @@ describe("网关配置路由（/api/gateway/plans + /api/gateway/config）", () 
 })
 
 describe("WEB_HTML 网关管理区块（主导航 + 套餐卡 + Token 卡）", () => {
-  test("主导航区块（main-nav + 3 区块 id + switchNav + 主题按钮）", () => {
+  test("主导航区块（main-nav + 4 区块 id keys/tui/gateway/stats + switchNav + 主题按钮）", () => {
     const html: string = (mod as any).WEB_HTML
     expect(html).toContain('id="main-nav"')
-    for (const b of ["keys", "settings", "stats"]) {
+    // 三域分离后 4 区块（关键管理/TUI/网关/统计）；原「3 区块」断言同步更新
+    for (const b of ["keys", "tui", "gateway", "stats"]) {
       expect(html).toContain('data-nav="' + b + '"')
       expect(html).toContain('id="nav-' + b + '"')
     }
     expect(html).not.toContain('data-nav="overview"')
-    expect(html).not.toContain('data-nav="gateway"')
+    expect(html).not.toContain('id="nav-settings"') // 原「网关与设置」区块已拆为 TUI + 网关
     expect(html).toContain("function switchNav(block)")
     expect(html).toContain('onclick="switchNav(\'keys\')"')
     /* 主题切换：右上角按钮 + 图标 + toggleTheme + localStorage 记忆 + 浅色变量覆盖 */
@@ -1008,20 +1009,20 @@ describe("WEB_HTML 重构（IA + 设计系统 + P1 修复，2026-08-17）", () =
     expect(html).not.toContain("请先「显示/隐藏」查看明文后再复制")
   })
 
-  test("概览只读化：冷却编辑下沉到设置（s-cooldown 之后仍有去设置跳链）", async () => {
+  test("概览只读化：冷却编辑下沉到 TUI 区块（s-cooldown 之后仍有去 TUI 跳链）", async () => {
     const mod = await import("../go-rotate.ts")
     const html: string = (mod as any).WEB_HTML
     const cooldown = html.indexOf('id="s-cooldown"')
     expect(cooldown).toBeGreaterThan(0)
-    // 导航按钮的 switchNav 在顶部，概览区跳链在 s-cooldown 之后——从 s-cooldown 位置往后搜
-    const after = html.indexOf(`onclick="switchNav('settings')"`, cooldown)
+    // 从 s-cooldown 位置往后搜 TUI 跳链（全局冷却窗口编辑已迁入 TUI zen 子区块）
+    const after = html.indexOf(`onclick="switchNav('tui')"`, cooldown)
     expect(after).toBeGreaterThan(cooldown)
   })
 
-  test("web 按钮迁移：web-on-btn 在设置区块（nav-settings 之后）", async () => {
+  test("web 按钮迁移：web-on-btn 在网关区块（nav-gateway 之后）", async () => {
     const mod = await import("../go-rotate.ts")
     const html: string = (mod as any).WEB_HTML
-    expect(html.indexOf('id="web-on-btn"')).toBeGreaterThan(html.indexOf('id="nav-settings"'))
+    expect(html.indexOf('id="web-on-btn"')).toBeGreaterThan(html.indexOf('id="nav-gateway"'))
   })
 
   test("网关日志移入统计：gwlogview 在 nav-stats 之后", async () => {
@@ -1071,11 +1072,11 @@ describe("WEB_HTML Team A/B 并行断言（网关使用方式 + 按钮主题）"
     const html: string = (mod as any).WEB_HTML
     // 网关地址已在内嵌管理页展示（网关管理卡行首）；Team A 的使用方式卡会再次复用该地址
     expect(html).toContain("127.0.0.1:18888")
-    // 使用方式卡插入锚点：nav-settings 内 gw-config-grid 之后
-    // 注意：CSS 类规则 ".gw-config-grid {...}" 在 <head>（nav-settings 之前），故用 DOM 类属性做位置匹配
+    // 使用方式卡插入锚点：nav-gateway 内 gw-config-grid 之后
+    // 注意：CSS 类规则 ".gw-config-grid {...}" 在 <head>（nav-gateway 之前），故用 DOM 类属性做位置匹配
     expect(html).toContain('class="gw-config-grid"')
-    // 锚点关系：gw-config-grid 的 DOM 容器在 nav-settings 块内（位置契约，Team A 不改序时不破坏既有定位断言）
-    expect(html.indexOf('class="gw-config-grid"')).toBeGreaterThan(html.indexOf('id="nav-settings"'))
+    // 锚点关系：gw-config-grid 的 DOM 容器在 nav-gateway 块内（位置契约，Team A 不改序时不破坏既有定位断言）
+    expect(html.indexOf('class="gw-config-grid"')).toBeGreaterThan(html.indexOf('id="nav-gateway"'))
   })
 
   test("使用方式配置展示卡（gw-usage-card + 三配置块 + 复制函数 + 位置）", async () => {
@@ -1103,8 +1104,8 @@ describe("WEB_HTML Team A/B 并行断言（网关使用方式 + 按钮主题）"
     expect(html).toContain("async function copyText(")
     expect(html).toContain("navigator.clipboard.writeText")
     expect(html).toContain("Bearer <ZEN_GATEWAY_TOKEN>")
-    // 位置断言：使用方式卡在 nav-settings 内（gw-token-card 之后、设置卡 web-on-btn 之前）
-    const settings = html.indexOf('id="nav-settings"')
+    // 位置断言：使用方式卡在 nav-gateway 内（gw-token-card 之后、web-on-btn 之前）
+    const settings = html.indexOf('id="nav-gateway"')
     const usage = html.indexOf('id="gw-usage-card"')
     const webOn = html.indexOf('id="web-on-btn"')
     expect(settings).toBeGreaterThan(0)
@@ -1144,14 +1145,14 @@ describe("WEB_HTML Team A/B 并行断言（网关使用方式 + 按钮主题）"
 
 /* ================= 使用方式卡（gw-usage-card，2026-08-17）================= */
 describe("WEB_HTML 使用方式卡（gw-usage-card：地址 + 三配置块 + 一键复制）", () => {
-  test("gw-usage-card 位于设置区块（nav-settings 内、gw-config-grid 之后、设置卡之前）", () => {
+  test("gw-usage-card 位于网关区块（nav-gateway 内、gw-config-grid 之后、设置卡之前）", () => {
     const html: string = (mod as any).WEB_HTML
     expect(html).toContain('id="gw-usage-card"')
     expect(html).toContain('id="usage-curl-text"')
     expect(html).toContain('id="usage-codex-text"')
     expect(html).toContain('id="usage-claude-text"')
     const usage = html.indexOf('id="gw-usage-card"')
-    expect(usage).toBeGreaterThan(html.indexOf('id="nav-settings"'))
+    expect(usage).toBeGreaterThan(html.indexOf('id="nav-gateway"'))
     expect(usage).toBeGreaterThan(html.indexOf('id="gw-token-card"'))
     // 设置卡 <b>设置</b> 在使用方式卡之后
     expect(html.indexOf("<b>设置</b>", usage)).toBeGreaterThan(usage)
@@ -1310,23 +1311,307 @@ describe("双域独立轮换（current_gateway / cooldown_until_gateway 域分�
     expect(cfg.keys[1].cooldown_until_gateway).toBeNull()
   })
 
-  test("WEB_HTML 双域 UI：TUI/网关当前按钮 + 各自冷却 + 网关当前徽标", () => {
+  test("WEB_HTML 三域 UI：Zen/Go/网关当前按钮 + 各自冷却 + 三域徽标 + 检查按钮", () => {
     const html: string = (mod as any).WEB_HTML
-    // 「设为当前」拆两枚：TUI 使用（data-set，缺省 domain）与 网关使用（data-set-gw + domain:gateway）
+    // 「当前」拆三枚：Zen 使用（data-set，缺省 domain）/ Go 使用（data-set-go + domain:go）/ 网关使用（data-set-gw + domain:gateway）
     expect(html).toContain('data-set="')
-    expect(html).toContain("TUI 使用")
+    expect(html).toContain("Zen 使用")
+    expect(html).toContain('data-set-go="')
+    expect(html).toContain("Go 使用")
+    expect(html).toContain('api("/api/current", { name: b.dataset.setGo, domain: "go" })')
     expect(html).toContain('data-set-gw="')
     expect(html).toContain("网关使用")
     expect(html).toContain('api("/api/current", { name: b.dataset.setGw, domain: "gateway" })')
-    // 冷却双域：data-cooldown（TUI）+ data-cooldown-gw（domain=gateway）
-    expect(html).toContain("TUI 冷却")
-    expect(html).toContain("TUI 清冷却")
+    // 冷却三域：data-cooldown（zen）+ data-cooldown-go（domain=go）+ data-cooldown-gw（domain=gateway）
+    expect(html).toContain("Zen 冷却")
+    expect(html).toContain("Zen 清冷却")
+    expect(html).toContain('data-cooldown-go="')
+    expect(html).toContain('api("/api/cooldown", { name: b.dataset.cooldownGo, minutes: Number(b.dataset.min), domain: "go" })')
     expect(html).toContain('data-cooldown-gw="')
     expect(html).toContain('api("/api/cooldown", { name: b.dataset.cooldownGw, minutes: Number(b.dataset.min), domain: "gateway" })')
-    // 徽标区分双域当前
-    expect(html).toContain(">TUI 当前</span>")
+    // 徽标区分三域当前
+    expect(html).toContain(">Zen 当前</span>")
+    expect(html).toContain(">Go 当前</span>")
     expect(html).toContain(">网关当前</span>")
+    // 双套餐健康列 + 每 key 检查按钮（domain:"all"）
+    expect(html).toContain(">Zen 健康</th>")
+    expect(html).toContain(">Go 健康</th>")
+    expect(html).toContain('data-check="')
+    expect(html).toContain('api("/api/keys/check", { name: b.dataset.check, domain: "all" })')
+    // 手动轮换支持 domain（rotateDomain）：zen/go
+    expect(html).toContain('onclick="rotateDomain(\'zen\')"')
+    expect(html).toContain('onclick="rotateDomain(\'go\')"')
+    expect(html).toContain('api("/api/rotate", { domain })')
     // 网关卡 gw-current 显示 statusPayload 网关域字段
     expect(html).toContain("(st && st.current_gateway)")
+  })
+})
+
+/* ================= 三域分离 + 双套餐健康检查（2026-08-17）================= */
+describe("provider 判定（isGoProvider / isZenProvider，注入分流核心）", () => {
+  test("go 套餐：精确 opencode-go 或以其为后缀", () => {
+    expect(mod.isGoProvider("opencode-go")).toBe(true)
+    expect(mod.isGoProvider("xz/opencode-go")).toBe(true) // 带上下文前缀形态
+    expect(mod.isGoProvider("opencode")).toBe(false)
+    expect(mod.isGoProvider("codeplan")).toBe(false)
+    expect(mod.isGoProvider("")).toBe(false)
+  })
+  test("zen 免费档：含 opencode 但非 go 套餐", () => {
+    expect(mod.isZenProvider("opencode")).toBe(true)
+    expect(mod.isZenProvider("opencode-free")).toBe(true)
+    expect(mod.isZenProvider("opencode-go")).toBe(false)
+    expect(mod.isZenProvider("codeplan")).toBe(false)
+  })
+})
+
+describe("chat.headers 三域分流（zen/go/非 opencode）", () => {
+  async function inject(pid: string) {
+    const out = { headers: {} }
+    await hooks["chat.headers"]({ model: { providerID: pid }, sessionID: "d3-" + Math.random() }, out)
+    return out.headers.Authorization
+  }
+  test("go 套餐 -> 注入 go 域 current_go（current_go 与 current 不同时仍用 go 域）", async () => {
+    seed({ ...twoKeys("a"), current_go: "b" })
+    expect(await inject("opencode-go")).toBe("Bearer sk-bbb")
+    expect(await inject("xz/opencode-go")).toBe("Bearer sk-bbb")
+  })
+  test("zen 免费档 -> 注入 zen 域 current（opencode / opencode-free）", async () => {
+    seed({ ...twoKeys("a"), current_go: "b" })
+    expect(await inject("opencode")).toBe("Bearer sk-aaa")
+    expect(await inject("opencode-free")).toBe("Bearer sk-aaa")
+  })
+  test("非 opencode provider -> 不注入（红线），原 headers 保留", async () => {
+    seed(twoKeys("a"))
+    const out = { headers: { "x": "1" } }
+    await hooks["chat.headers"]({ model: { providerID: "codeplan" }, sessionID: "d3c" }, out)
+    expect(out.headers.Authorization).toBeUndefined()
+    expect(out.headers.x).toBe("1")
+  })
+  test("go 域 current_go 缺省 -> 读侧兜底 current", async () => {
+    seed(twoKeys("b")) // 无 current_go（旧配置形态）
+    expect(await inject("opencode-go")).toBe("Bearer sk-bbb") // current_go ?? current = b
+  })
+})
+
+describe("rotate 按域（zen 轮换不动 current_go；go 域不写 auth.json md5 铁证）", () => {
+  test("go 域 rotate：写 cooldown_until_go/last_status_go/current_go，zen 域字段不动，auth 不写", () => {
+    seed({ ...twoKeys("a"), current_go: "a" })
+    seedAuth({ other: { type: "api", key: "keep" } })
+    const authBefore = readFileSync(AUTH_FILE, "utf8")
+    mod.rotate("quota exceeded: reset at 2026-08-16 08:00:00 +0800 CST", { data: { statusCode: 429, message: "quota" } }, "go")
+    const cfg = readCfg()
+    expect(cfg.current_go).toBe("b")                        // go 域切换
+    expect(cfg.current).toBe("a")                            // zen 域不动
+    expect(cfg.keys[0].cooldown_until_go).toBe("2026-08-16T00:00:00.000Z") // go 冷却写 go 域字段
+    expect(cfg.keys[0].cooldown_until).toBeNull()            // zen 冷却不动
+    expect(cfg.keys[0].last_status_go).toBe("limited")
+    expect(cfg.keys[0].last_status ?? null).toBeNull() // zen 域健康字段未被写（缺省未归一化 = undefined/null）
+    // md5 铁证：auth.json 逐字节不变（go 域不写 auth.json）
+    expect(readFileSync(AUTH_FILE, "utf8")).toBe(authBefore)
+  })
+  test("zen 域 rotate：写 cooldown_until/current 并 syncAuth，go 域字段不动", () => {
+    seed({ ...twoKeys("a"), current_go: "b" })
+    seedAuth({})
+    mod.rotate("quota", { data: { statusCode: 429 } }, "zen")
+    const cfg = readCfg()
+    expect(cfg.current).toBe("b")
+    expect(cfg.current_go).toBe("b") // 预设不动
+    expect(cfg.keys[0].cooldown_until).toBeTruthy()
+    expect(cfg.keys[0].cooldown_until_go).toBeNull()
+    expect(readAuth()["opencode-go"].key).toBe("sk-bbb") // zen 域写 auth
+  })
+  test("manualRotate 按域：go 域切 current_go 不写 auth；zen 域切 current 写 auth", () => {
+    seed({ ...twoKeys("a"), current_go: "a" })
+    seedAuth({})
+    const authBefore = readFileSync(AUTH_FILE, "utf8")
+    mod.manualRotate("go")
+    let cfg = readCfg()
+    expect(cfg.current_go).toBe("b")
+    expect(cfg.current).toBe("a")
+    expect(readFileSync(AUTH_FILE, "utf8")).toBe(authBefore) // go 域不写 auth
+    mod.manualRotate() // zen 缺省
+    cfg = readCfg()
+    expect(cfg.current).toBe("b")
+    expect(readAuth()["opencode-go"].key).toBe("sk-bbb")
+  })
+  test("pickNext 按域冷却字段筛选（cooldown_until_go 不阻塞 zen 域选择）", () => {
+    const cfg = { current: "a", current_go: "a", keys: [
+      { name: "a", key: "sk-aaa", cooldown_until_go: new Date(Date.now() + 60000).toISOString(), cooldown_until: null },
+      { name: "b", key: "sk-bbb", cooldown_until: new Date(Date.now() + 60000).toISOString(), cooldown_until_go: null },
+    ] } as any
+    // zen 域：a 在 go 域冷却但 zen 域没冷却 -> 先看 b（zen 冷却）跳过，回绕到 a（zen 域可用）
+    expect(mod.pickNext(cfg, "zen")?.name).toBe("a")
+    // go 域：a 在 go 域冷却 -> 选 b（go 域可用）
+    expect(mod.pickNext(cfg, "go")?.name).toBe("b")
+  })
+})
+
+describe("event 钩子按域轮换（sessionProvider 记录 pid 判域）", () => {
+  test("opencode 会话配额错误 -> zen 域轮换（current 变，current_go 不动）", async () => {
+    seed({ ...twoKeys("a"), current_go: "b" })
+    // 先注册 opencode（zen）会话
+    await hooks["chat.headers"]({ model: { providerID: "opencode" }, sessionID: "ev-zen" }, { headers: {} })
+    await hooks.event({ event: { type: "session.error", properties: { sessionID: "ev-zen", error: { name: "APIError", data: { message: "quota", statusCode: 429, metadata: { url: "https://opencode.ai/zen/v1" } } } } } })
+    const cfg = readCfg()
+    expect(cfg.current).toBe("b")
+    expect(cfg.current_go).toBe("b") // go 域不动
+    expect(cfg.keys[0].cooldown_until).toBeTruthy()
+    expect(cfg.keys[0].cooldown_until_go).toBeNull()
+  })
+  test("opencode-go 会话配额错误 -> go 域轮换，auth.json 铁证", async () => {
+    seed({ ...twoKeys("a"), current_go: "a" })
+    seedAuth({})
+    const authBefore = readFileSync(AUTH_FILE, "utf8")
+    await hooks["chat.headers"]({ model: { providerID: "opencode-go" }, sessionID: "ev-gos" }, { headers: {} })
+    await hooks.event({ event: { type: "session.error", properties: { sessionID: "ev-gos", error: { name: "APIError", data: { message: "quota", statusCode: 429, metadata: { url: "https://opencode.ai/zen/go/v1" } } } } } })
+    const cfg = readCfg()
+    expect(cfg.current_go).toBe("b")
+    expect(cfg.current).toBe("a")
+    expect(readFileSync(AUTH_FILE, "utf8")).toBe(authBefore) // go 域轮换不碰 auth
+  })
+})
+
+describe("probeKey 双端点 / checkAllKeys 双域写字段", () => {
+  test("probeKey go 端点 hy3、zen 端点 hy3-free；200 -> ok", async () => {
+    const calls: string[] = []
+    const orig = globalThis.fetch
+    globalThis.fetch = async (url: any, opts: any) => {
+      calls.push(String(url) + "|" + JSON.parse(String(opts.body)).model)
+      return new Response(JSON.stringify({ choices: [] }), { status: 200 })
+    }
+    try {
+      await mod.probeKey("sk-x", "go")
+      await mod.probeKey("sk-x", "zen")
+    } finally { globalThis.fetch = orig }
+    expect(calls).toContain("https://opencode.ai/zen/go/v1/chat/completions|hy3")
+    expect(calls).toContain("https://opencode.ai/zen/v1/chat/completions|hy3-free")
+  })
+  test("checkAllKeys 双端点写对应域 last_status + last_checked（mock fetch）", async () => {
+    const orig = globalThis.fetch
+    let n = 0
+    globalThis.fetch = async () => {
+      n++;
+      if (n % 2 === 1) return new Response(JSON.stringify({ error: { message: "quota exceeded" } }), { status: 429 })
+      return new Response(JSON.stringify({ choices: [] }), { status: 200 })
+    }
+    seed(twoKeys("a"))
+    try {
+      const res = await mod.checkAllKeys("all")
+      expect(res["a"].zen?.status).toBe("limited")  // 第 1 次调用（zen）429
+      expect(res["a"].go?.status).toBe("ok")        // 第 2 次调用（go）200
+    } finally { globalThis.fetch = orig }
+  })
+})
+
+describe("statusPayload 三域", () => {
+  test("current_go / current_gateway + 每 key 三域字段", () => {
+    seed({ ...twoKeys("a"), current_go: "b", current_gateway: "b", keys: [
+      { name: "a", key: "sk-aaa", cooldown_until: null, cooldown_until_go: new Date(Date.now() + 60000).toISOString(), cooldown_until_gateway: null, last_status: null, last_status_go: "nobalance", last_checked_zen: null, last_checked_go: "2026-08-17T00:00:00.000Z" },
+      { name: "b", key: "sk-bbb", cooldown_until: null, cooldown_until_go: null, cooldown_until_gateway: null, last_status_go: null },
+    ] })
+    const st = mod.statusPayload()
+    expect(st.current).toBe("a")
+    expect(st.current_go).toBe("b")
+    expect(st.current_gateway).toBe("b")
+    const a = st.keys.find((x: any) => x.name === "a")
+    const bb = st.keys.find((x: any) => x.name === "b")
+    expect(a.isCurrent).toBe(true)
+    expect(a.isCurrentGo).toBe(false)
+    expect(a.isCurrentGateway).toBe(false)
+    expect(bb.isCurrentGo).toBe(true)
+    expect(bb.isCurrentGateway).toBe(true)
+    expect(a.cooldown_until_go).toBeTruthy()
+    expect(a.last_status_go).toBe("nobalance")
+    expect(a.last_checked_go).toBe("2026-08-17T00:00:00.000Z")
+    expect(a.last_checked_zen).toBeNull()
+  })
+})
+
+describe("Web API domain 矩阵（current/cooldown/rotate/check）", () => {
+  const post = (route: string, body: any) => mod.handleWeb(new Request("http://127.0.0.1:8899" + route, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+  }))
+  test("/api/current domain=go 写 current_go 不写 current 不写 auth；domain=gateway 写 current_gateway", async () => {
+    seed({ ...twoKeys("a") }); seedAuth({})
+    await post("/api/current", { name: "b", domain: "go" })
+    let cfg = readCfg()
+    expect(cfg.current).toBe("a")
+    expect(cfg.current_go).toBe("b")
+    expect(readAuth()).toEqual({}) // go 域不写 auth
+    await post("/api/current", { name: "b", domain: "gateway" })
+    cfg = readCfg()
+    expect(cfg.current_gateway).toBe("b")
+    // 缺省 domain -> zen
+    await post("/api/current", { name: "a" })
+    cfg = readCfg()
+    expect(cfg.current).toBe("a")
+    expect(cfg.current_go).toBe("b")
+  })
+  test("/api/cooldown domain=go 写 cooldown_until_go；null 清除各域", async () => {
+    seed({ ...twoKeys("a"), current_go: "b" })
+    await post("/api/cooldown", { name: "b", minutes: 60, domain: "go" })
+    let cfg = readCfg()
+    expect(near(cfg.keys[1].cooldown_until_go, 60)).toBe(true)
+    expect(cfg.keys[1].cooldown_until).toBeNull()
+    await post("/api/cooldown", { name: "b", minutes: null, domain: "go" })
+    cfg = readCfg()
+    expect(cfg.keys[1].cooldown_until_go).toBeNull()
+  })
+  test("/api/rotate domain=go 手动轮换 go 域；缺省 zen 轮换 zen 域（auth 仅 zen 写）", async () => {
+    seed({ ...twoKeys("a"), current_go: "a" }); seedAuth({})
+    const authBefore = readFileSync(AUTH_FILE, "utf8")
+    await post("/api/rotate", { domain: "go" })
+    let cfg = readCfg()
+    expect(cfg.current_go).toBe("b")
+    expect(cfg.current).toBe("a")
+    expect(readFileSync(AUTH_FILE, "utf8")).toBe(authBefore)
+    await post("/api/rotate", {})
+    cfg = readCfg()
+    expect(cfg.current).toBe("b")
+    expect(readAuth()["opencode-go"].key).toBe("sk-bbb")
+  })
+})
+
+describe("loadConfig 迁移兜底 / updateKey 三域跟随", () => {
+  test("旧配置（无 current_go/cooldown_until_go/last_status_go）读侧归一化 + 兜底 current", () => {
+    seed({
+      provider_id: "opencode-go", cooldown_minutes: 300, current: "a", auto_web: false,
+      keys: [{ name: "a", key: "sk-aaa", cooldown_until: null }],
+    })
+    const cfg = mod.loadConfig()
+    expect(cfg.current_go).toBe("a") // 读侧兜底 current
+    expect(cfg.keys[0].cooldown_until_go).toBeNull()
+    expect(cfg.keys[0].last_status_go).toBeNull()
+    expect(cfg.keys[0].last_checked_zen).toBeNull()
+    expect(cfg.keys[0].last_checked_go).toBeNull()
+    // mutateConfig 往返保留（写回不丢）
+    mod.mutateConfig((c: any) => { c.provider_id = "opencode-go" })
+    const cfg2 = readCfg()
+    expect(cfg2.current_go).toBe("a")
+  })
+  test("updateKey 改名时 current_go 跟随（三域）", () => {
+    seed({ ...twoKeys("a"), current_go: "a", current_gateway: "a" })
+    mod.updateKey("a", { name: "a-renamed" })
+    const cfg = readCfg()
+    expect(cfg.current).toBe("a-renamed")
+    expect(cfg.current_go).toBe("a-renamed")
+    expect(cfg.current_gateway).toBe("a-renamed")
+  })
+  test("setGoCurrent 写 current_go 不动 current，不写 auth", () => {
+    seed(twoKeys("a")); seedAuth({})
+    mod.setGoCurrent("b")
+    const cfg = readCfg()
+    expect(cfg.current).toBe("a")
+    expect(cfg.current_go).toBe("b")
+    expect(readAuth()).toEqual({})
+  })
+  test("reconcileCurrent go 域自愈：current_go 指向不存在 -> 兜底 zen current 后 keys[0]", () => {
+    const cfg0 = { current: "a", current_go: "zzz", keys: [{ name: "a", key: "k" }, { name: "b", key: "k2" }] } as any
+    mod.reconcileCurrent(cfg0)
+    expect(cfg0.current_go).toBe("a")
+    const cfg1 = { current: "zzz", current_go: "yyy", keys: [{ name: "a", key: "k" }, { name: "b", key: "k2" }] } as any
+    mod.reconcileCurrent(cfg1)
+    expect(cfg1.current).toBe("a")
+    expect(cfg1.current_go).toBe("a")
   })
 })

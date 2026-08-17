@@ -1861,11 +1861,11 @@ function gatewayModelsSummary() {
   return { models: [...ACTIVE_PLAN.builtinModels], aliases: { ...MODEL_ALIAASES } }
 }
 
-/** GET /api/gateway/config 响应组装：只读配置摘要。keys 仅含 name/cooldown_until（绝不含 key 明文）。
+/** GET /api/gateway/config 响应组装：只读配置摘要。keys 仅含 name/cooldown_until_gateway（网关域冷却，与 current 域一致；绝不含 key 明文）。
  *  raw 为 go-keys.json 原始 JSON（readRawConfig），用于透传 loadConfig 未携带的扩展字段 auto_web。 */
 function gatewayConfigSummary(cfg, raw = null) {
   const keys = Array.isArray(cfg?.keys)
-    ? cfg.keys.map((k) => ({ name: k.name, cooldown_until: k.cooldown_until ?? null }))
+    ? cfg.keys.map((k) => ({ name: k.name, cooldown_until_gateway: k.cooldown_until_gateway ?? null }))
     : []
   const autoWeb =
     raw && typeof raw === "object" && typeof raw.auto_web === "boolean" ? raw.auto_web : undefined

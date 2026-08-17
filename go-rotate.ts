@@ -55,16 +55,26 @@ const LOG_KEEP = 3
 const LOCK_TIMEOUT_MS = 5000
 const LOCK_STALE_MS = 15000
 
+/** 三域模型：zen（opencode 免费档 provider `opencode`）/ go（套餐 provider `opencode-go`）/ gateway（网关 upstream go 档） */
+type Domain = "zen" | "go" | "gateway"
+
 type KeyEntry = {
   name: string
   key: string
   cooldown_until: string | null
   /** 该 key 的独立冷却窗口（分钟）；缺省回退全局 cfg.cooldown_minutes，再回退 DEFAULT_COOLDOWN_MIN */
   cooldown_minutes?: number
-  /** 最近一次探测/轮换得到的健康状态：ok | invalid | nobalance | limited | error | null */
+  /** 最近一次探测/轮换得到的健康状态：ok | invalid | nobalance | limited | error | null（zen 域） */
   last_status?: string | null
   /** 网关域冷却记录（双域独立轮换）：null = 网关域无冷却。TUI 域冷却仍用 cooldown_until */
   cooldown_until_gateway?: string | null
+  /** go 套餐域冷却记录（三域独立轮换）：null = go 域无冷却。读侧兜底缺省 null */
+  cooldown_until_go?: string | null
+  /** go 套餐域健康状态（双端点探测，zen→last_status / go→last_status_go） */
+  last_status_go?: string | null
+  /** zen 端点最近探测时间（ISO）；go 端点用 last_checked_go */
+  last_checked_zen?: string | null
+  last_checked_go?: string | null
 }
 type Config = {
   provider_id: string
@@ -72,6 +82,8 @@ type Config = {
   current: string
   /** 网关域游标（双域独立轮换）：读侧兜底 `current_gateway ?? current` */
   current_gateway?: string
+  /** go 套餐域游标（三域独立轮换）：读侧兜底 `current_go ?? current` */
+  current_go?: string
   keys: KeyEntry[]
   /** 是否随 opencode 启动自动起 Web；false 时轮换仍可用，仅不占用端口 */
   auto_web?: boolean
@@ -155,14 +167,23 @@ function loadConfig(): Config {
     const cfg = JSON.parse(raw)
     const keys = (Array.isArray(cfg.keys) ? cfg.keys : [])
     .filter((k: any) => k && typeof k.name === "string" && typeof k.key === "string")
-    // 归一化：每 key 都显式携带网关域冷却字段（null = 网关域无冷却，schema 一致）
-    .map((k: any) => ({ ...k, cooldown_until_gateway: k.cooldown_until_gateway ?? null }))
+    // 归一化：每 key 显式携带三域冷却 + 健康字段（null = 该域无冷却/未探测，schema 一致；向后兼容）
+    .map((k: any) => ({
+      ...k,
+      cooldown_until_gateway: k.cooldown_until_gateway ?? null,
+      cooldown_until_go: k.cooldown_until_go ?? null,
+      last_status_go: k.last_status_go ?? null,
+      last_checked_zen: k.last_checked_zen ?? null,
+      last_checked_go: k.last_checked_go ?? null,
+    }))
     const out: any = {
       provider_id: cfg.provider_id ?? "opencode-go",
       cooldown_minutes: cfg.cooldown_minutes ?? DEFAULT_COOLDOWN_MIN,
       current: cfg.current ?? "",
       // 网关域游标：读侧兜底 current_gateway ?? current（旧配置无网关域字段=干净起步用 TUI 当前 key）
       current_gateway: cfg.current_gateway ?? cfg.current ?? "",
+      // go 套餐域游标：读侧兜底 current_go ?? current（旧配置无 go 域字段=干净起步用 zen 当前 key）
+      current_go: cfg.current_go ?? cfg.current ?? "",
       keys,
       auto_web: cfg.auto_web !== false,
     }
@@ -173,7 +194,7 @@ function loadConfig(): Config {
     return out
   } catch (e) {
     log(`loadConfig error: ${(e as Error).message}`)
-    return { provider_id: "opencode-go", cooldown_minutes: DEFAULT_COOLDOWN_MIN, current: "", current_gateway: "", keys: [], auto_web: true }
+    return { provider_id: "opencode-go", cooldown_minutes: DEFAULT_COOLDOWN_MIN, current: "", current_gateway: "", current_go: "", keys: [], auto_web: true }
   }
 }
 
@@ -214,14 +235,19 @@ function reconcileCurrent(cfg: Config) {
   if (!cfg.keys.some((k) => k.name === cfg.current)) {
     cfg.current = cfg.keys[0]?.name ?? ""
   }
+  const next = () => (cfg.keys.some((k) => k.name === cfg.current) ? cfg.current : (cfg.keys[0]?.name ?? ""))
+  // go 套餐域自愈：指向不存在 name → 兜底 zen 当前（或 keys[0]）
+  if (!cfg.keys.some((k) => k.name === (cfg.current_go ?? cfg.current))) {
+    cfg.current_go = next()
+  }
+  // 网关域自愈
   if (!cfg.keys.some((k) => k.name === cfg.current_gateway)) {
-    cfg.current_gateway =
-      cfg.keys.some((k) => k.name === cfg.current) ? cfg.current : (cfg.keys[0]?.name ?? "")
+    cfg.current_gateway = next()
   }
 }
 
-function currentKey(cfg: Config): KeyEntry | undefined {
-  return cfg.keys.find((k) => k.name === cfg.current) ?? cfg.keys[0]
+function currentKey(cfg: Config, domain: "zen" | "go" = "zen"): KeyEntry | undefined {
+  return cfg.keys.find((k) => k.name === domainCurrent(cfg, domain)) ?? cfg.keys[0]
 }
 
 /** 计算冷却到期时间：key 有独立窗口用它的，否则用全局窗口，再回退 DEFAULT_COOLDOWN_MIN */
@@ -274,51 +300,86 @@ function isGoError(err: any): boolean {
   return /"opencode/i.test(body) || /opencode\.ai\/zen/i.test(body)
 }
 
-function pickNext(cfg: Config): KeyEntry | undefined {
+/** go 套餐 provider 判定：`opencode-go`（或以此为后缀的形态）。真实环境 providerID 若带上下文后缀也能命中 */
+function isGoProvider(pid: string): boolean {
+  return pid === "opencode-go" || pid.endsWith("opencode-go")
+}
+
+/** zen 免费档 provider 判定：含 "opencode" 但非 go 套餐（`opencode` 免费层 / 其它含 opencode 前缀形态） */
+function isZenProvider(pid: string): boolean {
+  return String(pid).includes("opencode") && !isGoProvider(pid)
+}
+
+/** 该域游标（读侧兜底：go → current_go ?? current；zen → current） */
+function domainCurrent(cfg: Config, domain: "zen" | "go"): string {
+  return domain === "go" ? (cfg.current_go ?? cfg.current ?? "") : (cfg.current ?? "")
+}
+
+function pickNext(cfg: Config, domain: "zen" | "go" = "zen"): KeyEntry | undefined {
   const now = Date.now()
   const ordered = cfg.keys
-  const startIdx = ordered.findIndex((k) => k.name === cfg.current)
+  const startIdx = ordered.findIndex((k) => k.name === domainCurrent(cfg, domain))
+  const coolField = domain === "go" ? "cooldown_until_go" : "cooldown_until"
   for (let i = 1; i <= ordered.length; i++) {
     const k = ordered[(startIdx + i) % ordered.length]
     if (!k) continue
-    if (!k.cooldown_until || Date.parse(k.cooldown_until) <= now) return k
+    const c = (k as any)[coolField]
+    if (!c || Date.parse(c) <= now) return k
   }
   return undefined
 }
 
-/** 轮换（锁内执行）：当前 key 进冷却，切换到下一个可用 key */
-function rotate(errMsg: string, err?: any): Config {
+/** 轮换（锁内执行）：当前 key 进冷却，切换到下一个可用 key。
+ *  domain="zen"（默认，现状字段不变）写 cooldown_until/last_status/current 并 syncAuth；
+ *  domain="go" 写 cooldown_until_go/last_status_go/current_go，且【不写 auth.json】——auth.json
+ *  单槽仅由 zen 免费档域维护（go 套餐域与网关域一样，轮换不碰 auth.json）。 */
+function rotate(errMsg: string, err?: any, domain: "zen" | "go" = "zen"): Config {
   return mutateConfig((cfg) => {
-    const cur = currentKey(cfg)
+    const isGo = domain === "go"
+    const cur = currentKey(cfg, domain)
     if (cur) {
-      cur.cooldown_until = parseResetTime(errMsg) ?? cooldownUntilDefault(cfg, cur)
-      cur.last_status = classifyGoError(errMsg, err?.data?.statusCode)
-      log(`⚠️  key "${cur.name}" 配额耗尽（${cur.last_status}），进入冷却 until=${cur.cooldown_until}`)
+      const cooldownVal = parseResetTime(errMsg) ?? cooldownUntilDefault(cfg, cur)
+      const st = classifyGoError(errMsg, err?.data?.statusCode)
+      if (isGo) {
+        cur.cooldown_until_go = cooldownVal
+        cur.last_status_go = st
+      } else {
+        cur.cooldown_until = cooldownVal
+        cur.last_status = st
+      }
+      log(`⚠️  key "${cur.name}" 配额耗尽（${st}），进入${isGo ? "go 域" : "zen 域"}冷却 until=${cooldownVal}`)
     }
-    const next = pickNext(cfg)
+    const next = pickNext(cfg, domain)
     if (!next) {
-      log(`❌  没有可用 key（全部在冷却期），维持当前 key "${cfg.current}"`)
+      log(`❌  ${isGo ? "go 域" : "zen 域"}没有可用 key（全部在冷却期），维持当前 key "${domainCurrent(cfg, domain)}"`)
       return
     }
-    cfg.current = next.name
-    const nk = currentKey(cfg)
-    if (nk) nk.last_status = null
-    syncAuth(next.key)
-    log(`✅  轮换到 key "${next.name}"，已同步 auth.json`)
+    if (isGo) cfg.current_go = next.name
+    else cfg.current = next.name
+    const nk = currentKey(cfg, domain)
+    if (nk) { if (isGo) nk.last_status_go = null; else nk.last_status = null }
+    if (!isGo) syncAuth(next.key)
+    log(isGo
+      ? `✅  go 域轮换到 key "${next.name}"（go 域不写 auth.json）`
+      : `✅  轮换到 key "${next.name}"，已同步 auth.json`)
   })
 }
 
-/** 手动轮换到下一个可用 key（web/CLI 用） */
-function manualRotate(): Config {
+/** 手动轮换到下一个可用 key（web/CLI 用）。domain 缺省 zen；go 域不写 auth.json。 */
+function manualRotate(domain: "zen" | "go" = "zen"): Config {
   return mutateConfig((cfg) => {
-    const next = pickNext(cfg)
+    const isGo = domain === "go"
+    const next = pickNext(cfg, domain)
     if (!next) {
-      log(`❌  手动轮换：没有可用 key，保持当前`)
+      log(`❌  手动轮换（${isGo ? "go 域" : "zen 域"}）：没有可用 key，保持当前`)
       return
     }
-    cfg.current = next.name
-    syncAuth(next.key)
-    log(`🔄  手动轮换到 key "${next.name}"`)
+    if (isGo) cfg.current_go = next.name
+    else cfg.current = next.name
+    if (!isGo) syncAuth(next.key)
+    log(isGo
+      ? `🔄  go 域手动轮换到 key "${next.name}"（不写 auth.json）`
+      : `🔄  手动轮换到 key "${next.name}"`)
   })
 }
 
@@ -337,7 +398,7 @@ function setCurrent(name: string): Config {
 function addKey(name: string, key: string): Config {
   return mutateConfig((cfg) => {
     if (cfg.keys.some((x) => x.name === name)) throw new Error(`key "${name}" 已存在`)
-    cfg.keys.push({ name, key, cooldown_until: null, cooldown_until_gateway: null })
+    cfg.keys.push({ name, key, cooldown_until: null, cooldown_until_gateway: null, cooldown_until_go: null })
     log(`➕  添加 key "${name}"`)
   })
 }
@@ -351,9 +412,11 @@ function updateKey(name: string, patch: { key?: string; name?: string }): Config
       if (cfg.keys.some((x) => x.name === patch.name)) throw new Error(`key "${patch.name}" 已存在`)
       const wasCurrent = k.name === cfg.current
       const wasGatewayCurrent = k.name === cfg.current_gateway
+      const wasGoCurrent = k.name === cfg.current_go
       k.name = patch.name
       if (wasCurrent) cfg.current = patch.name
       if (wasGatewayCurrent) cfg.current_gateway = patch.name
+      if (wasGoCurrent) cfg.current_go = patch.name
     }
     if (patch.key) k.key = patch.key
     log(`✏️  更新 key "${name}"`)
@@ -392,6 +455,31 @@ function setGatewayCurrent(name: string): Config {
     if (!k) throw new Error(`key "${name}" 不存在`)
     cfg.current_gateway = k.name
     log(`🎯  手动设置网关域当前 key 为 "${k.name}"`)
+  })
+}
+
+/** 设置 go 套餐域当前 key（web/API 用，domain="go"）。绝不 syncAuth（go 域轮换不碰 auth.json） */
+function setGoCurrent(name: string): Config {
+  return mutateConfig((cfg) => {
+    const k = cfg.keys.find((x) => x.name === name)
+    if (!k) throw new Error(`key "${name}" 不存在`)
+    cfg.current_go = k.name
+    log(`🎯  手动设置 go 套餐域当前 key 为 "${k.name}"`)
+  })
+}
+
+/** 设置/清除 go 套餐域冷却（cooldown_until_go；zen 域冷却用 setCooldown，网关域用 setGatewayCooldown） */
+function setGoCooldown(name: string, minutes: number | null): Config {
+  return mutateConfig((cfg) => {
+    const k = cfg.keys.find((x) => x.name === name)
+    if (!k) throw new Error(`key "${name}" 不存在`)
+    if (minutes === null) {
+      k.cooldown_until_go = null
+      log(`🧊  清除 key "${name}" go 域名冷却`)
+    } else {
+      k.cooldown_until_go = new Date(Date.now() + minutes * 60_000).toISOString()
+      log(`🧊  key "${name}" go 域进入冷却 ${minutes} 分钟`)
+    }
   })
 }
 
@@ -461,18 +549,24 @@ function statusPayload() {
       state,
       remainMin,
       cooldown_until: k.cooldown_until,
+      cooldown_until_go: k.cooldown_until_go ?? null,
+      cooldown_until_gateway: k.cooldown_until_gateway ?? null,
       cooldown_minutes: k.cooldown_minutes ?? null,
       last_status: k.last_status ?? null,
+      last_status_go: k.last_status_go ?? null,
+      last_checked_zen: k.last_checked_zen ?? null,
+      last_checked_go: k.last_checked_go ?? null,
       isCurrent: k.name === cfg.current,
-      cooldown_until_gateway: k.cooldown_until_gateway ?? null,
-      isCurrentGateway: k.name === cfg.current_gateway,
+      isCurrentGo: k.name === (cfg.current_go ?? cfg.current),
+      isCurrentGateway: k.name === (cfg.current_gateway ?? cfg.current),
     }
   })
   return {
     provider_id: cfg.provider_id,
     cooldown_minutes: cfg.cooldown_minutes,
     current: cfg.current,
-    current_gateway: cfg.current_gateway,
+    current_go: cfg.current_go ?? cfg.current ?? "",
+    current_gateway: cfg.current_gateway ?? cfg.current ?? "",
     auto_web: cfg.auto_web !== false,
     keyCount: cfg.keys.length,
     availableCount: keys.filter((k) => k.state === "available").length,
@@ -737,14 +831,17 @@ function gatewayPlansPayload() {
  */
 
 const GO_API = "https://opencode.ai/zen/go/v1/chat/completions"
+const ZEN_API = "https://opencode.ai/zen/v1/chat/completions"
 
-async function probeKey(key: string): Promise<{ status: string; detail: string }> {
+async function probeKey(key: string, domain: "zen" | "go" = "go"): Promise<{ status: string; detail: string }> {
+  const api = domain === "go" ? GO_API : ZEN_API
+  const model = domain === "go" ? "hy3" : "hy3-free"
   try {
-    const res = await fetch(GO_API, {
+    const res = await fetch(api, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
       body: JSON.stringify({
-        model: "hy3",
+        model,
         messages: [{ role: "user", content: "hi" }],
         max_tokens: 1,
         stream: false,
@@ -768,18 +865,26 @@ async function probeKey(key: string): Promise<{ status: string; detail: string }
   }
 }
 
-/** 探测所有 key 的健康状态（只读，不写配置） */
-async function checkAllKeys() {
+/** 探测所有 key 的健康状态（只读探测，仅回调 mutateConfig 持久化结果）。
+ *  domain: "all"（双端点，默认）| "zen" | "go"；name 仅探测单个 key（可选）。
+ *  写各自域状态 + 探测时间：zen→last_status/last_checked_zen，go→last_status_go/last_checked_go。
+ */
+async function checkAllKeys(domain: "zen" | "go" | "all" = "all", name?: string) {
   const cfg = loadConfig()
-  const results: Record<string, { status: string; detail: string }> = {}
-  for (const k of cfg.keys) {
-    results[k.name] = await probeKey(k.key)
+  const targets = name ? cfg.keys.filter((k) => k.name === name) : cfg.keys
+  const results: Record<string, { zen?: { status: string; detail: string }; go?: { status: string; detail: string } }> = {}
+  for (const k of targets) {
+    if (domain === "all" || domain === "zen") results[k.name] = { ...(results[k.name] ?? {}), zen: await probeKey(k.key, "zen") }
+    if (domain === "all" || domain === "go") results[k.name] = { ...(results[k.name] ?? {}), go: await probeKey(k.key, "go") }
   }
-  // 持久化探测结果到 last_status，便于状态列展示
+  const now = new Date().toISOString()
+  // 持久化探测结果到对应域 last_status + 探测时间，便于状态列展示
   mutateConfig((c) => {
     for (const k of c.keys) {
       const r = results[k.name]
-      if (r) k.last_status = r.status
+      if (!r) continue
+      if (r.zen) { k.last_status = r.zen.status; k.last_checked_zen = now }
+      if (r.go) { k.last_status_go = r.go.status; k.last_checked_go = now }
     }
   })
   return results
@@ -815,9 +920,14 @@ async function handleWeb(req: any): Promise<Response> {
   if (method === "GET" && route === "/api/gateway/log") return json(await gatewayLog())
   if (method === "GET" && route === "/api/gateway/plans") return json(gatewayPlansPayload())
   if (method === "GET" && route === "/api/gateway/config") return json(gatewayConfigPayload())
-  // key 健康探测：仅 POST（GET 会意外触发真实探测消耗配额，防呆 405/404）
+  // key 健康探测：仅 POST（GET 会意外触发真实探测消耗配额，防呆 404/405）。
+  // body: { name?, domain?: "zen"|"go"|"all" }，默认 all=双端点，name 可选单 key 探测。
   if (method === "POST" && route === "/api/keys/check") {
-    return json({ results: await checkAllKeys() })
+    let body: any = {}
+    try { body = await req.json() } catch {}
+    const domain: any = body?.domain === "go" ? "go" : (body?.domain === "zen" ? "zen" : "all")
+    const one = typeof body?.name === "string" && body.name ? String(body.name) : undefined
+    return json({ results: await checkAllKeys(domain, one) })
   }
   // Web 开关：/api/web/off 关闭并停止 server；/api/web/on 开启自动启动
   if (route === "/api/web/off") {
@@ -845,16 +955,19 @@ async function handleWeb(req: any): Promise<Response> {
         if (route === "/api/keys/add") return addKey(String(body.name), String(body.key))
         if (route === "/api/keys/update") return updateKey(String(body.name), body.patch ?? {})
         if (route === "/api/keys/delete") return removeKey(String(body.name))
-        // 双域：body.domain 缺省 = "tui"（现状行为不变）；"gateway" 写网关域字段
-        if (route === "/api/current")
-          return body.domain === "gateway"
-            ? setGatewayCurrent(String(body.name))
-            : setCurrent(String(body.name))
+        // 三域：body.domain 缺省 = "zen"（现状 TUI 免费档，行为不变）；"go" 写 go 域字段；"gateway" 写网关域字段
+        if (route === "/api/current") {
+          const d = body.domain ?? "zen"
+          if (d === "gateway") return setGatewayCurrent(String(body.name))
+          if (d === "go") return setGoCurrent(String(body.name))
+          return setCurrent(String(body.name))
+        }
         if (route === "/api/cooldown") {
           const minutes = body.minutes === null ? null : Number(body.minutes)
-          return body.domain === "gateway"
-            ? setGatewayCooldown(String(body.name), minutes)
-            : setCooldown(String(body.name), minutes)
+          const d = body.domain ?? "zen"
+          if (d === "gateway") return setGatewayCooldown(String(body.name), minutes)
+          if (d === "go") return setGoCooldown(String(body.name), minutes)
+          return setCooldown(String(body.name), minutes)
         }
         if (route === "/api/cooldown/window")
           return setCooldownWindow(
@@ -862,7 +975,7 @@ async function handleWeb(req: any): Promise<Response> {
             body.minutes === null || body.minutes === "" ? null : Number(body.minutes),
           )
         if (route === "/api/settings") return setGlobalCooldown(Number(body.cooldown_minutes))
-        if (route === "/api/rotate") return manualRotate()
+        if (route === "/api/rotate") return manualRotate(body.domain === "go" ? "go" : "zen")
         if (route === "/api/log/clear") return clearLog()
         // 网关管理：start/stop/restart → {ok, output}，透传不套统一包装
         if (route === "/api/gateway/start") return gatewayManage("start")
@@ -973,8 +1086,15 @@ export const GoRotate = async (ctx: any) => {
       if (!pid || !sid) return
       sessionProvider.set(sid, pid)
       PRUNE()
-      if (!pid.includes("opencode")) return
-      const key = currentKey(loadConfig())
+      // 红线：非 opencode provider 一律不注入（绝不影响 codeplan/fox-aws 等）
+      if (!isGoProvider(pid) && !isZenProvider(pid)) return
+      // 三域分流：go 套餐 provider（opencode-go）→ 注入 go 域 current（current_go ?? current）；
+      // zen 免费档 provider（opencode / 其它含 opencode 前缀非 go）→ 注入 zen 域 current（current）
+      const cfg = loadConfig()
+      const isGo = isGoProvider(pid)
+      const key = isGo
+        ? cfg.keys.find((k) => k.name === (cfg.current_go ?? cfg.current)) ?? cfg.keys[0]
+        : cfg.keys.find((k) => k.name === cfg.current) ?? cfg.keys[0]
       if (!key) return
       output.headers = { ...output.headers, Authorization: `Bearer ${key.key}` }
     },
@@ -991,14 +1111,21 @@ export const GoRotate = async (ctx: any) => {
       if (!isQuotaError(err)) return
 
       const sid = props?.sessionID
-      const sessionIsGo = sid ? sessionProvider.get(sid)?.includes("opencode") : false
-      if (!sessionIsGo && !isGoError(err)) return
+      const pid = sid ? sessionProvider.get(sid) : undefined
+      // 按 session 记录的 pid 判定所属域（三域独立）：go 套餐 provider → go 域；
+      // zen provider → zen 域。pid 未知（真实会话必经 chat.headers 注册 pid，理论不出现）
+      // 兜底默认 zen 免费档域（现状语义，避免误切 go 域破坏既有行为）。
+      let domain: "zen" | "go" = "zen"
+      if (pid) {
+        if (isGoProvider(pid)) domain = "go"
+        else if (isZenProvider(pid)) domain = "zen"
+      }
 
       const msg = err.data?.message ?? err.message ?? ""
-      log(`🔁  检测到配额/鉴权错误: ${String(msg).slice(0, 200)}`)
-      log(`    sessionID=${sid ?? "?"} statusCode=${err.data?.statusCode ?? "?"}`)
-      const cfg = rotate(String(msg), err)
-      log(`    now current=${cfg.current}`)
+      log(`🔁  检测到${domain === "go" ? "go 套餐" : "zen 免费档"}配额/鉴权错误: ${String(msg).slice(0, 200)}`)
+      log(`    sessionID=${sid ?? "?"} statusCode=${err.data?.statusCode ?? "?"} pid=${pid ?? "?"}`)
+      const cfg = rotate(String(msg), err, domain)
+      log(`    now ${domain}域 current=${domain === "go" ? cfg.current_go : cfg.current}`)
     },
   }
 }
@@ -1333,40 +1460,67 @@ try {
 
   <div class="nav" id="main-nav">
     <button class="nav-btn active" data-nav="keys" onclick="switchNav('keys')">Key 管理</button>
-    <button class="nav-btn" data-nav="settings" onclick="switchNav('settings')">网关与设置</button>
+    <button class="nav-btn" data-nav="tui" onclick="switchNav('tui')">TUI</button>
+    <button class="nav-btn" data-nav="gateway" onclick="switchNav('gateway')">网关</button>
     <button class="nav-btn" data-nav="stats" onclick="switchNav('stats')">统计</button>
   </div>
 
-  <!-- ============ Key 管理：概览状态条 + 主操作区（新增卡 + 表格卡） ============ -->
+  <!-- ============ Key 管理：健康总览条（zen/go/网关）+ 主操作区（新增卡 + 表格卡） ============ -->
   <div class="block" id="nav-keys">
   <div class="card">
     <div class="stats ov-strip">
-      <div class="stat"><div class="v" id="s-current">-</div><div class="l">当前 key</div></div>
+      <div class="stat"><div class="v" id="s-current">-</div><div class="l">Zen 当前 key</div></div>
+      <div class="stat"><div class="v" id="s-current-go">-</div><div class="l">Go 当前 key</div></div>
       <div class="stat"><div class="v" id="s-avail">-</div><div class="l">可用 &nbsp;<span class="muted" id="s-total"></span></div></div>
       <div class="stat"><div class="v" id="ov-gw-state">-</div><div class="l">网关</div></div>
       <div class="stat"><div class="v" id="ov-last-rotate">-</div><div class="l">最近轮换</div></div>
-      <div class="stat"><div class="v" id="s-cooldown">-</div><div class="l">冷却窗口(min) <a href="javascript:void(0)" onclick="switchNav('settings')" style="color:#60a5fa">去设置</a></div></div>
-      <div class="stat"><div class="v" id="s-autoweb">-</div><div class="l">Web 自动启动 <a href="javascript:void(0)" onclick="switchNav('settings')" style="color:#60a5fa">去设置</a></div></div>
+      <div class="stat"><div class="v" id="s-cooldown">-</div><div class="l">冷却窗口(min) <a href="javascript:void(0)" onclick="switchNav('tui')" style="color:#60a5fa">去 TUI</a></div></div>
+      <div class="stat"><div class="v" id="s-autoweb">-</div><div class="l">Web 自动启动 <a href="javascript:void(0)" onclick="switchNav('gateway')" style="color:#60a5fa">去网关</a></div></div>
     </div>
     <div class="muted banner" id="ov-hint" style="margin-top:12px">
-      <span id="ov-hint-full"><b>①</b> 添加 key → 下方输入框　<b>②</b> （可选）启动网关 → <a href="javascript:void(0)" onclick="switchNav('settings')" style="color:#60a5fa">网关与设置</a>　<b>③</b> （可选）生成 token → 网关与设置</span>
+      <span id="ov-hint-full"><b>①</b> 添加 key → 下方输入框　<b>②</b> 按钮设当前 key（Zen/Go/网关三域）　<b>③</b> 每 key 「检查」双套餐健康　<b>④</b> 各域手动轮换见 <a href="javascript:void(0)" onclick="switchNav('tui')" style="color:#60a5fa">TUI</a>，网关见 <a href="javascript:void(0)" onclick="switchNav('gateway')" style="color:#60a5fa">网关</a></span>
       <span id="ov-hint-min" style="display:none">当前状态健康。</span>
     </div>
   </div>
   <div class="card" id="keys-add-card">
     <div class="row" style="margin-bottom:10px"><input id="new-name" placeholder="名称，如 act2">&nbsp;<input id="new-key" placeholder="sk-xxxx 完整的 API key"><button class="primary" onclick="addKey()">新增 key</button></div>
     <div class="muted banner" id="keys-empty" style="display:none">还没有 key：粘贴第一个 opencode-go key，添加后自动探测健康。</div>
-    <div class="row" style="margin-bottom:10px"><span class="muted">手动操作：</span><button onclick="rotate()">轮换</button><button onclick="checkKeys()">检测所有 key</button><span class="muted" id="check-hint"></span></div>
+    <div class="row" style="margin-bottom:10px"><span class="muted">手动操作：</span><button onclick="rotateDomain('zen')">Zen 轮换</button><button onclick="rotateDomain('go')">Go 轮换</button><button onclick="checkKeys()">检测所有 key</button><span class="muted" id="check-hint"></span></div>
   </div>
   <div class="card" id="keys-table-card">
     <div class="table-wrap">
-    <table style="min-width:860px">
-      <thead><tr><th>名称</th><th>Key</th><th>状态</th><th>健康</th><th>操作</th></tr></thead>
+    <table style="min-width:1120px">
+      <thead><tr><th>名称</th><th>Key</th><th>状态</th><th>Zen 健康</th><th>Go 健康</th><th>操作</th></tr></thead>
       <tbody id="tbody"></tbody>
     </table>
     </div>
-    <div class="muted" style="margin-top:8px">每 key 独立冷却窗口行内设置；全局冷却窗口见 <a href="javascript:void(0)" onclick="switchNav('settings')" style="color:#60a5fa">设置</a>。</div>
+    <div class="muted" style="margin-top:8px">每 key 独立冷却窗口行内设置；Zen 当前 = opencode 免费档，Go 当前 = 套餐；健康列为「检查」结果（zen/go 双端点，可 hover 看探测时间与详情）。</div>
     <div class="msg" id="msg"></div>
+  </div>
+  </div>
+
+  <!-- ============ TUI：zen / go 两个子区块（当前 key、冷却列表、手动轮换、冷却设置） ============ -->
+  <div class="block" id="nav-tui" style="display:none">
+  <div class="card" id="tui-zen-card">
+    <div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+      <b>Zen 免费档（provider <code>opencode</code>） <span id="tui-zen-badge"></span></b>
+      <div class="actions">
+        <button id="tui-zen-rotate" onclick="rotateDomain('zen')">手动轮换</button>
+        <button onclick="editGlobalWindow()">全局冷却窗口设置</button>
+      </div>
+    </div>
+    <div class="row" style="margin-bottom:8px"><span class="muted">当前 key：</span><b id="tui-zen-cur">-</b></div>
+    <div class="muted" id="tui-zen-note">Zen 免费档轮换会同步写入 auth.json（免费档主用）。冷却中 key：</div>
+    <pre id="tui-zen-list">(无)</pre>
+  </div>
+  <div class="card" id="tui-go-card">
+    <div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+      <b>Go 套餐（provider <code>opencode-go</code>） <span id="tui-go-badge"></span></b>
+      <button id="tui-go-rotate" onclick="rotateDomain('go')">手动轮换</button>
+    </div>
+    <div class="row" style="margin-bottom:8px"><span class="muted">当前 key：</span><b id="tui-go-cur">-</b></div>
+    <div class="muted" id="tui-go-note">Go 套餐域与网关域一样，轮换不写 auth.json（auth.json 单槽仅维护 zen 免费档）。冷却中 key：</div>
+    <pre id="tui-go-list">(无)</pre>
   </div>
   </div>
 
@@ -1411,8 +1565,8 @@ try {
   </div>
   </div>
 
-  <!-- ============ 网关与设置：网关状态主卡 + 配置子区 + 全局设置（合并区块） ============ -->
-  <div class="block" id="nav-settings" style="display:none">
+  <!-- ============ 网关：网关状态主卡 + 配置子区 + 使用方式 + 全局设置（web on/off） ============ -->
+  <div class="block" id="nav-gateway" style="display:none">
   <div class="card" id="gateway-card">
     <div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between">
       <b>网关管理 <span id="gw-badge"></span></b>
@@ -1494,15 +1648,11 @@ try {
   <div class="card">
     <b>设置</b>
     <div class="row" style="margin-top:10px">
-      <span style="flex:1">全局冷却窗口：<b id="set-cooldown">-</b> 分钟</span>
-      <button onclick="editGlobalWindow()">编辑</button>
-    </div>
-    <div class="row" style="margin-top:10px">
       <span style="flex:1">Web 自动启动：<b id="set-autoweb">-</b></span>
       <button id="web-on-btn" onclick="webOn()">开启</button>
       <button id="web-off-btn" class="danger" onclick="webOff()">关闭</button>
     </div>
-    <div class="muted" style="margin-top:8px">套餐切换与网关 token 见上方网关卡片；每 key 独立冷却窗口在 Key 表格内联。</div>
+    <div class="muted" style="margin-top:8px">全局冷却窗口/每 key 独立窗口见 <a href="javascript:void(0)" onclick="switchNav('tui')" style="color:#60a5fa">TUI</a> 与 Key 表格；套餐切换与网关 token 见上方网关卡片。</div>
   </div>
   </div>
 </div>
@@ -1530,14 +1680,30 @@ async function refresh() {
     const el = document.getElementById("s-current")
     el.textContent = st.current || "(none)"
     el.title = st.current || "(none)"
+    const eg = document.getElementById("s-current-go")
+    eg.textContent = st.current_go || "(none)"
+    eg.title = st.current_go || "(none)"
     document.getElementById("s-avail").textContent = st.availableCount + "/" + st.keyCount
     document.getElementById("s-total").textContent = "total " + st.keyCount
     document.getElementById("s-cooldown").textContent = st.cooldown_minutes
     document.getElementById("s-autoweb").textContent = st.auto_web ? "开启" : "关闭"
-    document.getElementById("set-cooldown").textContent = st.cooldown_minutes
-    document.getElementById("set-autoweb").textContent = st.auto_web ? "开启" : "关闭"
+    const sec = document.getElementById("set-autoweb"); if (sec) sec.textContent = st.auto_web ? "开启" : "关闭"
     document.getElementById("web-off-btn").disabled = !st.auto_web
     document.getElementById("web-on-btn").disabled = st.auto_web
+    /* TUI 子区块：zen/go 各自当前 key + 冷却列表 + 运行徽标 */
+    const setCur = (id, cur) => { const x = document.getElementById(id); x.textContent = cur || "(none)" }
+    setCur("tui-zen-cur", st.current)
+    setCur("tui-go-cur", st.current_go)
+    const zenBadge = document.getElementById("tui-zen-badge")
+    zenBadge.innerHTML = st.current ? '<span class="badge b-running">运行中</span>' : '<span class="badge b-stopped">未设置</span>'
+    const goBadge = document.getElementById("tui-go-badge")
+    goBadge.innerHTML = st.current_go ? '<span class="badge b-running">运行中</span>' : '<span class="badge b-stopped">未设置</span>'
+    const coolList = (field) => st.keys
+      .filter(k => k[field] && Date.parse(k[field]) > Date.now())
+      .map(k => k.name + " (剩余 " + Math.ceil((Date.parse(k[field]) - Date.now()) / 60000) + "min)")
+      .join(", ") || "(无冷却中 key)"
+    document.getElementById("tui-zen-list").textContent = coolList("cooldown_until")
+    document.getElementById("tui-go-list").textContent = coolList("cooldown_until_go")
     /* IA B3：空状态横幅（0 key 引导 / 概览折叠为一行健康，健康文案按可用 key 数动态判定 P2-2） */
     document.getElementById("keys-empty").style.display = st.keys.length ? "none" : "block"
     document.getElementById("ov-hint-full").style.display = st.keys.length ? "none" : "inline"
@@ -1550,17 +1716,18 @@ async function refresh() {
     } else {
       hintEl.style.display = "none"
     }
-    /* P2-3：表格增量守卫——keys 列表（含健康/冷却/双域当前状态）无变化时跳过 5s 全量重建，
-       避免打断表格 hover/滚动等交互；状态卡字段已在上面无条件更新 */
+    /* P2-3：表格增量守卫——三域字段（健康/冷却/当前/探测时间）无变化时跳过 5s 全量重建 */
     const sig = JSON.stringify(st.keys.map(k =>
-      [k.name, k.state, k.cooldown_until, k.cooldown_until_gateway, k.isCurrent, k.isCurrentGateway, health[k.name]?.status ?? "", k.masked]))
+      [k.name, k.state, k.cooldown_until, k.cooldown_until_go, k.cooldown_until_gateway,
+       k.last_status, k.last_status_go, k.last_checked_zen, k.last_checked_go,
+       k.isCurrent, k.isCurrentGo, k.isCurrentGateway, k.masked]))
     const tb = document.getElementById("tbody")
     if (sig !== lastKeysSig) {
       lastKeysSig = sig
       tb.innerHTML = ""
     for (const k of st.keys) {
       const tr = document.createElement("tr")
-      // 状态徽章：优先显示健康状态（余额不足/无效/限流），其次冷却/可用
+      // 状态徽章：优先显示 zen 健康状态（余额不足/无效/限流），其次冷却/可用
       const statusLabel = { ok:'可用', invalid:'key 无效', nobalance:'余额不足', limited:'限流', error:'异常' }
       const statusHint = { invalid:'该 key 无效', nobalance:'余额不足，需充值', limited:'请求被限流', error:'探测异常' }
       const tip = (status, text, hint) => { const cls = (status === "invalid" || status === "nobalance" || status === "error") ? "b-invalid" : (status === "limited" ? "b-warn" : "b-cooling"); return hint ? '<span class="badge ' + cls + ' gr-tip" title="' + esc(hint) + '">' + esc(text) + '</span>' : '<span class="badge ' + cls + '">' + esc(text) + '</span>' }
@@ -1571,31 +1738,37 @@ async function refresh() {
       } else {
         badge = k.state === "cooling" ? '<span class="badge b-cooling">冷却 ' + esc(k.remainMin) + 'min</span>' : '<span class="badge b-available">可用</span>'
       }
-      if (k.isCurrent) badge += '<span class="badge b-current">TUI 当前</span>'
+      if (k.isCurrent) badge += '<span class="badge b-current">Zen 当前</span>'
+      if (k.isCurrentGo) badge += '<span class="badge b-current">Go 当前</span>'
       if (k.isCurrentGateway) badge += '<span class="badge b-current">网关当前</span>'
-      const h = health[k.name]
-      let hcell = '<span class="muted">-</span>'
-      if (h) {
-        // 详情只作为 hover 浮窗展示，不直接内联（P1-1：h.detail 经 esc 转义，防属性注入）
-        hcell = tip(h.status, statusLabel[h.status] || h.status, h.detail)
+      /* 双套餐健康列：zen:✓/✗（last_status）+ go:✓/✗（last_status_go），title 含探测时间；- = 未探测 */
+      const healthCell = (status, checked) => {
+        if (!status || status === "ok")
+          return '<span class="badge b-available gr-tip" title="' + esc(checked ? "探测时间 " + checked : "未探测") + '">✓</span>'
+        const cls = (status === "invalid" || status === "nobalance" || status === "error") ? "b-invalid" : "b-warn"
+        return '<span class="badge ' + cls + ' gr-tip" title="' + esc((statusHint[status] || status) + (checked ? " · 探测 " + checked : "")) + '">✗ ' + esc(statusLabel[status] || status) + '</span>'
       }
       const n = esc(k.name), key = esc(k.key), masked = esc(k.masked)
-      /* 双域：TUI 使用 / 网关使用 分别写 current / current_gateway（/api/current domain 参数）；
-         冷却/清冷却（TUI 域）与网关冷却/网关清冷却（domain=gateway）域独立 */
-      const tuiCooling = k.state === "cooling"
+      const zenCooling = k.state === "cooling"
+      const goCooling = !!(k.cooldown_until_go && Date.parse(k.cooldown_until_go) > Date.now())
       tr.innerHTML =
         '<td class="td-name" title="' + n + '">' + n + '</td>' +
         '<td class="muted" title="' + key + '">' + masked + '</td>' +
         '<td>' + badge + '</td>' +
-        '<td>' + hcell + '</td>' +
+        '<td>' + healthCell(k.last_status, k.last_checked_zen) + '</td>' +
+        '<td>' + healthCell(k.last_status_go, k.last_checked_go) + '</td>' +
         '<td><div class="actions">' +
-          (k.isCurrent ? '' : '<button data-set="' + n + '">TUI 使用</button>') +
-          (k.isCurrentGateway ? '' : '<button data-set-gw="' + n + '">网关使用</button>') +
-          (tuiCooling
-            ? '<button data-cooldown="' + n + '" data-min="0">TUI 清冷却</button>'
-            : '<button data-cooldown="' + n + '" data-min="' + esc(st.cooldown_minutes) + '">TUI 冷却</button>') +
-          '<button data-cooldown-gw="' + n + '" data-min="0" title="清除网关域冷却">网清冷却</button>' +
-          '<button data-cooldown-gw="' + n + '" data-min="' + esc(st.cooldown_minutes) + '" title="网关域冷却（共享窗口分钟）">网冷却</button>' +
+          '<button data-check="' + n + '" title="探测该 key 双套餐健康（consumes ~1 token/端点）">检查</button>' +
+          (k.isCurrent ? '' : '<button data-set="' + n + '" title="设为 zen 免费档当前（同步 auth.json）">Zen 使用</button>') +
+          (k.isCurrentGo ? '' : '<button data-set-go="' + n + '" title="设为 go 套餐当前（不写 auth.json）">Go 使用</button>') +
+          (k.isCurrentGateway ? '' : '<button data-set-gw="' + n + '" title="设为网关当前（不写 auth.json）">网关使用</button>') +
+          (zenCooling
+            ? '<button data-cooldown="' + n + '" data-min="0">Zen 清冷却</button>'
+            : '<button data-cooldown="' + n + '" data-min="' + esc(st.cooldown_minutes) + '">Zen 冷却</button>') +
+          (goCooling
+            ? '<button data-cooldown-go="' + n + '" data-min="0">Go 清冷却</button>'
+            : '<button data-cooldown-go="' + n + '" data-min="' + esc(st.cooldown_minutes) + '">Go 冷却</button>') +
+          '<button data-cooldown-gw="' + n + '" data-min="0" title="清除网关域冷却">网关清冷却</button>' +
           '<button data-window="' + n + '" title="设置该 key 独立冷却窗口（分钟，留空清除回退全局）">窗口</button>' +
           (k.cooldown_minutes ? '<button data-window-clear="' + n + '" title="清除独立窗口，回退全局">清窗</button>' : '') +
           '<button data-edit="' + n + '" title="编辑名称 / key 值">编辑</button>' +
@@ -1603,9 +1776,12 @@ async function refresh() {
         '</div></td>'
       tb.appendChild(tr)
       }
+      tb.querySelectorAll("[data-check]").forEach(b => b.onclick = () => { b.classList.add("loading"); doOp(() => api("/api/keys/check", { name: b.dataset.check, domain: "all" })) })
       tb.querySelectorAll("[data-set]").forEach(b => b.onclick = () => doOp(() => api("/api/current", { name: b.dataset.set })))
+      tb.querySelectorAll("[data-set-go]").forEach(b => b.onclick = () => doOp(() => api("/api/current", { name: b.dataset.setGo, domain: "go" })))
       tb.querySelectorAll("[data-set-gw]").forEach(b => b.onclick = () => doOp(() => api("/api/current", { name: b.dataset.setGw, domain: "gateway" })))
       tb.querySelectorAll("[data-cooldown]").forEach(b => b.onclick = () => doOp(() => api("/api/cooldown", { name: b.dataset.cooldown, minutes: Number(b.dataset.min) })))
+      tb.querySelectorAll("[data-cooldown-go]").forEach(b => b.onclick = () => doOp(() => api("/api/cooldown", { name: b.dataset.cooldownGo, minutes: Number(b.dataset.min), domain: "go" })))
       tb.querySelectorAll("[data-cooldown-gw]").forEach(b => b.onclick = () => doOp(() => api("/api/cooldown", { name: b.dataset.cooldownGw, minutes: Number(b.dataset.min), domain: "gateway" })))
       tb.querySelectorAll("[data-window]").forEach(b => b.onclick = () => editKeyWindow(b.dataset.window))
       tb.querySelectorAll("[data-window-clear]").forEach(b => b.onclick = () => doOp(() => api("/api/cooldown/window", { name: b.dataset.windowClear, minutes: null })))
@@ -1649,7 +1825,10 @@ async function addKey() {
     refresh()
   } catch (e) { showErr(e.message) }
 }
-async function rotate() { try { await api("/api/rotate", {}); refresh() } catch (e) { showErr(e.message) } }
+async function rotateDomain(domain) {
+  try { await api("/api/rotate", { domain }); refresh() }
+  catch (e) { showErr(e.message) }
+}
 async function webOff() {
   if (!confirm("确认关闭 Web？关闭后本页面立即停止，且 opencode 启动时不再自动起 Web（轮换功能不受影响）。")) return
   try {
@@ -1671,10 +1850,10 @@ async function checkKeys() {
   const hint = document.getElementById("check-hint")
   hint.textContent = "检测中…"
   try {
-    // 探测会真实消耗配额（~1 token/key）：显式 POST（api 带 body 即 POST），避免 GET 意外触发
-    const j = await api("/api/keys/check", {})
+    // 探测会真实消耗配额（~1 token/端点/key）：显式 POST + domain:"all" 双端点（api 带 body 即 POST）
+    const j = await api("/api/keys/check", { domain: "all" })
     health = j.results || {}
-    hint.textContent = "检测完成（每次消耗约 1 token）"
+    hint.textContent = "检测完成（每次消耗约 1 token/端点）"
     refresh()
   } catch (e) { hint.textContent = ""; showErr(e.message) }
 }
@@ -2130,7 +2309,9 @@ export {
   updateKey,
   removeKey,
   setCurrent,
+  setGoCurrent,
   setCooldown,
+  setGoCooldown,
   setGatewayCurrent,
   setGatewayCooldown,
   setCooldownWindow,
@@ -2148,4 +2329,10 @@ export {
   gatewayPlansPayload,
   GATEWAY_PLANS,
   handleWeb,
+  /* 三域模型（2026-08-17 新增导出，供单测断言） */
+  isGoProvider,
+  isZenProvider,
+  domainCurrent,
+  probeKey,
+  checkAllKeys,
 }

@@ -1351,10 +1351,24 @@ t("version === '1.1.0'（契约 5.3 GATEWAY_VERSION，空/损坏 cfg 亦恒定�
 
 group("gatewayConfigSummary（/api/gateway/config 摘要不泄漏 key）")
 
-t("keys 仅含 name/cooldown_until 两键（无 key 明文字段）", () => {
+t("keys 仅含 name/cooldown_until_gateway 两键（无 key 明文字段）", () => {
   const c = gw.gatewayConfigSummary(_statusCfg)
   assert.equal(c.keys.length, 2)
-  for (const k of c.keys) assert.deepEqual(Object.keys(k).sort(), ["cooldown_until", "name"])
+  for (const k of c.keys) assert.deepEqual(Object.keys(k).sort(), ["cooldown_until_gateway", "name"])
+})
+t("keys cooldown_until_gateway 取网关域字段（与 current 域一致）", () => {
+  const c = gw.gatewayConfigSummary({
+    current: "a", current_gateway: "b",
+    cooldown_minutes: 30,
+    keys: [
+      { name: "a", key: "1", cooldown_until: "2026-01-01T00:00:00.000Z", cooldown_until_gateway: "2026-09-01T00:00:00.000Z" },
+      { name: "b", key: "2" },
+    ],
+  })
+  assert.equal(c.current, "b")
+  assert.equal(c.keys[0].cooldown_until_gateway, "2026-09-01T00:00:00.000Z")
+  assert.ok(!("cooldown_until" in c.keys[0]))
+  assert.equal(c.keys[1].cooldown_until_gateway, null)
 })
 
 t("序列化后不含 key 明文（sk- 前缀与 key 字段绝不出现）", () => {
