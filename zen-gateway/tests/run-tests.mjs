@@ -243,7 +243,32 @@ t("动态表优先于别名（上游真有 gpt-4o 时返回原样）", () => {
 t("重置动态表后恢复默认行为", () => {
   gw.__setDynamicModels([])
   assert.equal(gw.mapModel("my-fake-model"), "hy3")
+})
+t("zen 档：付费别名回退套餐默认（gpt-4o-mini → hy3-free，不发出付费模型）", async () => {
+  const cfgPath = "/tmp/zen-gateway-unittest-gwcfg-zen.json"
+  writeFileSync(cfgPath, JSON.stringify({ plan: "zen", token: "a".repeat(64) }))
+  const savedCfg = process.env.ZEN_GATEWAY_CONFIG
+  const savedDefault = process.env.ZEN_DEFAULT_MODEL
+  process.env.ZEN_GATEWAY_CONFIG = cfgPath
+  delete process.env.ZEN_DEFAULT_MODEL
+  try {
+    const zen = await import("../gateway.mjs?plan-zen-map=" + Date.now())
+    assert.equal(zen.mapModel("gpt-4o-mini"), "hy3-free")          // 付费别名 → 回退默认
+    assert.equal(zen.mapModel("gpt-4o"), "hy3-free")               // 付费别名 → 回退默认
+    assert.equal(zen.mapModel("grok-code"), "hy3-free")            // hy3 付费 → 回退默认
+    assert.equal(zen.mapModel("hy3-free"), "hy3-free")             // free 内置原样
+    assert.equal(zen.mapModel("deepseek-v4-flash-free"), "deepseek-v4-flash-free")
+    assert.equal(zen.mapModel("unknown-xyz"), "hy3-free")          // 未知名默认
+  } finally {
+    process.env.ZEN_GATEWAY_CONFIG = savedCfg
+    if (savedDefault === undefined) delete process.env.ZEN_DEFAULT_MODEL
+    else process.env.ZEN_DEFAULT_MODEL = savedDefault
+  }
+})
+t("go 档：付费别名不受影响（gpt-4o-mini → deepseek-v4-flash 仍在内置表）", () => {
+  assert.equal(gw.mapModel("gpt-4o-mini"), "deepseek-v4-flash")
   assert.equal(gw.mapModel("gpt-4o"), "glm-5.2")
+  assert.equal(gw.mapModel("grok-code"), "hy3")
 })
 
 /* ================= 4. anthropicToOpenAI ================= */

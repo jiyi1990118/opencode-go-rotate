@@ -597,7 +597,12 @@ function mapModel(requested) {
   const r = String(requested).toLowerCase()
   if (ZEN_MODELS_DYNAMIC.includes(r)) return r               // 动态表（上游最新）
   if (ACTIVE_PLAN.builtinModels.includes(r)) return r        // 内置真实模型（当前套餐）
-  if (MODEL_ALIAASES[r]) return MODEL_ALIAASES[r]            // 已知别名
+  const alias = MODEL_ALIAASES[r]
+  if (alias) {
+    // 别名目标必须属于当前套餐内置表；否则（如 zen 免费档命中付费别名）回退套餐默认
+    if (ACTIVE_PLAN.builtinModels.includes(alias)) return alias
+    return ACTIVE_PLAN.defaultModel
+  }
   return ACTIVE_PLAN.defaultModel                             // 未知名 → 默认
 }
 
