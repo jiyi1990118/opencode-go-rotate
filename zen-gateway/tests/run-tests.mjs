@@ -23,6 +23,7 @@ process.env.ZEN_TEST = "1" // 跳过 listen（网关不启动）
 process.env.ZEN_DEFAULT_MODEL = "hy3" // 固定默认模型（mapModel 断言依赖）
 process.env.ZEN_NOTIFY = "0" // 不弹系统通知
 process.env.ZEN_CONFIG = "/tmp/zen-gateway-unittest-go-keys.json" // 防御：指向临时配置
+process.env.ZEN_LOG_FILE = "/tmp/zen-gateway-unittest.log" // 防御：日志落临时文件（绝不污染真实 /tmp/opencode-go-rotate.log）
 process.env.ZEN_USAGE_FILE = "/tmp/zen-gateway-unittest-usage.jsonl"
 process.env.ZEN_GATEWAY_CONFIG = "/tmp/zen-gateway-unittest-gateway-config.json" // 防御：网关配置指向临时（绝不读真实 ~/.local/share/zen-gateway/）
 delete process.env.ZEN_GATEWAY_HOST // 默认 127.0.0.1，避免 S6 拒绝启动

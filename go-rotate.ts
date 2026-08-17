@@ -42,7 +42,7 @@ import { randomBytes } from "node:crypto"
 const DATA_DIR = path.join(homedir(), ".config", "opencode")
 const CONFIG_FILE = process.env.GOROTATE_CONFIG_FILE ?? path.join(DATA_DIR, "go-keys.json")
 const AUTH_FILE = process.env.GOROTATE_AUTH_FILE ?? path.join(homedir(), ".local", "share", "opencode", "auth.json")
-const LOG_FILE = "/tmp/opencode-go-rotate.log"
+const LOG_FILE = process.env.GOROTATE_LOG_FILE || "/tmp/opencode-go-rotate.log"
 const LOCK_FILE = CONFIG_FILE + ".lock"
 // 固定端口用于保证"全系统只启动一个 web"（tui-control 占用 7792-7811，故避开）
 // GOROTATE_WEB_PORT 仅供测试/隔离实例覆盖端口；非法值回退默认 8899（生产不设行为不变）
@@ -555,12 +555,26 @@ function gatewayManage(action: "start" | "stop" | "restart"): { ok: boolean; out
 }
 
 /** 网关日志（只读）：优先 gateway 新端点 /api/gateway/log（并行团队已加则直接用），
- * 未就绪回退 zen-gateway logs 300（bash 脚本只读命令）。失败容错，不抛异常。 */
-async function gatewayLog(): Promise<{ ok: boolean; text: string; source: string }> {
+ * 未就绪回退 zen-gateway logs 300（bash 脚本只读命令）。失败容错，不抛异常。
+ * gateway 端点返回 {lines:string[], total}：解析后把 lines join 成纯文本 text（前端直接可读），
+ * 同时透传 lines/total 供前端逐行渲染；回退脚本路径 text 本身即纯文本。 */
+async function gatewayLog(): Promise<{ ok: boolean; text: string; source: string; lines?: string[]; total?: number }> {
   try {
     const r = await fetch(GATEWAY_BASE + "/api/gateway/log", { signal: AbortSignal.timeout(2000) })
     if (r.ok) {
-      const text = await r.text()
+      const j: any = await r.json().catch(() => null)
+      if (j && Array.isArray(j.lines)) {
+        const lines = j.lines.map((l: any) => String(l ?? ""))
+        return {
+          ok: true,
+          text: lines.join("\n"),
+          lines,
+          total: typeof j.total === "number" ? j.total : lines.length,
+          source: "gateway",
+        }
+      }
+      // 旧网关/非 {lines,total} 形态：原样纯文本返回（兼容）
+      const text = await r.text().catch(() => "")
       if (text && text.length > 0) return { ok: true, text, source: "gateway" }
     }
   } catch {}
@@ -1004,6 +1018,9 @@ const WEB_HTML = `<!doctype html>
   .actions { display: flex; gap: 6px; flex-wrap: wrap; }
   .gw-config-grid { display: grid; grid-template-columns: 2fr 1fr; gap: var(--sp-4); align-items: start; }
   .log-row { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-4); align-items: start; }
+  /* P1-2 修复：grid item 允许收缩，pre 内部 overflow-x 滚动不被 min-width:auto 覆盖（防超长日志行撑爆 track） */
+  .log-row > .card, .gw-config-grid > .card { min-width: 0; }
+  .log-row pre { max-width: 100%; }
   .gr-tip { cursor: help; border-bottom: 1px dotted var(--tx-3); }
 
   /* ============ 导航 ============ */
@@ -1151,6 +1168,10 @@ const WEB_HTML = `<!doctype html>
     .stats { gap: var(--sp-4); }
     pre { max-height: 160px; }
     .table-wrap table { min-width: 720px; }
+  }
+  /* P3-4 修复：断点提到 780px 才去 .ov-strip 分隔线，消除 721-780px 区间 flex wrap 后第二行首格残留 border-left */
+  @media (max-width: 780px) {
+    .ov-strip .stat + .stat { border-left: none; padding-left: 0; }
   }
 </style>
 </head>
@@ -1354,10 +1375,10 @@ async function refresh() {
       // 状态徽章：优先显示健康状态（余额不足/无效/限流），其次冷却/可用
       const statusLabel = { ok:'可用', invalid:'key 无效', nobalance:'余额不足', limited:'限流', error:'异常' }
       const statusHint = { invalid:'该 key 无效', nobalance:'余额不足，需充值', limited:'请求被限流', error:'探测异常' }
-      const tip = (text, hint) => hint ? '<span class="badge b-cooling gr-tip" title="' + esc(hint) + '">' + esc(text) + '</span>' : '<span class="badge b-cooling">' + esc(text) + '</span>'
+      const tip = (status, text, hint) => { const cls = (status === "invalid" || status === "nobalance" || status === "error") ? "b-invalid" : (status === "limited" ? "b-warn" : "b-cooling"); return hint ? '<span class="badge ' + cls + ' gr-tip" title="' + esc(hint) + '">' + esc(text) + '</span>' : '<span class="badge ' + cls + '">' + esc(text) + '</span>' }
       let badge
       if (k.last_status && k.last_status !== "ok") {
-        badge = tip(statusLabel[k.last_status] || k.last_status, statusHint[k.last_status] || k.last_status)
+        badge = tip(k.last_status, statusLabel[k.last_status] || k.last_status, statusHint[k.last_status] || k.last_status)
         if (k.state === "cooling") badge += '<span class="badge b-cooling">冷却 ' + esc(k.remainMin) + 'min</span>'
       } else {
         badge = k.state === "cooling" ? '<span class="badge b-cooling">冷却 ' + esc(k.remainMin) + 'min</span>' : '<span class="badge b-available">可用</span>'
@@ -1367,7 +1388,7 @@ async function refresh() {
       let hcell = '<span class="muted">-</span>'
       if (h) {
         // 详情只作为 hover 浮窗展示，不直接内联（P1-1：h.detail 经 esc 转义，防属性注入）
-        hcell = tip(statusLabel[h.status] || h.status, h.detail)
+        hcell = tip(h.status, statusLabel[h.status] || h.status, h.detail)
       }
       const n = esc(k.name), key = esc(k.key), masked = esc(k.masked)
       tr.innerHTML =
@@ -1451,7 +1472,7 @@ function showErr(m) {
   toast(m, "error")
   setTimeout(() => { const e2 = document.getElementById("msg"); if (e2) { e2.textContent = ""; e2.className = "msg" } }, 3000)
 }
-function showMsg(m) { const el = document.getElementById("msg"); el.textContent = m; el.className = "msg" }
+function showMsg(m) { const el = document.getElementById("msg"); el.textContent = m; el.className = "msg"; toast(m, "success") }
 function toast(m, type) {
   const t = document.getElementById("gtoast")
   if (!t) return
@@ -1647,7 +1668,12 @@ async function refreshGwLog() {
     document.getElementById("gwlog-src").textContent =
       r.source === "gateway" ? "来源: gateway /api/gateway/log" :
       r.source === "zen-gateway logs" ? "来源: zen-gateway logs 300" : ""
-    pre.textContent = r.text || "(空)"
+    // 优先逐行渲染（gateway 端点 {lines,total} 形态）：lines 数组 join 为每行一行；
+    // 回退纯文本 text（旧网关 / zen-gateway logs 脚本路径）。textContent 赋值天然转义
+    // < > & 等字符（不解析 HTML，防 XSS / 防破坏 pre 布局）。空列表显示空状态。
+    let lines = Array.isArray(r.lines) ? r.lines.map(String) : null
+    if (!lines && typeof r.text === "string" && r.text.length > 0) lines = r.text.split("\\n")
+    pre.textContent = lines && lines.length > 0 ? lines.join("\\n") : "暂无网关日志"
     pre.style.color = r.ok ? "" : "#f87171"
   } catch (e) {
     pre.textContent = "获取失败: " + e.message

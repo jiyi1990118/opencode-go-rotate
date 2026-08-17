@@ -46,6 +46,9 @@ const AUTH_FILE = path.join(AUTH_DIR, "auth.json")
 
 process.env.GOROTATE_CONFIG_FILE = CFG_FILE
 process.env.GOROTATE_AUTH_FILE = AUTH_FILE
+// 日志隔离：GOROTATE_LOG_FILE 指向临时文件（测试进程 log() 绝不写真实共享日志，
+// 避免污染 /tmp/opencode-go-rotate.log 与 parseStatsLog 统计）
+process.env.GOROTATE_LOG_FILE = path.join(TMP_ROOT, "go-rotate-test.log")
 // 网关配置隔离：GOROTATE_GATEWAY_CONFIG 指向临时 gateway-config.json（测试写套餐/token
 // 不碰真实 ~/.local/share/zen-gateway/gateway-config.json；import 前设，模块常量固化）
 const GW_CONFIG_FILE = path.join(TMP_ROOT, "zen-gateway", "gateway-config.json")
