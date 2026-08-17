@@ -203,6 +203,17 @@ describe("saveConfig / mutateConfig", () => {
     expect(() => mod.addKey("a", "sk-dup")).toThrow()
     expect(existsSync(LOCK_FILE)).toBe(false)
   })
+  test("addKey/updateKey 强制 sk- 前缀", () => {
+    seed(twoKeys())
+    expect(() => mod.addKey("bad", "nope123")).toThrow('必须以 "sk-" 开头')
+    expect(() => mod.addKey("ok1", "sk-ok")).not.toThrow()
+    expect(() => mod.updateKey("a", { key: "not-sk" })).toThrow('必须以 "sk-" 开头')
+    expect(() => mod.updateKey("a", { key: "sk-ok" })).not.toThrow()
+    expect(() => mod.updateKey("bad", { key: "sk-ok" })).toThrow('不存在')
+    const cfg = mod.loadConfig()
+    expect(cfg.keys.find((x) => x.name === "ok1")?.key).toBe("sk-ok")
+    expect(cfg.keys.find((x) => x.name === "a")?.key).toBe("sk-ok")
+  })
   test("reconcileCurrent：current 指向不存在的 key 时回退到第一个", () => {
     seed(twoKeys())
     mod.mutateConfig((c: any) => {

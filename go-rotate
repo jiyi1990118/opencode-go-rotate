@@ -210,6 +210,8 @@ def do_next(cfg, minutes):
 def do_add(cfg, name, key):
     if any(k["name"] == name for k in cfg["keys"]):
         sys.exit(f'key "{name}" already exists')
+    if not str(key).startswith("sk-"):
+        sys.exit('key must start with "sk-" (rejected)')
     cfg["keys"].append({"name": name, "key": key, "cooldown_until": None})
     if not cfg["current"]:
         cfg["current"] = name
@@ -291,6 +293,9 @@ def do_init():
         key = input("API key (sk-...): ").strip()
         if not key:
             print("  ⚠️  未输入 key，跳过")
+            continue
+        if not str(key).startswith("sk-"):
+            print('  ⚠️  key 必须以 "sk-" 开头，已跳过')
             continue
         cfg["keys"].append({"name": name, "key": key, "cooldown_until": None})
         if not cfg["current"]:

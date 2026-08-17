@@ -398,6 +398,7 @@ function setCurrent(name: string): Config {
 function addKey(name: string, key: string): Config {
   return mutateConfig((cfg) => {
     if (cfg.keys.some((x) => x.name === name)) throw new Error(`key "${name}" 已存在`)
+    if (!key.startsWith("sk-")) throw new Error(`key 必须以 "sk-" 开头（当前值被拒绝）`)
     cfg.keys.push({ name, key, cooldown_until: null, cooldown_until_gateway: null, cooldown_until_go: null })
     log(`➕  添加 key "${name}"`)
   })
@@ -418,7 +419,10 @@ function updateKey(name: string, patch: { key?: string; name?: string }): Config
       if (wasGatewayCurrent) cfg.current_gateway = patch.name
       if (wasGoCurrent) cfg.current_go = patch.name
     }
-    if (patch.key) k.key = patch.key
+    if (patch.key) {
+      if (!patch.key.startsWith("sk-")) throw new Error(`key 必须以 "sk-" 开头（当前值被拒绝）`)
+      k.key = patch.key
+    }
     log(`✏️  更新 key "${name}"`)
   })
 }
@@ -1867,6 +1871,7 @@ async function addKey() {
   const name = document.getElementById("new-name").value.trim()
   const key = document.getElementById("new-key").value.trim()
   if (!name || !key) return showErr("名称和 key 不能为空")
+  if (!key.startsWith("sk-")) return showErr('key 必须以 "sk-" 开头')
   try {
     const r = await fetch("/api/keys/add", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, key }) })
     const j = await r.json()
@@ -1937,7 +1942,10 @@ async function editKey(name) {
   if (newKey === null) return
   const patch = {}
   if (newName.trim()) patch.name = newName.trim()
-  if (newKey.trim()) patch.key = newKey.trim()
+  if (newKey.trim()) {
+    if (!newKey.trim().startsWith("sk-")) return showErr('key 必须以 "sk-" 开头')
+    patch.key = newKey.trim()
+  }
   if (!patch.name && !patch.key) return showMsg('未修改：名称与 key 值均为空')
   try {
     await api("/api/keys/update", { name, patch })

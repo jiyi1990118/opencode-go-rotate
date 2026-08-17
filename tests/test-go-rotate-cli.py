@@ -616,6 +616,14 @@ class TestAdd(_CliCase):
             self.g.do_add(read_cfg(self.home), "act1", "sk-x")
         self.assertIn("already exists", str(cm.exception))
 
+    def test_add非sk前缀拒绝(self):
+        """add key 不以 sk- 开头 → SystemExit 拒绝（检查在探测之前，不发网络）"""
+        write_cfg(self.home, [], current="")
+        with self.assertRaises(SystemExit) as cm:
+            self.g.do_add(read_cfg(self.home), "act1", "plain-token")
+        self.assertIn('must start with "sk-"', str(cm.exception))
+        self.assertEqual(len(read_cfg(self.home)["keys"]), 0)
+
     def test_add探测在锁内执行(self):
         """源码结构：main() 中 add 经 _with_lock 包裹 → 网络探测期间持锁（设计观察，待裁决）"""
         src = open(CLI_PATH, encoding="utf-8").read()
