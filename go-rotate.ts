@@ -1016,9 +1016,10 @@ const WEB_HTML = `<!doctype html>
   .row { display: flex; gap: var(--sp-2); align-items: center; }
   .row input { flex: 1; }
   .actions { display: flex; gap: 6px; flex-wrap: wrap; }
-  .gw-config-grid { display: grid; grid-template-columns: 2fr 1fr; gap: var(--sp-4); align-items: start; }
-  .log-row { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-4); align-items: start; }
-  /* P1-2 修复：grid item 允许收缩，pre 内部 overflow-x 滚动不被 min-width:auto 覆盖（防超长日志行撑爆 track） */
+  /* 单列堆叠：网关配置两块与日志双卡纵向排列，避免并排时内容宽度不足导致布局错乱 */
+  .gw-config-grid { display: grid; grid-template-columns: 1fr; gap: var(--sp-4); align-items: start; }
+  .log-row { display: grid; grid-template-columns: 1fr; gap: var(--sp-4); align-items: start; }
+  /* 单列下 pre 不再受 grid 双列挤压，仍保留 max-width 兜底（超长行 overflow-x 滚动，不撑爆容器） */
   .log-row > .card, .gw-config-grid > .card { min-width: 0; }
   .log-row pre { max-width: 100%; }
   .gr-tip { cursor: help; border-bottom: 1px dotted var(--tx-3); }
@@ -1044,11 +1045,16 @@ const WEB_HTML = `<!doctype html>
   /* ============ 状态面板 ============ */
   .stats { display: flex; gap: var(--sp-6); flex-wrap: wrap; }
   .stat .v { font-size: 24px; font-weight: 600; line-height: 1.2;
-             font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+             font-variant-numeric: tabular-nums; letter-spacing: -.01em;
+             overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+             max-width: 100%; }
   .stat .l { font-size: 12px; color: var(--tx-2); margin-top: 2px; }
-  .ov-strip .stat { flex: 1 1 0; min-width: 110px; }
+  .ov-strip .stat { flex: 1 1 0; min-width: 0; }
   .ov-strip .stat + .stat { border-left: 1px solid var(--bd-1); padding-left: var(--sp-6); }
   #s-current { color: var(--link); }
+  /* key 名称截断：概览当前 key / Key 表格名称列，超长省略号 + title 悬浮全名 */
+  .td-name { max-width: 260px; overflow: hidden; text-overflow: ellipsis;
+             white-space: nowrap; word-break: keep-all; }
 
   /* ============ 按钮 ============ */
   button { font: inherit; display: inline-flex; align-items: center; justify-content: center;
@@ -1355,7 +1361,9 @@ function esc(s) {
 async function refresh() {
   try {
     const st = await api("/api/status")
-    document.getElementById("s-current").textContent = st.current || "(none)"
+    const el = document.getElementById("s-current")
+    el.textContent = st.current || "(none)"
+    el.title = st.current || "(none)"
     document.getElementById("s-avail").textContent = st.availableCount + "/" + st.keyCount
     document.getElementById("s-total").textContent = "total " + st.keyCount
     document.getElementById("s-cooldown").textContent = st.cooldown_minutes
@@ -1392,7 +1400,7 @@ async function refresh() {
       }
       const n = esc(k.name), key = esc(k.key), masked = esc(k.masked)
       tr.innerHTML =
-        '<td>' + n + '</td>' +
+        '<td class="td-name" title="' + n + '">' + n + '</td>' +
         '<td class="muted" title="' + key + '">' + masked + '</td>' +
         '<td>' + badge + '</td>' +
         '<td>' + hcell + '</td>' +
@@ -1542,7 +1550,7 @@ async function refreshStats() {
       const k = st.byKey[name]
       const tr = document.createElement("tr")
       /* P1-1：name 为 key 名（用户可控），拼 innerHTML 前转义 */
-      tr.innerHTML = '<td>' + esc(name) + '</td><td>' + esc(k.rotations) + '</td><td>' + esc(k.coolings) +
+      tr.innerHTML = '<td class="td-name" title="' + esc(name) + '">' + esc(name) + '</td><td>' + esc(k.rotations) + '</td><td>' + esc(k.coolings) +
         '</td><td class="muted">' + (k.lastRotate ? new Date(k.lastRotate).toLocaleString() : '-') + '</td>'
       tb.appendChild(tr)
     })
