@@ -984,6 +984,26 @@ try {
     --warning-soft: rgba(251,191,36,.12);
     --danger-soft: rgba(248,113,113,.12);
     --info-soft: rgba(96,165,250,.12);
+    /* 按钮语义色（双主题，随 :root / html[data-theme="light"] 联动） */
+    /* 中性 */
+    --btn-bg: #181d26;  --btn-bd: #2c3442;  --btn-fg: #e8eaed;
+    --btn-bg-hover: #202636;  --btn-bd-hover: #3a4354;  --btn-fg-hover: #e8eaed;
+    /* primary：品牌蓝底白字，hover 深一档 */
+    --btn-primary-bg: #3b82f6;  --btn-primary-bd: #3b82f6;  --btn-primary-fg: #ffffff;
+    --btn-primary-hover-bg: #2563eb;  --btn-primary-hover-bd: #2563eb;  --btn-primary-hover-fg: #ffffff;
+    /* danger：红 soft 底 + 亮红字，hover 提亮 */
+    --btn-danger-bg: rgba(248,113,113,.12);  --btn-danger-bd: rgba(248,113,113,.28);  --btn-danger-fg: #fca5a5;
+    --btn-danger-hover-bg: rgba(248,113,113,.22);  --btn-danger-hover-bd: rgba(248,113,113,.45);  --btn-danger-hover-fg: #fecaca;
+    /* success：绿 soft 底 + 亮绿字（预留，供将来 success 按钮使用） */
+    --btn-success-bg: rgba(74,222,128,.12);  --btn-success-bd: rgba(74,222,128,.28);  --btn-success-fg: #4ade80;
+    --btn-success-hover-bg: rgba(74,222,128,.22);  --btn-success-hover-bd: rgba(74,222,128,.45);  --btn-success-hover-fg: #86efac;
+    /* ghost：透明底灰字，hover 浅灰底 */
+    --btn-ghost-fg: #9aa3ad;  --btn-ghost-hover-bg: #181d26;  --btn-ghost-hover-fg: #e8eaed;
+    /* 加载 spinner（按语义色区分边框 + 顶边） */
+    --btn-spin: rgba(232,234,237,.30);  --btn-spin-top: #e8eaed;
+    --btn-primary-spin: rgba(255,255,255,.35);  --btn-primary-spin-top: #ffffff;
+    --btn-danger-spin: rgba(252,165,165,.35);  --btn-danger-spin-top: #fca5a5;
+    --btn-success-spin: rgba(74,222,128,.35);  --btn-success-spin-top: #4ade80;
     /* 运行日志前景（深色下偏绿，浅色下深绿） */
     --log: #9ceba8;
     /* 字体 */
@@ -1014,6 +1034,20 @@ try {
     --warning-soft: rgba(202,138,4,.12);
     --danger-soft: rgba(220,38,38,.08);
     --info-soft: rgba(37,99,235,.10);
+    /* 按钮语义色（浅色覆盖：中性白底灰框深字；primary 深蓝底白字；danger 浅红底深红字） */
+    --btn-bg: #ffffff;  --btn-bd: #c2c9d2;  --btn-fg: #16181c;
+    --btn-bg-hover: #f1f4f7;  --btn-bd-hover: #a6afba;  --btn-fg-hover: #16181c;
+    --btn-primary-bg: #2563eb;  --btn-primary-bd: #2563eb;  --btn-primary-fg: #ffffff;
+    --btn-primary-hover-bg: #1d4ed8;  --btn-primary-hover-bd: #1d4ed8;  --btn-primary-hover-fg: #ffffff;
+    --btn-danger-bg: #fdecec;  --btn-danger-bd: #f3c1c1;  --btn-danger-fg: #b91c1c;
+    --btn-danger-hover-bg: #f9dddd;  --btn-danger-hover-bd: #ec9c9c;  --btn-danger-hover-fg: #991b1b;
+    --btn-success-bg: #e7f6ec;  --btn-success-bd: #b9e4cb;  --btn-success-fg: #15803d;
+    --btn-success-hover-bg: #d7efe0;  --btn-success-hover-bd: #93d7ae;  --btn-success-hover-fg: #166534;
+    --btn-ghost-fg: #525c68;  --btn-ghost-hover-bg: #eef1f4;  --btn-ghost-hover-fg: #16181c;
+    --btn-spin: rgba(22,24,28,.20);  --btn-spin-top: #16181c;
+    --btn-primary-spin: rgba(255,255,255,.35);  --btn-primary-spin-top: #ffffff;
+    --btn-danger-spin: rgba(185,28,28,.25);  --btn-danger-spin-top: #b91c1c;
+    --btn-success-spin: rgba(21,128,61,.25);  --btn-success-spin-top: #15803d;
     --log: #1a7f37;
     --shadow-sm: 0 1px 2px rgba(16,24,40,.08);
     --shadow-md: 0 4px 12px rgba(16,24,40,.10), 0 1px 2px rgba(16,24,40,.06);
@@ -1074,8 +1108,8 @@ try {
              background: transparent; border-color: transparent; color: var(--tx-2);
              font-size: 13px; font-weight: 500; }
   .nav-btn:hover { background: var(--bg-2); color: var(--tx-1); }
-  .nav-btn.active { background: var(--brand); border-color: var(--brand); color: #fff; }
-  .nav-btn.active:hover { background: var(--brand-strong); }
+  .nav-btn.active { background: var(--btn-primary-bg); border-color: var(--btn-primary-bd); color: var(--btn-primary-fg); }
+  .nav-btn.active:hover { background: var(--btn-primary-hover-bg); border-color: var(--btn-primary-hover-bd); color: var(--btn-primary-hover-fg); }
 
   /* ============ 卡片 ============ */
   .card { background: var(--bg-1); border: 1px solid var(--bd-1); border-radius: var(--r-md);
@@ -1106,27 +1140,31 @@ try {
   /* ============ 按钮 ============ */
   button { font: inherit; display: inline-flex; align-items: center; justify-content: center;
            gap: 6px; height: 30px; padding: 0 12px; border-radius: var(--r-sm);
-           border: 1px solid var(--bd-2); background: var(--bg-2); color: var(--tx-1);
+           border: 1px solid var(--btn-bd); background: var(--btn-bg); color: var(--btn-fg);
            cursor: pointer; font-size: 13px; font-weight: 500; white-space: nowrap;
            transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease),
                        color var(--dur) var(--ease), transform var(--dur) var(--ease),
                        box-shadow var(--dur) var(--ease); }
-  button:hover { background: var(--bg-3); border-color: var(--bd-3); }
+  button:hover { background: var(--btn-bg-hover); border-color: var(--btn-bd-hover); color: var(--btn-fg-hover); }
   button:active { transform: translateY(.5px); }
   button:focus-visible { outline: none; box-shadow: var(--ring); }
   button:disabled, button[disabled] { opacity: .45; cursor: not-allowed; pointer-events: none; }
-  button.primary { background: var(--brand); border-color: var(--brand); color: #fff; }
-  button.primary:hover { background: var(--brand-strong); border-color: var(--brand-strong); }
-  button.danger { background: var(--danger-soft); border-color: rgba(127,29,29,.9); color: #fca5a5; }
-  button.danger:hover { background: rgba(248,113,113,.22); border-color: #7f1d1d; }
-  button.ghost { background: transparent; border-color: transparent; color: var(--tx-2); }
-  button.ghost:hover { background: var(--bg-2); color: var(--tx-1); }
+  button.primary { background: var(--btn-primary-bg); border-color: var(--btn-primary-bd); color: var(--btn-primary-fg); }
+  button.primary:hover { background: var(--btn-primary-hover-bg); border-color: var(--btn-primary-hover-bd); color: var(--btn-primary-hover-fg); }
+  button.danger { background: var(--btn-danger-bg); border-color: var(--btn-danger-bd); color: var(--btn-danger-fg); }
+  button.danger:hover { background: var(--btn-danger-hover-bg); border-color: var(--btn-danger-hover-bd); color: var(--btn-danger-hover-fg); }
+  button.success { background: var(--btn-success-bg); border-color: var(--btn-success-bd); color: var(--btn-success-fg); }
+  button.success:hover { background: var(--btn-success-hover-bg); border-color: var(--btn-success-hover-bd); color: var(--btn-success-hover-fg); }
+  button.ghost { background: transparent; border-color: transparent; color: var(--btn-ghost-fg); }
+  button.ghost:hover { background: var(--btn-ghost-hover-bg); color: var(--btn-ghost-hover-fg); }
   button.sm, .actions button { height: 26px; padding: 0 8px; font-size: 12px; border-radius: 5px; }
   button.loading { pointer-events: none; opacity: .75; }
   button.loading::before { content: ""; width: 12px; height: 12px;
-                           border: 2px solid rgba(255,255,255,.35); border-top-color: #fff;
+                           border: 2px solid var(--btn-spin); border-top-color: var(--btn-spin-top);
                            border-radius: 50%; animation: spin .6s linear infinite; flex: none; }
-  button.danger.loading::before { border-color: rgba(252,165,165,.35); border-top-color: #fca5a5; }
+  button.primary.loading::before { border-color: var(--btn-primary-spin); border-top-color: var(--btn-primary-spin-top); }
+  button.danger.loading::before { border-color: var(--btn-danger-spin); border-top-color: var(--btn-danger-spin-top); }
+  button.success.loading::before { border-color: var(--btn-success-spin); border-top-color: var(--btn-success-spin-top); }
   @keyframes spin { to { transform: rotate(360deg); } }
 
   /* ============ 徽标 / 状态点 ============ */
@@ -1373,6 +1411,34 @@ try {
     <div class="muted" style="margin-top:6px">其它 agent 连网关时用此 token（curl -H "Authorization: Bearer &lt;token&gt;"）。生成/编辑后可直接「复制」。</div>
     <div id="token-msg" class="msg" style="margin-top:6px"></div>
   </div>
+  </div>
+
+  <div class="card" id="gw-usage-card">
+    <b>使用方式</b>
+    <div class="row" style="margin-top:10px">
+      <span class="muted" style="flex:1">本地网关地址（OpenAI / Anthropic / Responses 三协议，默认仅 127.0.0.1 监听）：</span>
+      <code class="mono">127.0.0.1:18888</code>
+    </div>
+    <div class="muted" style="margin-top:6px">
+      鉴权默认关闭；若设了 <code>ZEN_GATEWAY_TOKEN</code>，请求需带 <code>Authorization: Bearer &lt;ZEN_GATEWAY_TOKEN&gt;</code>。测前先 <code>curl http://127.0.0.1:18888/healthz</code> 确认网关在跑。
+    </div>
+    <details open style="margin-top:10px">
+      <summary>curl 直连（OpenAI Chat Completions）</summary>
+      <pre style="margin-top:8px"><code id="usage-curl-text"></code></pre>
+      <div style="margin-top:6px" class="actions"><button onclick="copyUsage('curl')">复制</button></div>
+    </details>
+    <details style="margin-top:6px">
+      <summary>codex CLI（Responses）—— ~/.codex/config.toml</summary>
+      <pre style="margin-top:8px"><code id="usage-codex-text"></code></pre>
+      <div class="muted" style="margin-top:6px">坑：顶层 <code>web_search = "disabled"</code> 必须保留，否则 codex 会发 web_search 工具触发网关 400。</div>
+      <div style="margin-top:6px" class="actions"><button onclick="copyUsage('codex')">复制</button></div>
+    </details>
+    <details style="margin-top:6px">
+      <summary>claude code（Anthropic Messages）—— ~/.claude/settings.json env 块</summary>
+      <pre style="margin-top:8px"><code id="usage-claude-text"></code></pre>
+      <div class="muted" style="margin-top:6px">坑：只要 <code>ANTHROPIC_AUTH_TOKEN</code> 存在，claude code 就忽略 <code>ANTHROPIC_BASE_URL</code> 直连上游——切网关前必须移除。</div>
+      <div style="margin-top:6px" class="actions"><button onclick="copyUsage('claude')">复制</button></div>
+    </details>
   </div>
 
   <div class="card">
@@ -1898,6 +1964,43 @@ function toggleTokenMask() {
   }
 }
 
+/* ---- 使用方式卡：示例配置常量 + 一键复制（XSS 安全：纯静态常量 + textContent 填充，无用户可控数据） ---- */
+var USAGE_TEXT = {
+  curl: "curl http://127.0.0.1:18888/v1/chat/completions -H \\"Content-Type: application/json\\" -H \\"Authorization: Bearer <ZEN_GATEWAY_TOKEN>\\" -d '{\\"model\\":\\"hy3\\",\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"你好\\"}]}'",
+  codex: "model_provider = \\"zen\\"\\nmodel = \\"hy3\\"\\nweb_search = \\"disabled\\"  # 必须！否则 codex 会发 web_search 工具触发网关 400\\n\\n[model_providers.zen]\\nname = \\"zen-gateway\\"\\nbase_url = \\"http://127.0.0.1:18888/v1\\"  # 以 /v1 结尾、无尾斜杠\\nenv_key = \\"ZEN_GATEWAY_TOKEN\\"  # 网关未设 token 时不配\\nwire_api = \\"responses\\"",
+  claude: "{\\n  \\"env\\": {\\n    \\"ANTHROPIC_BASE_URL\\": \\"http://127.0.0.1:18888\\",\\n    \\"ANTHROPIC_AUTH_TOKEN\\": \\"<ZEN_GATEWAY_TOKEN>\\",\\n    \\"ANTHROPIC_DEFAULT_SONNET_MODEL\\": \\"hy3\\"\\n  }\\n}"
+}
+function hydrateUsage() {
+  for (const k in USAGE_TEXT) {
+    const el = document.getElementById("usage-" + k + "-text")
+    if (el) el.textContent = USAGE_TEXT[k]
+  }
+}
+/* onClick 入口：复制静态示例（常量为唯一数据源，绝不拼接用户输入） */
+function copyUsage(k) {
+  if (!USAGE_TEXT[k]) return
+  const label = k === "curl" ? "curl 示例" : k === "codex" ? "codex 配置" : "claude 配置"
+  copyText(USAGE_TEXT[k], "已复制 " + label)
+}
+/* 通用复制：navigator.clipboard 优先，权限被拒降级 execCommand，成功/失败均 toast */
+async function copyText(txt, okMsg) {
+  try {
+    await navigator.clipboard.writeText(txt)
+    toast(okMsg || "已复制到剪贴板", "success")
+    return
+  } catch (e) {}
+  const ta = document.createElement("textarea")
+  ta.value = txt
+  ta.style.position = "fixed"; ta.style.left = "-9999px"; ta.style.top = "0"; ta.style.opacity = "0"
+  document.body.appendChild(ta)
+  ta.select(); ta.setSelectionRange(0, txt.length)
+  let ok = false
+  try { ok = document.execCommand("copy") } catch (e2) {}
+  document.body.removeChild(ta)
+  if (ok) toast(okMsg || "已复制到剪贴板", "success")
+  else toast("复制失败（浏览器剪贴板权限被拒），请手动复制", "error")
+}
+
 /* ---- 日志：自动刷新开关 + 关键字过滤 ---- */
 let logText = ""
 async function refreshLog() {
@@ -1923,7 +2026,7 @@ async function clearLog() {
   try { await api("/api/log/clear", {}); refreshLog(); showMsg("日志已清空") }
   catch (e) { showErr(e.message) }
 }
-refresh(); refreshLog(); refreshStats(); refreshGateway(); refreshGwLog(); switchNav("keys");
+hydrateUsage(); refresh(); refreshLog(); refreshStats(); refreshGateway(); refreshGwLog(); switchNav("keys");
 refreshPlans(); refreshGatewayConfig();
 /* P1-2：定时器句柄存入 timers 对象，webOff() 可整体清理 */
 var timers = {}

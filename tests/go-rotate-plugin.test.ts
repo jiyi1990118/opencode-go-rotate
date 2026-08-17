@@ -1030,3 +1030,148 @@ describe("WEB_HTML 重构（IA + 设计系统 + P1 修复，2026-08-17）", () =
     expect(html.indexOf('id="gwlogview"')).toBeGreaterThan(html.indexOf('id="nav-stats"'))
   })
 })
+
+/* =========================================================================
+   网关使用方式 + 按钮双主题 —— Team A / B 并行改动协调断言（2026-08-17）
+   -------------------------------------------------------------------------
+   Team A：在 nav-settings 内 gw-usage-card 新增「使用方式」卡（id="gw-usage-card"），
+           展示网关地址 + 三个配置块（curl / codex config.toml / claude code settings.json）
+           + 每块复制按钮 + 复制函数（USAGE_TEXT / copyUsage(k) / copyText(txt,okMsg)）。
+   Team B：为 :root 与 html[data-theme="light"] 引入按钮语义色变量（--btn-*），
+           并将 button 规则改写为引用 var(--btn-...)，class 名 primary/danger/ghost/sm/loading 保持。
+
+   本 describe 下四个 test 已全部【落地为活动断言】：
+   - 前两个为契约锚点（类名保持 + 使用方式前置锚点），Team A/B 合入前后均稳定通过。
+   - 后两个已按 Team A/B 实际实现命名对齐（2026-08-17 Team A/B 已合入 go-rotate.ts，
+     命名核对：--btn-bd/--btn-fg/--btn-{primary,danger,success,ghost}-*、-hover- 前缀、
+     spinner 用 --btn-*-spin/--btn-*-spin-top；copyUsage(k)/copyText/copyText、usage-*-text、
+     占位 token "<ZEN_GATEWAY_TOKEN>"，codex 用 env_key 非 CODEX_HOME）。
+   Paste-ready 版本见 docs/测试同步-网关使用方式与按钮主题.md §4。
+   ========================================================================= */
+describe("WEB_HTML Team A/B 并行断言（网关使用方式 + 按钮主题）", () => {
+  test("按钮主题契约：语义类名保持（primary/danger/ghost/sm/loading）+ 变量基线", async () => {
+    const mod = await import("../go-rotate.ts")
+    const html: string = (mod as any).WEB_HTML
+    // Team B 契约：class 名不更名（只改配色实现，改按钮 CSS 主体不删类）
+    for (const cls of [".primary", ".danger", ".ghost", ".sm", ".loading"]) {
+      expect(html).toContain("button" + cls)
+    }
+    // 按钮通用规则（类无关）与语义变量体系基线：
+    //   Team B 平移为 --btn-* 前，按钮底色/文字引用既有语义变量（--brand/--danger-soft/--tx-*/--bg-*），
+    //   断言"是否引用 var(--" 前缀以确认按钮走收口变量而非硬编码色值。
+    expect(html).toContain("button { font: inherit;")
+    expect(html).toContain(":root")
+    expect(html).toContain("--brand:")
+    expect(html).toContain("button:hover {")
+    expect(html).toContain("button:disabled, button[disabled] {")
+  })
+
+  test("使用方式前置锚点：网关地址 127.0.0.1:18888 + gw-config-grid 容器（Team A 插入点）", async () => {
+    const mod = await import("../go-rotate.ts")
+    const html: string = (mod as any).WEB_HTML
+    // 网关地址已在内嵌管理页展示（网关管理卡行首）；Team A 的使用方式卡会再次复用该地址
+    expect(html).toContain("127.0.0.1:18888")
+    // 使用方式卡插入锚点：nav-settings 内 gw-config-grid 之后
+    // 注意：CSS 类规则 ".gw-config-grid {...}" 在 <head>（nav-settings 之前），故用 DOM 类属性做位置匹配
+    expect(html).toContain('class="gw-config-grid"')
+    // 锚点关系：gw-config-grid 的 DOM 容器在 nav-settings 块内（位置契约，Team A 不改序时不破坏既有定位断言）
+    expect(html.indexOf('class="gw-config-grid"')).toBeGreaterThan(html.indexOf('id="nav-settings"'))
+  })
+
+  test("使用方式配置展示卡（gw-usage-card + 三配置块 + 复制函数 + 位置）", async () => {
+    // 契约命名核对（2026-08-17 已对齐 Team A 实际实现）：
+    //   id="gw-usage-card" / USAGE_TEXT / copyUsage(k) / copyText(txt,okMsg) /
+    //   usage-curl/codex/claude-text / 占位 token "<ZEN_GATEWAY_TOKEN>"
+    const mod = await import("../go-rotate.ts")
+    const html: string = (mod as any).WEB_HTML
+    // 卡片 id
+    expect(html).toContain('id="gw-usage-card"')
+    // 网关地址（使用方式块与网关管理卡均复用 127.0.0.1:18888）
+    expect(html).toContain("127.0.0.1:18888")
+    // 三个配置块关键字（对应 docs/zen-gateway-clients.md）
+    expect(html).toContain("curl")
+    expect(html).toContain("config.toml")      // codex 客户端配置
+    expect(html).toContain("settings.json")    // claude code 客户端配置
+    expect(html).toContain('id="usage-curl-text"')
+    expect(html).toContain('id="usage-codex-text"')
+    expect(html).toContain('id="usage-claude-text"')
+    // 客户端接入变量 / codex wire_api=responses（clients 指南关键项，无 CODEX_HOME 这个键）
+    expect(html).toContain("ANTHROPIC_BASE_URL")
+    expect(html).toContain("env_key")
+    // 每块复制按钮 + 复制函数 + 占位 token（绝不拼真实 key/token）
+    expect(html).toContain("function copyUsage(")
+    expect(html).toContain("async function copyText(")
+    expect(html).toContain("navigator.clipboard.writeText")
+    expect(html).toContain("Bearer <ZEN_GATEWAY_TOKEN>")
+    // 位置断言：使用方式卡在 nav-settings 内（gw-token-card 之后、设置卡 web-on-btn 之前）
+    const settings = html.indexOf('id="nav-settings"')
+    const usage = html.indexOf('id="gw-usage-card"')
+    const webOn = html.indexOf('id="web-on-btn"')
+    expect(settings).toBeGreaterThan(0)
+    expect(usage).toBeGreaterThan(settings)
+    expect(usage).toBeGreaterThan(html.indexOf('id="gw-token-card"'))
+    expect(usage).toBeLessThan(webOn)
+  })
+
+  test("按钮双主题变量（--btn-* 深/浅两套 + 按钮规则引用 var(--btn-...)）", async () => {
+    // 契约命名核对（2026-08-17 已对齐 Team B 实际实现）：
+    //   基础 --btn-bg/--btn-bd/--btn-fg（+ -hover），语义 --btn-{primary,danger,success,ghost}-*
+    //   hover 用前缀 -hover-*（非后缀），spinner 用 --btn-*-spin / --btn-*-spin-top（非 --btn-spinner-*）
+    const mod = await import("../go-rotate.ts")
+    const html: string = (mod as any).WEB_HTML
+    // 深色 :root 定义 --btn-* 变量族（核心语义色平移为按钮专用名）
+    expect(html).toContain("--btn-bg:")
+    expect(html).toContain("--btn-fg:")
+    expect(html).toContain("--btn-bd:")
+    expect(html).toContain("--btn-primary-bg:")
+    // 浅色 html[data-theme="light"] 覆盖同一变量名（次序：:root 在前、light 覆盖在后）
+    const root = html.indexOf(":root")
+    const light = html.indexOf('html[data-theme="light"]')
+    expect(root).toBeGreaterThan(0)
+    expect(light).toBeGreaterThan(root)
+    // 按钮规则不再硬编码色值，引用 var(--btn-...)（含基础/语义/hover/spinner）
+    expect(html).toContain("button { font: inherit;")
+    expect(html).toContain("var(--btn-bg)")
+    expect(html).toContain("var(--btn-primary-bg)")
+    expect(html).toContain("var(--btn-danger-fg)")
+    expect(html).toContain("--btn-primary-hover-bg:")
+    // 类名契约保持
+    for (const cls of [".primary", ".danger", ".ghost", ".sm", ".loading"]) {
+      expect(html).toContain("button" + cls)
+    }
+  })
+})
+
+/* ================= 使用方式卡（gw-usage-card，2026-08-17）================= */
+describe("WEB_HTML 使用方式卡（gw-usage-card：地址 + 三配置块 + 一键复制）", () => {
+  test("gw-usage-card 位于设置区块（nav-settings 内、gw-config-grid 之后、设置卡之前）", () => {
+    const html: string = (mod as any).WEB_HTML
+    expect(html).toContain('id="gw-usage-card"')
+    expect(html).toContain('id="usage-curl-text"')
+    expect(html).toContain('id="usage-codex-text"')
+    expect(html).toContain('id="usage-claude-text"')
+    const usage = html.indexOf('id="gw-usage-card"')
+    expect(usage).toBeGreaterThan(html.indexOf('id="nav-settings"'))
+    expect(usage).toBeGreaterThan(html.indexOf('id="gw-token-card"'))
+    // 设置卡 <b>设置</b> 在使用方式卡之后
+    expect(html.indexOf("<b>设置</b>", usage)).toBeGreaterThan(usage)
+  })
+
+  test("复制函数与示例常量存在（copyText/copyUsage/USAGE_TEXT），token 用占位符", () => {
+    const html: string = (mod as any).WEB_HTML
+    expect(html).toContain("var USAGE_TEXT")
+    expect(html).toContain("function copyUsage(")
+    expect(html).toContain("async function copyText(")
+    expect(html).toContain("navigator.clipboard.writeText")
+    expect(html).toContain("document.execCommand(\"copy\")") // 降级复制
+    // 示例内一律用占位 token，绝不拼真实 key / 真实 token 值
+    expect(html).toContain("Bearer <ZEN_GATEWAY_TOKEN>")
+  })
+
+  test("使用方式卡内容走 textContent 填充（无 innerHTML 拼接用户可控数据 = XSS 红线）", () => {
+    const html: string = (mod as any).WEB_HTML
+    expect(html).toContain("el.textContent = USAGE_TEXT[k]")
+    expect(html).toContain("onclick=\"copyUsage('curl')\"")
+    expect(html).toContain("onclick=\"copyUsage('claude')\"")
+  })
+})
