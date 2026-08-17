@@ -961,6 +961,7 @@ const WEB_HTML = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>go-rotate · opencode-go keys</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%233b82f6'/><circle cx='8' cy='8' r='3' fill='%230b0d10'/></svg>">
 <style>
   /* ============ go-rotate 管理端设计系统 v1.0（深色 · 零依赖） ============ */
   :root {
@@ -1038,6 +1039,9 @@ const WEB_HTML = `<!doctype html>
           padding: var(--sp-4); margin-bottom: var(--sp-4); box-shadow: var(--shadow-sm);
           transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease),
                       transform var(--dur) var(--ease); }
+  /* P3-3：网关未运行灰卡降级（opacity 0.55）加过渡，视觉不突兀 */
+  #gateway-card { transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease),
+                  transform var(--dur) var(--ease), opacity .3s var(--ease); }
   .card:hover { border-color: var(--bd-2); }
   .card.interactive:hover { border-color: var(--bd-3); box-shadow: var(--shadow-md);
                             transform: translateY(-1px); }
@@ -1372,10 +1376,18 @@ async function refresh() {
     document.getElementById("set-autoweb").textContent = st.auto_web ? "开启" : "关闭"
     document.getElementById("web-off-btn").disabled = !st.auto_web
     document.getElementById("web-on-btn").disabled = st.auto_web
-    /* IA B3：空状态横幅（0 key 引导 / 概览折叠为一行健康） */
+    /* IA B3：空状态横幅（0 key 引导 / 概览折叠为一行健康，健康文案按可用 key 数动态判定 P2-2） */
     document.getElementById("keys-empty").style.display = st.keys.length ? "none" : "block"
     document.getElementById("ov-hint-full").style.display = st.keys.length ? "none" : "inline"
-    document.getElementById("ov-hint-min").style.display = st.keys.length ? "inline" : "none"
+    const hintEl = document.getElementById("ov-hint-min")
+    if (st.keys.length) {
+      hintEl.textContent = st.availableCount > 0
+        ? st.availableCount + " 个 key 可用，轮换正常。"
+        : "全部 key 冷却中，轮换暂不可用。"
+      hintEl.style.display = "inline"
+    } else {
+      hintEl.style.display = "none"
+    }
     const tb = document.getElementById("tbody")
     tb.innerHTML = ""
     for (const k of st.keys) {
@@ -1532,6 +1544,9 @@ async function editGlobalWindow() {
 
 /* ---- 轮换统计（/api/stats） ---- */
 async function refreshStats() {
+  /* P2-4：统计区块隐藏时不轮询（10s 常驻 interval 守卫），切到该区块时 switchNav 手动触发 */
+  const navStats = document.getElementById("nav-stats")
+  if (!navStats || navStats.style.display !== "block") return
   try {
     const st = await api("/api/stats")
     document.getElementById("st-total").textContent = st.totalRotations
@@ -1694,6 +1709,11 @@ function switchNav(block) {
   document.querySelectorAll(".block").forEach(b => { b.style.display = "none" })
   document.getElementById("nav-" + block).style.display = "block"
   document.querySelectorAll(".nav-btn").forEach(b => { b.classList.toggle("active", b.dataset.nav === block) })
+  /* P2-4：统计区块轮询已被守卫暂停，切入时手动触发一次，避免等下一个 interval 才出数 */
+  if (block === "stats") {
+    refreshStats()
+    refreshGwLog()
+  }
 }
 
 /* ---- 网关套餐 / Token（/api/gateway/plans + /api/gateway/config，写后显式调 restart 生效） ---- */
