@@ -941,3 +941,78 @@ describe("WEB_HTML 网关管理区块（主导航 + 套餐卡 + Token 卡）", (
     expect(html).toContain("navigator.clipboard.writeText")
   })
 })
+
+describe("WEB_HTML 重构（IA + 设计系统 + P1 修复，2026-08-17）", () => {
+  test("CSP 响应头存在（handleWeb 加固）", async () => {
+    const mod = await import("../go-rotate.ts")
+    const res = await (mod as any).handleWeb(new Request("http://127.0.0.1:8899/"))
+    const csp = res.headers.get("content-security-policy") ?? ""
+    expect(csp.length).toBeGreaterThan(0)
+    // 内联脚本/样式需要保留，但 base-uri/form-action/frame-ancestors 应禁
+    expect(csp).toContain("base-uri 'none'")
+    expect(csp).toContain("frame-ancestors 'none'")
+  })
+
+  test("XSS 转义函数 esc 存在且旧拼接消失", async () => {
+    const mod = await import("../go-rotate.ts")
+    const html: string = (mod as any).WEB_HTML
+    expect(html).toContain("function esc(") // 统一转义 &<>\"'
+    expect(html).not.toContain("'<td>' + k.name + '</td>'") // 旧 innerHTML 拼接消失
+  })
+
+  test("空状态横幅 keys-empty 存在", async () => {
+    const mod = await import("../go-rotate.ts")
+    expect((mod as any).WEB_HTML).toContain('id="keys-empty"')
+  })
+
+  test("概览引导条 ov-hint 存在", async () => {
+    const mod = await import("../go-rotate.ts")
+    expect((mod as any).WEB_HTML).toContain('id="ov-hint"')
+  })
+
+  test("双列布局 class gw-config-grid + log-row 存在", async () => {
+    const mod = await import("../go-rotate.ts")
+    const html: string = (mod as any).WEB_HTML
+    expect(html).toContain("gw-config-grid")
+    expect(html).toContain("log-row")
+  })
+
+  test("网关日志卡容器 an-gwlog-card 存在", async () => {
+    const mod = await import("../go-rotate.ts")
+    expect((mod as any).WEB_HTML).toContain('id="an-gwlog-card"')
+  })
+
+  test("响应式媒体查询 @media 存在", async () => {
+    const mod = await import("../go-rotate.ts")
+    expect((mod as any).WEB_HTML).toContain("@media")
+  })
+
+  test("copyToken 一步化（旧「先显示」分支移除）", async () => {
+    const mod = await import("../go-rotate.ts")
+    const html: string = (mod as any).WEB_HTML
+    expect(html).toContain("async function copyToken()")
+    expect(html).not.toContain("请先「显示/隐藏」查看明文后再复制")
+  })
+
+  test("概览只读化：冷却编辑下沉到设置（s-cooldown 之后仍有去设置跳链）", async () => {
+    const mod = await import("../go-rotate.ts")
+    const html: string = (mod as any).WEB_HTML
+    const cooldown = html.indexOf('id="s-cooldown"')
+    expect(cooldown).toBeGreaterThan(0)
+    // 导航按钮的 switchNav 在顶部，概览区跳链在 s-cooldown 之后——从 s-cooldown 位置往后搜
+    const after = html.indexOf(`onclick="switchNav('settings')"`, cooldown)
+    expect(after).toBeGreaterThan(cooldown)
+  })
+
+  test("web 按钮迁移：web-on-btn 在设置区块（nav-settings 之后）", async () => {
+    const mod = await import("../go-rotate.ts")
+    const html: string = (mod as any).WEB_HTML
+    expect(html.indexOf('id="web-on-btn"')).toBeGreaterThan(html.indexOf('id="nav-settings"'))
+  })
+
+  test("网关日志移入统计：gwlogview 在 nav-stats 之后", async () => {
+    const mod = await import("../go-rotate.ts")
+    const html: string = (mod as any).WEB_HTML
+    expect(html.indexOf('id="gwlogview"')).toBeGreaterThan(html.indexOf('id="nav-stats"'))
+  })
+})

@@ -742,7 +742,7 @@ async function handleWeb(req: any): Promise<Response> {
   const method = req.method
 
   if (method === "GET" && (route === "/" || route === "/index.html")) {
-    return new Response(WEB_HTML, { headers: { "content-type": "text/html; charset=utf-8" } })
+    return new Response(WEB_HTML, { headers: { "content-type": "text/html; charset=utf-8", "content-security-policy": "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'" } })
   }
   if (method === "GET" && route === "/api/status") return json(statusPayload())
   if (method === "GET" && route === "/api/log") {
@@ -948,48 +948,210 @@ const WEB_HTML = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>go-rotate · opencode-go keys</title>
 <style>
-  :root { color-scheme: dark; }
+  /* ============ go-rotate 管理端设计系统 v1.0（深色 · 零依赖） ============ */
+  :root {
+    color-scheme: dark;
+    /* 中性色：背景→表面→边框→文本 */
+    --bg-0: #0b0d10;  --bg-1: #11151c;  --bg-2: #181d26;  --bg-3: #202636;
+    --bd-1: #1e242e;  --bd-2: #2c3442;  --bd-3: #3a4354;
+    --tx-1: #e8eaed;  --tx-2: #9aa3ad;  --tx-3: #6b7280;
+    /* 品牌 + 语义色 */
+    --brand: #3b82f6;  --brand-strong: #2563eb;  --link: #60a5fa;
+    --success: #4ade80;  --warning: #fbbf24;  --danger: #f87171;  --info: #60a5fa;
+    --success-soft: rgba(74,222,128,.12);
+    --warning-soft: rgba(251,191,36,.12);
+    --danger-soft: rgba(248,113,113,.12);
+    --info-soft: rgba(96,165,250,.12);
+    /* 字体 */
+    --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI",
+                 "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    /* 间距（4px 基数） */
+    --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 20px; --sp-6: 24px;
+    /* 圆角 */
+    --r-sm: 6px; --r-md: 10px; --r-lg: 14px; --r-pill: 999px;
+    /* 阴影 / 焦点环 */
+    --shadow-sm: 0 1px 2px rgba(0,0,0,.3);
+    --shadow-md: 0 4px 12px rgba(0,0,0,.35), 0 1px 2px rgba(0,0,0,.3);
+    --shadow-lg: 0 8px 24px rgba(0,0,0,.45);
+    --ring: 0 0 0 3px rgba(59,130,246,.35);
+    /* 动效 */
+    --dur: 150ms;
+    --ease: cubic-bezier(.2,.8,.2,1);
+  }
+
+  /* ============ 基础 ============ */
   * { box-sizing: border-box; }
-  body { font-family: -apple-system, "SF Pro Text", "Segoe UI", sans-serif; margin: 0; background: #0f1115; color: #e6e8eb; }
-  .wrap { max-width: 860px; margin: 0 auto; padding: 24px 16px 80px; }
-  h1 { font-size: 20px; margin: 0 0 4px; }
-  .sub { color: #9aa3ad; font-size: 13px; margin-bottom: 20px; }
-  .card { background: #171a21; border: 1px solid #242a33; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
-  .stats { display: flex; gap: 24px; flex-wrap: wrap; }
-  .stat .v { font-size: 22px; font-weight: 600; }
-  .stat .l { font-size: 12px; color: #9aa3ad; }
-  table { width: 100%; border-collapse: collapse; font-size: 14px; }
-  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #242a33; }
-  th { color: #9aa3ad; font-weight: 500; font-size: 12px; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; }
-  .b-available { background: #1b3a2a; color: #4ade80; }
-  .b-cooling { background: #3a2f1b; color: #fbbf24; }
-  .b-current { background: #1e3a5f; color: #60a5fa; margin-left: 6px; }
-  .b-running { background: #1b3a2a; color: #4ade80; }
-  .b-stopped { background: #333b46; color: #9aa3ad; }
-  .b-error { background: #3b1d1d; color: #f87171; }
-  button:disabled { opacity: 0.45; cursor: not-allowed; }
-  button:disabled:hover { background: #242a33; }
-  .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; background: var(--bg-0); color: var(--tx-1);
+         font-family: var(--font-sans); font-size: 14px; line-height: 1.5; }
+  ::selection { background: rgba(59,130,246,.35); }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--bd-2); border-radius: 5px;
+                              border: 2px solid transparent; background-clip: padding-box; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--bd-3); }
+
+  /* ============ 布局 / 工具 ============ */
+  .wrap { max-width: 1060px; margin: 0 auto; padding: 24px 20px 80px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; letter-spacing: -.01em; }
+  .sub { color: var(--tx-2); font-size: 13px; margin-bottom: var(--sp-5); }
+  .muted { color: var(--tx-3); font-size: 12px; }
+  .mono { font-family: var(--font-mono); }
   .small { font-size: 12px; }
-  .model-list { font-size: 12px; color: #9aa3ad; word-break: break-all; }
-  button { background: #242a33; color: #e6e8eb; border: 1px solid #333b46; border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 13px; }
-  button:hover { background: #2e3642; }
-  button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
-  button.danger { background: #3b1d1d; border-color: #7f1d1d; color: #fca5a5; }
-  input { background: #0f1115; border: 1px solid #333b46; border-radius: 6px; padding: 6px 8px; color: #e6e8eb; font-size: 13px; width: 100%; }
-  .row { display: flex; gap: 8px; align-items: center; }
+  .row { display: flex; gap: var(--sp-2); align-items: center; }
   .row input { flex: 1; }
-  .actions { display: flex; gap: 6px; }
-  .msg { color: #4ade80; font-size: 13px; min-height: 18px; margin-top: 8px; }
-  .err { color: #f87171; }
-  pre { background: #0c0e12; border: 1px solid #242a33; border-radius: 8px; padding: 12px; font-size: 12px; overflow: auto; max-height: 260px; color: #9ceba8; }
-  .muted { color: #6b7280; font-size: 12px; }
-  .gr-tip { cursor: help; border-bottom: 1px dotted #7a8494; }
-  .nav { display: flex; gap: 6px; margin-bottom: 16px; flex-wrap: wrap; }
-  .nav-btn { border-radius: 6px; padding: 6px 14px; }
-  .nav-btn.active { background: #2563eb; border-color: #2563eb; color: #fff; }
-  input[type="radio"] { width: auto; margin-right: 4px; }
+  .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .gw-config-grid { display: grid; grid-template-columns: 2fr 1fr; gap: var(--sp-4); align-items: start; }
+  .log-row { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-4); align-items: start; }
+  .gr-tip { cursor: help; border-bottom: 1px dotted var(--tx-3); }
+
+  /* ============ 导航 ============ */
+  .nav { display: flex; gap: 6px; margin-bottom: var(--sp-4); flex-wrap: wrap; }
+  .nav-btn { height: 32px; padding: 0 14px; border-radius: var(--r-sm);
+             background: transparent; border-color: transparent; color: var(--tx-2);
+             font-size: 13px; font-weight: 500; }
+  .nav-btn:hover { background: var(--bg-2); color: var(--tx-1); }
+  .nav-btn.active { background: var(--brand); border-color: var(--brand); color: #fff; }
+  .nav-btn.active:hover { background: var(--brand-strong); }
+
+  /* ============ 卡片 ============ */
+  .card { background: var(--bg-1); border: 1px solid var(--bd-1); border-radius: var(--r-md);
+          padding: var(--sp-4); margin-bottom: var(--sp-4); box-shadow: var(--shadow-sm);
+          transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease),
+                      transform var(--dur) var(--ease); }
+  .card:hover { border-color: var(--bd-2); }
+  .card.interactive:hover { border-color: var(--bd-3); box-shadow: var(--shadow-md);
+                            transform: translateY(-1px); }
+
+  /* ============ 状态面板 ============ */
+  .stats { display: flex; gap: var(--sp-6); flex-wrap: wrap; }
+  .stat .v { font-size: 24px; font-weight: 600; line-height: 1.2;
+             font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+  .stat .l { font-size: 12px; color: var(--tx-2); margin-top: 2px; }
+  .ov-strip .stat { flex: 1 1 0; min-width: 110px; }
+  .ov-strip .stat + .stat { border-left: 1px solid var(--bd-1); padding-left: var(--sp-6); }
+  #s-current { color: var(--link); }
+
+  /* ============ 按钮 ============ */
+  button { font: inherit; display: inline-flex; align-items: center; justify-content: center;
+           gap: 6px; height: 30px; padding: 0 12px; border-radius: var(--r-sm);
+           border: 1px solid var(--bd-2); background: var(--bg-2); color: var(--tx-1);
+           cursor: pointer; font-size: 13px; font-weight: 500; white-space: nowrap;
+           transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease),
+                       color var(--dur) var(--ease), transform var(--dur) var(--ease),
+                       box-shadow var(--dur) var(--ease); }
+  button:hover { background: var(--bg-3); border-color: var(--bd-3); }
+  button:active { transform: translateY(.5px); }
+  button:focus-visible { outline: none; box-shadow: var(--ring); }
+  button:disabled, button[disabled] { opacity: .45; cursor: not-allowed; pointer-events: none; }
+  button.primary { background: var(--brand); border-color: var(--brand); color: #fff; }
+  button.primary:hover { background: var(--brand-strong); border-color: var(--brand-strong); }
+  button.danger { background: var(--danger-soft); border-color: rgba(127,29,29,.9); color: #fca5a5; }
+  button.danger:hover { background: rgba(248,113,113,.22); border-color: #7f1d1d; }
+  button.ghost { background: transparent; border-color: transparent; color: var(--tx-2); }
+  button.ghost:hover { background: var(--bg-2); color: var(--tx-1); }
+  button.sm, .actions button { height: 26px; padding: 0 8px; font-size: 12px; border-radius: 5px; }
+  button.loading { pointer-events: none; opacity: .75; }
+  button.loading::before { content: ""; width: 12px; height: 12px;
+                           border: 2px solid rgba(255,255,255,.35); border-top-color: #fff;
+                           border-radius: 50%; animation: spin .6s linear infinite; flex: none; }
+  button.danger.loading::before { border-color: rgba(252,165,165,.35); border-top-color: #fca5a5; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ============ 徽标 / 状态点 ============ */
+  .badge { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px;
+           border-radius: var(--r-pill); font-size: 12px; font-weight: 500;
+           line-height: 1.5; white-space: nowrap; }
+  .b-available, .b-running { background: var(--success-soft); color: var(--success); }
+  .b-cooling,   .b-warn     { background: var(--warning-soft); color: var(--warning); }
+  .b-current,   .b-info     { background: var(--info-soft);    color: var(--info); }
+  .b-stopped,   .b-neutral  { background: rgba(154,163,173,.12); color: var(--tx-2); }
+  .b-error,     .b-invalid  { background: var(--danger-soft);  color: var(--danger); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block;
+         background: var(--tx-3); flex: none; }
+  .dot.ok   { background: var(--success); box-shadow: 0 0 6px rgba(74,222,128,.5); }
+  .dot.warn { background: var(--warning); box-shadow: 0 0 6px rgba(251,191,36,.5); }
+  .dot.err  { background: var(--danger);  box-shadow: 0 0 6px rgba(248,113,113,.5); }
+
+  /* ============ 输入框 ============ */
+  input { font: inherit; width: 100%; height: 30px; padding: 4px 10px;
+          background: var(--bg-0); border: 1px solid var(--bd-2); border-radius: var(--r-sm);
+          color: var(--tx-1);
+          transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease); }
+  input::placeholder { color: var(--tx-3); }
+  input:focus { outline: none; border-color: var(--brand); box-shadow: var(--ring); }
+  input[readonly] { background: var(--bg-2); color: var(--tx-2); }
+  input[type="checkbox"], input[type="radio"] { width: auto; height: auto;
+    accent-color: var(--brand); margin: 0 4px 0 0; }
+
+  /* ============ 表格 ============ */
+  .table-wrap { overflow-x: auto; border-radius: var(--r-sm); }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--bd-1);
+           vertical-align: middle; }
+  th { color: var(--tx-3); font-weight: 500; font-size: 12px; white-space: nowrap; }
+  tbody tr { transition: background var(--dur) var(--ease); }
+  tbody tr:hover { background: rgba(255,255,255,.02); }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:has(.b-current) { background: var(--info-soft); }
+
+  /* ============ 空状态横幅 ============ */
+  .banner { display: flex; align-items: flex-start; gap: var(--sp-2); padding: 10px 14px;
+            border: 1px dashed var(--bd-2); border-radius: var(--r-sm);
+            background: var(--bg-0); color: var(--tx-2); font-size: 13px; line-height: 1.6; }
+  .banner b { color: var(--tx-1); font-weight: 500; }
+
+  /* ============ 消息 / toast ============ */
+  .msg { color: var(--success); font-size: 13px; min-height: 18px; margin-top: var(--sp-2);
+         animation: fadeIn var(--dur) var(--ease); }
+  .err { color: var(--danger); }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(-2px); }
+                      to   { opacity: 1; transform: none; } }
+  .toast { position: fixed; right: 24px; bottom: 24px; z-index: 100; max-width: 320px;
+           padding: 10px 16px; border-radius: var(--r-sm); background: var(--bg-3);
+           border: 1px solid var(--bd-2); color: var(--tx-1); font-size: 13px;
+           box-shadow: var(--shadow-lg); opacity: 0; transform: translateY(8px);
+           pointer-events: none; transition: opacity .2s var(--ease), transform .2s var(--ease); }
+  .toast.show { opacity: 1; transform: none; }
+  .toast.success { border-color: rgba(74,222,128,.4); }
+  .toast.error { border-color: rgba(248,113,113,.4); }
+
+  /* ============ 日志 / 代码 ============ */
+  pre { margin: 0; background: var(--bg-0); border: 1px solid var(--bd-1);
+        border-radius: var(--r-sm); padding: 12px; font-family: var(--font-mono);
+        font-size: 12px; line-height: 1.6; overflow: auto; max-height: 260px; color: #9ceba8; }
+  code { font-family: var(--font-mono); font-size: 12px; background: var(--bg-2);
+         border: 1px solid var(--bd-1); border-radius: 4px; padding: 1px 5px; color: var(--tx-1); }
+  .model-list { font-size: 12px; color: var(--tx-2); word-break: break-all; line-height: 1.7; }
+  details summary { cursor: pointer; color: var(--tx-2); font-size: 12px; }
+  details summary:hover { color: var(--tx-1); }
+
+  /* ============ 骨架屏 / 模态框（预留） ============ */
+  .skeleton { background: linear-gradient(90deg, var(--bg-2) 25%, var(--bg-3) 50%, var(--bg-2) 75%);
+              background-size: 200% 100%; animation: shimmer 1.4s linear infinite; border-radius: 4px; }
+  @keyframes shimmer { to { background-position: -200% 0; } }
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.55);
+                    display: flex; align-items: center; justify-content: center; z-index: 200; }
+  .modal { width: min(420px, calc(100vw - 32px)); background: var(--bg-1);
+           border: 1px solid var(--bd-2); border-radius: var(--r-lg);
+           padding: var(--sp-5); box-shadow: var(--shadow-lg); }
+
+  /* ============ 响应式（<720px 单列） ============ */
+  @media (max-width: 720px) {
+    .wrap { padding: 16px 12px 64px; }
+    .nav { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 2px;
+           -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+    .nav::-webkit-scrollbar { display: none; }
+    .gw-config-grid, .log-row { grid-template-columns: 1fr; }
+    .ov-strip { display: grid; grid-template-columns: repeat(2, 1fr);
+                gap: var(--sp-3) var(--sp-4); }
+    .ov-strip .stat { min-width: 0; }
+    .ov-strip .stat + .stat { border-left: none; padding-left: 0; }
+    .stats { gap: var(--sp-4); }
+    pre { max-height: 160px; }
+    .table-wrap table { min-width: 720px; }
+  }
 </style>
 </head>
 <body>
@@ -1005,34 +1167,44 @@ const WEB_HTML = `<!doctype html>
     <button class="nav-btn" data-nav="settings" onclick="switchNav('settings')">设置</button>
   </div>
 
+  <!-- ============ 概览：只读状态面板（编辑动作下沉到设置 / Key 管理） ============ -->
   <div class="block" id="nav-overview">
   <div class="card">
-    <div class="stats">
+    <div class="stats ov-strip">
       <div class="stat"><div class="v" id="s-current">-</div><div class="l">当前 key</div></div>
       <div class="stat"><div class="v" id="s-avail">-</div><div class="l">可用 &nbsp;<span class="muted" id="s-total"></span></div></div>
-      <div class="stat"><div class="v" id="s-cooldown">-</div><div class="l">冷却窗口(min) <a href="javascript:void(0)" onclick="editGlobalWindow()" style="color:#60a5fa">编辑</a></div></div>
-      <div class="stat"><div class="v" id="s-autoweb">-</div><div class="l">Web 自动启动</div></div>
+      <div class="stat"><div class="v" id="ov-gw-state">-</div><div class="l">网关</div></div>
+      <div class="stat"><div class="v" id="ov-last-rotate">-</div><div class="l">最近轮换</div></div>
+      <div class="stat"><div class="v" id="s-cooldown">-</div><div class="l">冷却窗口(min) <a href="javascript:void(0)" onclick="switchNav('settings')" style="color:#60a5fa">去设置</a></div></div>
+      <div class="stat"><div class="v" id="s-autoweb">-</div><div class="l">Web 自动启动 <a href="javascript:void(0)" onclick="switchNav('settings')" style="color:#60a5fa">去设置</a></div></div>
     </div>
-    <div class="row" style="margin-top:12px">
-      <span class="muted">关闭后本页面会立即停止，且 opencode 启动时不再自动起 Web（轮换功能不受影响）。</span>
-      <button id="web-off-btn" class="danger" onclick="webOff()">关闭 Web</button>
-      <button id="web-on-btn" onclick="webOn()">开启自动启动</button>
+    <div class="muted banner" id="ov-hint" style="margin-top:12px">
+      <span id="ov-hint-full"><b>①</b> 添加 key → <a href="javascript:void(0)" onclick="switchNav('keys')" style="color:#60a5fa">Key 管理</a>　<b>②</b> （可选）启动网关 → <a href="javascript:void(0)" onclick="switchNav('gateway')" style="color:#60a5fa">网关管理</a>　<b>③</b> （可选）生成 token → 网关管理</span>
+      <span id="ov-hint-min" style="display:none">当前状态健康。</span>
     </div>
   </div>
   </div>
 
+  <!-- ============ Key 管理：主操作区（新增卡 + 表格卡） ============ -->
   <div class="block" id="nav-keys" style="display:none">
-  <div class="card">
+  <div class="card" id="keys-add-card">
     <div class="row" style="margin-bottom:10px"><input id="new-name" placeholder="名称，如 act2">&nbsp;<input id="new-key" placeholder="sk-xxxx 完整的 API key"><button class="primary" onclick="addKey()">新增 key</button></div>
+    <div class="muted banner" id="keys-empty" style="display:none">还没有 key：粘贴第一个 opencode-go key，添加后自动探测健康。</div>
     <div class="row" style="margin-bottom:10px"><span class="muted">手动操作：</span><button onclick="rotate()">轮换</button><button onclick="checkKeys()">检测所有 key</button><span class="muted" id="check-hint"></span></div>
-    <table>
+  </div>
+  <div class="card" id="keys-table-card">
+    <div class="table-wrap">
+    <table style="min-width:720px">
       <thead><tr><th>名称</th><th>Key</th><th>状态</th><th>健康</th><th>操作</th></tr></thead>
       <tbody id="tbody"></tbody>
     </table>
+    </div>
+    <div class="muted" style="margin-top:8px">每 key 独立冷却窗口行内设置；全局冷却窗口见 <a href="javascript:void(0)" onclick="switchNav('settings')" style="color:#60a5fa">设置</a>。</div>
     <div class="msg" id="msg"></div>
   </div>
   </div>
 
+  <!-- ============ 统计 · 分析与日志（轮换统计 + 运行日志 + 网关日志，双列） ============ -->
   <div class="block" id="nav-stats" style="display:none">
   <div class="card">
     <div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between">
@@ -1048,6 +1220,7 @@ const WEB_HTML = `<!doctype html>
     </table>
   </div>
 
+  <div class="log-row">
   <div class="card">
     <div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
       <b>运行日志</b>
@@ -1059,35 +1232,21 @@ const WEB_HTML = `<!doctype html>
     </div>
     <pre id="logview"></pre>
   </div>
+  <div class="card" id="an-gwlog-card">
+    <div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between">
+      <b>网关日志</b>
+      <div class="row">
+        <span class="muted" id="gwlog-src"></span>
+        <button onclick="refreshGwLog()">刷新</button>
+      </div>
+    </div>
+    <pre id="gwlogview"></pre>
+  </div>
+  </div>
   </div>
 
+  <!-- ============ 网关管理：状态主卡（首位）+ 配置子区（套餐 / Token 并排） ============ -->
   <div class="block" id="nav-gateway" style="display:none">
-  <div class="card" id="gw-plan-card">
-    <b>上游套餐</b>
-    <div class="row" style="margin-top:10px">
-      <label style="display:flex;align-items:center;gap:4px;margin-right:12px"><input type="radio" name="plan" value="go" id="plan-go"> Go 订阅</label>
-      <label style="display:flex;align-items:center;gap:4px"><input type="radio" name="plan" value="zen" id="plan-zen"> Zen 免费</label>
-      <button id="plan-apply" class="primary" style="margin-left:auto" onclick="saveGatewayPlan()">切换并重启</button>
-    </div>
-    <div class="muted" id="plan-meta" style="margin-top:8px">加载中…</div>
-    <div class="muted" style="margin-top:6px">提示：Zen 免费档数据可能被用于训练，敏感代码请勿使用（个人自用合规）。切换后需重启网关生效。</div>
-    <div id="plan-msg" class="msg" style="margin-top:6px"></div>
-  </div>
-
-  <div class="card" id="gw-token-card">
-    <b>网关访问 Token <span id="token-badge"></span></b>
-    <div class="row" style="margin-top:10px">
-      <input id="token-input" readonly placeholder="未设置（鉴权关闭）" class="mono">
-      <button onclick="genGatewayToken()">生成</button>
-      <button onclick="setGatewayToken()">编辑</button>
-      <button onclick="copyToken()">复制</button>
-      <button onclick="toggleTokenMask()">显示/隐藏</button>
-      <button class="danger" onclick="clearGatewayToken()">清除</button>
-    </div>
-    <div class="muted" style="margin-top:6px">其它 agent 连网关时用此 token（curl -H "Authorization: Bearer &lt;token&gt;"）。生成/编辑后点「显示/隐藏」可看明文。</div>
-    <div id="token-msg" class="msg" style="margin-top:6px"></div>
-  </div>
-
   <div class="card" id="gateway-card">
     <div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between">
       <b>网关管理 <span id="gw-badge"></span></b>
@@ -1110,18 +1269,36 @@ const WEB_HTML = `<!doctype html>
     <div id="gw-ctl-msg" class="msg" style="margin-top:6px"></div>
   </div>
 
-  <div class="card">
-    <div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between">
-      <b>网关日志</b>
-      <div class="row">
-        <span class="muted" id="gwlog-src"></span>
-        <button onclick="refreshGwLog()">刷新</button>
-      </div>
+  <div class="gw-config-grid">
+  <div class="card" id="gw-plan-card">
+    <b>上游套餐</b>
+    <div class="row" style="margin-top:10px">
+      <label style="display:flex;align-items:center;gap:4px;margin-right:12px"><input type="radio" name="plan" value="go" id="plan-go"> Go 订阅</label>
+      <label style="display:flex;align-items:center;gap:4px"><input type="radio" name="plan" value="zen" id="plan-zen"> Zen 免费</label>
+      <button id="plan-apply" class="primary" style="margin-left:auto" onclick="saveGatewayPlan()">切换并重启</button>
     </div>
-    <pre id="gwlogview"></pre>
+    <div class="muted" id="plan-meta" style="margin-top:8px">加载中…</div>
+    <div class="muted" style="margin-top:6px">提示：Zen 免费档数据可能被用于训练，敏感代码请勿使用（个人自用合规）。切换后需重启网关生效。</div>
+    <div id="plan-msg" class="msg" style="margin-top:6px"></div>
+  </div>
+
+  <div class="card" id="gw-token-card">
+    <b>网关访问 Token <span id="token-badge"></span></b>
+    <div class="row" style="margin-top:10px">
+      <input id="token-input" readonly placeholder="未设置（鉴权关闭）" class="mono">
+      <button onclick="genGatewayToken()">生成</button>
+      <button onclick="setGatewayToken()">编辑</button>
+      <button onclick="copyToken()">复制</button>
+      <button onclick="toggleTokenMask()">显示/隐藏</button>
+      <button class="danger" onclick="clearGatewayToken()">清除</button>
+    </div>
+    <div class="muted" style="margin-top:6px">其它 agent 连网关时用此 token（curl -H "Authorization: Bearer &lt;token&gt;"）。生成/编辑后可直接「复制」。</div>
+    <div id="token-msg" class="msg" style="margin-top:6px"></div>
+  </div>
   </div>
   </div>
 
+  <!-- ============ 设置：全局配置（冷却窗口 + Web 自动启动，唯一可操作点） ============ -->
   <div class="block" id="nav-settings" style="display:none">
   <div class="card">
     <b>设置</b>
@@ -1131,13 +1308,15 @@ const WEB_HTML = `<!doctype html>
     </div>
     <div class="row" style="margin-top:10px">
       <span style="flex:1">Web 自动启动：<b id="set-autoweb">-</b></span>
-      <button onclick="webOn()">开启</button>
-      <button class="danger" onclick="webOff()">关闭</button>
+      <button id="web-on-btn" onclick="webOn()">开启</button>
+      <button id="web-off-btn" class="danger" onclick="webOff()">关闭</button>
     </div>
     <div class="muted" style="margin-top:8px">套餐切换与网关 token 见「网关管理」区块；每 key 独立冷却窗口在 Key 表格内联。</div>
   </div>
   </div>
 </div>
+
+<div class="toast" id="gtoast"></div>
 
 <script>
 async function api(path, body) {
@@ -1148,6 +1327,10 @@ async function api(path, body) {
   return j
 }
 var health = {}
+/* P1-1 XSS 修复：统一转义 HTML 特殊字符（用户可控字段拼 innerHTML / 属性前必须过 esc） */
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]))
+}
 async function refresh() {
   try {
     const st = await api("/api/status")
@@ -1160,6 +1343,10 @@ async function refresh() {
     document.getElementById("set-autoweb").textContent = st.auto_web ? "开启" : "关闭"
     document.getElementById("web-off-btn").disabled = !st.auto_web
     document.getElementById("web-on-btn").disabled = st.auto_web
+    /* IA B3：空状态横幅（0 key 引导 / 概览折叠为一行健康） */
+    document.getElementById("keys-empty").style.display = st.keys.length ? "none" : "block"
+    document.getElementById("ov-hint-full").style.display = st.keys.length ? "none" : "inline"
+    document.getElementById("ov-hint-min").style.display = st.keys.length ? "inline" : "none"
     const tb = document.getElementById("tbody")
     tb.innerHTML = ""
     for (const k of st.keys) {
@@ -1167,35 +1354,36 @@ async function refresh() {
       // 状态徽章：优先显示健康状态（余额不足/无效/限流），其次冷却/可用
       const statusLabel = { ok:'可用', invalid:'key 无效', nobalance:'余额不足', limited:'限流', error:'异常' }
       const statusHint = { invalid:'该 key 无效', nobalance:'余额不足，需充值', limited:'请求被限流', error:'探测异常' }
-      const tip = (text, hint) => hint ? '<span class="badge b-cooling gr-tip" title="' + hint + '">' + text + '</span>' : '<span class="badge b-cooling">' + text + '</span>'
+      const tip = (text, hint) => hint ? '<span class="badge b-cooling gr-tip" title="' + esc(hint) + '">' + esc(text) + '</span>' : '<span class="badge b-cooling">' + esc(text) + '</span>'
       let badge
       if (k.last_status && k.last_status !== "ok") {
         badge = tip(statusLabel[k.last_status] || k.last_status, statusHint[k.last_status] || k.last_status)
-        if (k.state === "cooling") badge += '<span class="badge b-cooling">冷却 ' + k.remainMin + 'min</span>'
+        if (k.state === "cooling") badge += '<span class="badge b-cooling">冷却 ' + esc(k.remainMin) + 'min</span>'
       } else {
-        badge = k.state === "cooling" ? '<span class="badge b-cooling">冷却 ' + k.remainMin + 'min</span>' : '<span class="badge b-available">可用</span>'
+        badge = k.state === "cooling" ? '<span class="badge b-cooling">冷却 ' + esc(k.remainMin) + 'min</span>' : '<span class="badge b-available">可用</span>'
       }
       if (k.isCurrent) badge += '<span class="badge b-current">当前</span>'
       const h = health[k.name]
       let hcell = '<span class="muted">-</span>'
       if (h) {
-        // 详情只作为 hover 浮窗展示，不直接内联
-        hcell = tip(statusLabel[h.status] || h.status, h.detail.replace(/"/g, "&quot;"))
+        // 详情只作为 hover 浮窗展示，不直接内联（P1-1：h.detail 经 esc 转义，防属性注入）
+        hcell = tip(statusLabel[h.status] || h.status, h.detail)
       }
+      const n = esc(k.name), key = esc(k.key), masked = esc(k.masked)
       tr.innerHTML =
-        '<td>' + k.name + '</td>' +
-        '<td class="muted" title="' + k.key + '">' + k.masked + '</td>' +
+        '<td>' + n + '</td>' +
+        '<td class="muted" title="' + key + '">' + masked + '</td>' +
         '<td>' + badge + '</td>' +
         '<td>' + hcell + '</td>' +
         '<td><div class="actions">' +
-          (k.isCurrent ? '' : '<button data-set="' + k.name + '">启用</button>') +
+          (k.isCurrent ? '' : '<button data-set="' + n + '">启用</button>') +
           (k.state === "cooling"
-            ? '<button data-cooldown="' + k.name + '" data-min="0">清除冷却</button>'
-            : '<button data-cooldown="' + k.name + '" data-min="' + st.cooldown_minutes + '">冷却</button>') +
-          '<button data-window="' + k.name + '" title="设置该 key 独立冷却窗口（分钟，留空清除回退全局）">窗口</button>' +
-          (k.cooldown_minutes ? '<button data-window-clear="' + k.name + '" title="清除独立窗口，回退全局">清窗</button>' : '') +
-          '<button data-edit="' + k.name + '" title="编辑名称 / key 值">编辑</button>' +
-          '<button class="danger" data-del="' + k.name + '">删除</button>' +
+            ? '<button data-cooldown="' + n + '" data-min="0">清除冷却</button>'
+            : '<button data-cooldown="' + n + '" data-min="' + esc(st.cooldown_minutes) + '">冷却</button>') +
+          '<button data-window="' + n + '" title="设置该 key 独立冷却窗口（分钟，留空清除回退全局）">窗口</button>' +
+          (k.cooldown_minutes ? '<button data-window-clear="' + n + '" title="清除独立窗口，回退全局">清窗</button>' : '') +
+          '<button data-edit="' + n + '" title="编辑名称 / key 值">编辑</button>' +
+          '<button class="danger" data-del="' + n + '">删除</button>' +
         '</div></td>'
       tb.appendChild(tr)
     }
@@ -1232,6 +1420,9 @@ async function webOff() {
   if (!confirm("确认关闭 Web？关闭后本页面立即停止，且 opencode 启动时不再自动起 Web（轮换功能不受影响）。")) return
   try {
     await api("/api/web/off", {})
+    /* P1-2 修复：body 整体替换前清理全部定时器，避免残留 interval 对已删除 DOM 的 TypeError 风暴 */
+    for (const k in timers) { clearInterval(timers[k]) }
+    if (logTimer) { clearInterval(logTimer); logTimer = null }
     document.body.innerHTML = '<div style="padding:40px;text-align:center;color:#9aa3ad">Web 已关闭。<br><br>需要时用 <code>go-rotate web</code> 重新启动，或 <code>go-rotate web on</code> 恢复自动启动。</div>'
   } catch (e) { showErr(e.message) }
 }
@@ -1254,8 +1445,21 @@ async function checkKeys() {
   } catch (e) { hint.textContent = ""; showErr(e.message) }
 }
 async function doOp(p) { try { await p(); refresh() } catch (e) { showErr(e.message) } }
-function showErr(m) { const el = document.getElementById("msg"); el.textContent = m; el.className = "msg err"; setTimeout(() => showMsg(""), 3000) }
+/* P1-3 修复：错误同时写 #msg（Key 管理卡）与全局 toast（任何区块可见）；3s 后自动清除 */
+function showErr(m) {
+  const el = document.getElementById("msg"); el.textContent = m; el.className = "msg err"
+  toast(m, "error")
+  setTimeout(() => { const e2 = document.getElementById("msg"); if (e2) { e2.textContent = ""; e2.className = "msg" } }, 3000)
+}
 function showMsg(m) { const el = document.getElementById("msg"); el.textContent = m; el.className = "msg" }
+function toast(m, type) {
+  const t = document.getElementById("gtoast")
+  if (!t) return
+  t.textContent = m
+  t.className = "toast show" + (type === "error" ? " error" : " success")
+  clearTimeout(t._h)
+  t._h = setTimeout(() => { t.className = "toast" }, 3000)
+}
 
 /* ---- 独立冷却窗口 / 全局窗口编辑 ---- */
 async function editKey(name) {
@@ -1302,6 +1506,13 @@ async function refreshStats() {
   try {
     const st = await api("/api/stats")
     document.getElementById("st-total").textContent = st.totalRotations
+    /* IA B1：概览「最近轮换」= byKey 中最近 lastRotate（时间），无记录显示 - */
+    let last = ""
+    for (const n in (st.byKey || {})) {
+      const lt = st.byKey[n].lastRotate
+      if (lt && (!last || new Date(lt) > new Date(last))) last = lt
+    }
+    document.getElementById("ov-last-rotate").textContent = last ? new Date(last).toLocaleTimeString() : "-"
     const tb = document.getElementById("stats-tbody")
     const names = Object.keys(st.byKey || {})
     if (!names.length) { tb.innerHTML = '<tr><td colspan="4" class="muted">暂无轮换记录</td></tr>'; return }
@@ -1309,7 +1520,8 @@ async function refreshStats() {
     names.sort().forEach(name => {
       const k = st.byKey[name]
       const tr = document.createElement("tr")
-      tr.innerHTML = '<td>' + name + '</td><td>' + k.rotations + '</td><td>' + k.coolings +
+      /* P1-1：name 为 key 名（用户可控），拼 innerHTML 前转义 */
+      tr.innerHTML = '<td>' + esc(name) + '</td><td>' + esc(k.rotations) + '</td><td>' + esc(k.coolings) +
         '</td><td class="muted">' + (k.lastRotate ? new Date(k.lastRotate).toLocaleString() : '-') + '</td>'
       tb.appendChild(tr)
     })
@@ -1328,6 +1540,11 @@ async function refreshGateway() {
     document.getElementById("gw-mcount").textContent = "-"
     document.getElementById("gw-version").textContent = "—"
   }
+  /* IA B2：概览「网关」格 = 双通道（圆点 + 文本） */
+  const ovGw = (cls, text) => {
+    document.getElementById("ov-gw-state").innerHTML =
+      '<span class="dot ' + cls + '" style="margin-right:6px"></span>' + esc(text)
+  }
   // 管理按钮：start 在未运行且已安装时可用；stop/restart 在运行中可用
   const setBtns = (running, installed) => {
     document.getElementById("gw-start").disabled = running || !installed
@@ -1342,21 +1559,24 @@ async function refreshGateway() {
       setDash()
       if (!installed) {
         badge.innerHTML = '<span class="badge b-stopped">未安装</span>'
+        ovGw("", "未安装")
         setBtns(false, false)
         document.getElementById("gw-body").innerHTML =
           '<span class="muted">未检测到 zen-gateway 管理脚本' +
           '（<code>~/.local/bin/zen-gateway</code>）。可用 <code>bash install.sh zen-gateway</code> 安装。</span>'
       } else {
         badge.innerHTML = '<span class="badge b-stopped">未运行</span>'
+        ovGw("", "未运行")
         setBtns(false, true)
         document.getElementById("gw-body").innerHTML =
-          '<span class="muted">zen-gateway 服务未运行' + (g.error ? '（' + g.error + '）' : '') +
+          '<span class="muted">zen-gateway 服务未运行' + (g.error ? '（' + esc(g.error) + '）' : '') +
           '。点「启动」拉起 launchd 服务。</span>'
       }
       return
     }
     card.style.opacity = "1"
     badge.innerHTML = '<span class="badge b-running">运行中</span>'
+    ovGw("ok", "运行中")
     setBtns(true, true)
     const h = g.healthz || {}
     const u = g.usage || {}
@@ -1374,25 +1594,27 @@ async function refreshGateway() {
       html = '<table><thead><tr><th>Key</th><th>成功</th><th>轮换</th></tr></thead><tbody>'
       names.sort().forEach(n => {
         const s = pk[n]
-        html += '<tr><td>' + n + '</td><td>' + (s.success ?? 0) + '</td><td>' + (s.rotated ?? 0) + '</td></tr>'
+        /* P1-1：n 为 key 名（用户可控），转义后拼表 */
+        html += '<tr><td>' + esc(n) + '</td><td>' + esc(s.success ?? 0) + '</td><td>' + esc(s.rotated ?? 0) + '</td></tr>'
       })
       html += '</tbody></table>'
     }
-    // 模型列表：小字显示数量 + 前几个，details 展开看全部
+    // 模型列表：小字显示数量 + 前几个，details 展开看全部（模型名非用户直接可控，防御性转义）
     const models = g.models || []
     if (models.length) {
-      const preview = models.slice(0, 4).join(", ") + (models.length > 4 ? " …" : "")
+      const preview = models.slice(0, 4).map(esc).join(", ") + (models.length > 4 ? " …" : "")
       html += '<details class="small" style="margin-top:6px"><summary class="muted" style="cursor:pointer">' +
         '模型（' + models.length + '）：' + preview + '</summary>' +
-        '<div class="model-list" style="margin-top:4px">' + models.join("<br>") + '</div></details>'
+        '<div class="model-list" style="margin-top:4px">' + models.map(esc).join("<br>") + '</div></details>'
     }
     document.getElementById("gw-body").innerHTML = html
   } catch (e) {
     card.style.opacity = "0.55"
     badge.innerHTML = '<span class="badge b-error">状态获取失败</span>'
+    ovGw("err", "获取失败")
     setDash()
     setBtns(false, false)
-    document.getElementById("gw-body").innerHTML = '<span class="muted">获取失败：' + e.message + '</span>'
+    document.getElementById("gw-body").innerHTML = '<span class="muted">获取失败：' + esc(e.message) + '</span>'
   }
 }
 /* 管理操作：start/stop/restart（真实启停）。成功后 800ms 刷新状态（launchd 拉起有延迟）。 */
@@ -1416,7 +1638,7 @@ async function gwManage(action) {
   }
 }
 
-/* ---- 网关日志（/api/gateway/log，只读文本 + 手动刷新） ---- */
+/* ---- 网关日志（/api/gateway/log，只读文本 + 手动刷新；已移入「统计 · 分析与日志」区块） ---- */
 async function refreshGwLog() {
   const pre = document.getElementById("gwlogview")
   pre.textContent = "加载中…"
@@ -1529,9 +1751,10 @@ async function clearGatewayToken() {
     showTokenMsg(r.needsRestart ? "Token 已清除（重启网关后生效）" : "Token 已清除")
   } catch (e) { showTokenMsg(e.message, true) }
 }
+/* IA B4：生成/编辑后明文在本会话持有，直接复制明文，去掉「先显示/隐藏」前置步骤 */
 async function copyToken() {
-  const val = gwToken.plain || gwToken.masked
-  if (!val || val.indexOf("...") >= 0) return showTokenMsg("请先「显示/隐藏」查看明文后再复制", true)
+  const val = gwToken.plain
+  if (!val) return showTokenMsg("当前会话未持有明文（token 由外部设置），请先「生成」或「编辑」后再复制", true)
   try {
     await navigator.clipboard.writeText(val)
     showTokenMsg("已复制到剪贴板")
@@ -1580,16 +1803,19 @@ async function clearLog() {
 }
 refresh(); refreshLog(); refreshStats(); refreshGateway(); refreshGwLog(); switchNav("overview");
 refreshPlans(); refreshGatewayConfig();
-setInterval(refresh, 5000);
-setInterval(refreshStats, 10000);
+/* P1-2：定时器句柄存入 timers 对象，webOff() 可整体清理 */
+var timers = {}
+timers.refresh = setInterval(refresh, 5000);
+timers.stats = setInterval(refreshStats, 10000);
 // gateway 拉取带 2s 超时，独立异步刷新避免阻塞 status 轮询
-setInterval(refreshGateway, 15000);
-setInterval(refreshPlans, 30000);
+timers.gateway = setInterval(refreshGateway, 15000);
+timers.plans = setInterval(refreshPlans, 30000);
 document.getElementById("log-auto").onchange = e => { setLogAuto(e.target.checked); if (e.target.checked) refreshLog() }
 document.getElementById("log-filter").oninput = applyLogFilter;
 </script>
 </body>
-</html>`
+</html>
+`
 
 /* ---------------- 测试导出（2026-08-16 追加，仅命名导出不改变行为；供 tests/go-rotate-plugin.test.ts 使用） ---------------- */
 export {
