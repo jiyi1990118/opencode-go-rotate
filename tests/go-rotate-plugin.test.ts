@@ -984,6 +984,25 @@ describe("网关配置路由（/api/gateway/plans + /api/gateway/config）", () 
     )
     expect(unk.status).toBe(400)
   })
+  test("POST /api/gateway/token action=get 返回单个明文（复制用）；非法下标 400", async () => {
+    mod.writeGatewayConfig({ tokens: ["sk-aaaa", "sk-bbbb"] })
+    const ok = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/token", { method: "POST", body: JSON.stringify({ action: "get", index: 1 }) }),
+    )
+    const j = await ok.json()
+    expect(j.ok).toBe(true)
+    expect(j.plain).toBe("sk-bbbb")
+    // 列表仍只回掩码（GET 不可见明文）
+    const cfg = await (await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/config"))).json()
+    expect(cfg.tokens[1]).not.toContain("sk-bbbb")
+    // 越界/非法 index → 400
+    for (const badIdx of [9, -1, "x"]) {
+      const r = await mod.handleWeb(
+        new Request("http://127.0.0.1:8899/api/gateway/token", { method: "POST", body: JSON.stringify({ action: "get", index: badIdx }) }),
+      )
+      expect(r.status).toBe(400)
+    }
+  })
 })
 
 describe("WEB_HTML 网关管理区块（主导航 + 套餐卡 + Token 卡）", () => {
@@ -1037,6 +1056,8 @@ describe("WEB_HTML 网关管理区块（主导航 + 套餐卡 + Token 卡）", (
     expect(html).toContain("async function clearGatewayToken()")
     expect(html).toContain("async function delGatewayToken(") // 每行删除
     expect(html).toContain("async function copySessionPlain()") // 本次会话明文复制
+    expect(html).toContain('onclick="copyGatewayToken(')       // 每个 key 行「复制」按钮
+    expect(html).toContain("async function copyGatewayToken(") // 单 key 明文复制（action=get）
     // 操作走新多 key 后端 + 掩码列表 + 剪贴板
     expect(html).toContain('api("/api/gateway/token", { action: "gen" })')
     expect(html).toContain('api("/api/gateway/token", { action: "del", index:')

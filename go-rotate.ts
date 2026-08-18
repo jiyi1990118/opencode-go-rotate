@@ -1164,6 +1164,15 @@ async function handleWeb(req: any): Promise<Response> {
                needsRestart: true,
              }
            }
+           // 获取单个 key 明文（仅复制用途；列表仍只显示掩码，点「复制」才下发单个明文）
+           if (action === "get") {
+             const idx = Number(body.index)
+             const cfg = readGatewayConfig()
+             if (!Number.isInteger(idx) || idx < 0 || idx >= cfg.tokens.length)
+               throw new Error(`index 越界（当前 ${cfg.tokens.length} 个 key）`)
+             log(`📋  [gateway] 复制访问 key #${idx} 明文（Web 管理页）`)
+             return { ok: true, plain: cfg.tokens[idx] }
+           }
            if (action === "del") {
              const idx = Number(body.index)
              const cfg = readGatewayConfig()
@@ -2407,8 +2416,9 @@ function switchNav(block) {
 
 /* ---- 网关套餐 / Token（/api/gateway/plans + /api/gateway/config，写后显式调 restart 生效） ---- */
 var gwToken = { plain: "" } // 本会话「生成/设置」过的明文（GET 只回掩码，明文不进 token-list）
-/* token 列表多 key 渲染：每行掩码 + 删除按钮；本会话明文存在时前置「复制明文」行。
- * 掩码列表来自 /api/gateway/config（服务端只回掩码，零明文泄漏）；esc 防御性转义。 */
+/* token 列表多 key 渲染：每行掩码 + 复制 + 删除按钮；本会话明文存在时前置「复制明文」行。
+ * 掩码列表来自 /api/gateway/config（服务端只回掩码，零明文泄漏）；每项「复制」走 /api/gateway/token
+ * action=get 取单个明文（列表仍只显示掩码）；esc 防御性转义。 */
 function renderTokenList(tokens) {
   const el = document.getElementById("token-list")
   if (!Array.isArray(tokens) || !tokens.length) {
@@ -2424,6 +2434,7 @@ function renderTokenList(tokens) {
   html += tokens.map((t, i) =>
     '<div style="display:flex;align-items:center;gap:8px;padding:3px 0">' +
       '<code style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(t) + '</code>' +
+      '<button class="small" onclick="copyGatewayToken(' + i + ')">\u590d\u5236</button>' +
       '<button class="small" onclick="delGatewayToken(' + i + ')">\u5220\u9664</button></div>').join("")
   el.innerHTML = html
 }
@@ -2515,6 +2526,15 @@ async function delGatewayToken(i) {
     showTokenMsg(r.needsRestart ? "已删除（重启网关后生效）" : "已删除")
     refreshGatewayConfig()
   } catch (e) { showTokenMsg(e.message, true) }
+}
+/* 复制指定下标的访问 key 明文（列表只显示掩码，点复制走 action=get 取单个明文进剪贴板） */
+async function copyGatewayToken(i) {
+  try {
+    const r = await api("/api/gateway/token", { action: "get", index: Number(i) })
+    if (!r.plain) return showTokenMsg("未获取到明文", true)
+    await navigator.clipboard.writeText(r.plain)
+    showTokenMsg("已复制第 " + (Number(i) + 1) + " 个 Key 到剪贴板")
+  } catch (e) { showTokenMsg("复制失败：" + e.message, true) }
 }
 /* 一次「生成/设置」后明文在本会话持有，一键复制（去「先显示/隐藏」前置步骤） */
 async function copySessionPlain() {
