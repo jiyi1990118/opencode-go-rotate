@@ -1,3 +1,5 @@
+> **✅ 免费代理批量淘源工具已交付（2026-08-18，主线程，用户需求「联网查找可靠免费/付费代理平台」）**：新增根目录 `fetch_proxies.py`（零依赖 Python 标准库，4 源：proxifly/thespeedx/monosans/clarketm 的 GitHub raw 列表），`--check` 并发做完整 SOCKS5 握手 + CONNECT 隧道验证（默认目标 opencode.ai:443，可 `--to` 覆盖），`--limit/--timeout/--json` 可选；输出 `socks5://host:port 	 OK/FAIL 	 ms` 按延迟排序，直接可粘贴进 egress。**平台免费档核实（2026-08 联网）**：Webshare 免费档确认有效（永久 10 IP 无卡）；Oxylabs 免费档改变——需联系销售仅一次（不再注册即 5 IP+5GB）；Bright Data 数据中心页已 404 需注册确认。**实战验证**：859 候选 → 154 连通（18%）；接入真实 egress 池经网关健康检查，免费数据中心 IP 大多被 opencode.ai 429 限流（限流分时段），仅极少数 200——再次印证稳定付费必要性（建议 Webshare 免费 10 IP 或 DataImpulse $1/GB）。真实 egress 已恢复为 11 个连通优先出口。文档：zen-gateway/README.md 增「免费代理批量淘源」节。遗留（非阻塞）：proxyscrape/free-proxy-list 两源被反爬返回空已剔除；免费代理 429 大多是时段限流，可定期重跑脚本 + 健康检查更新池。
+
 # AGENTS.md — go-rotate
 
 > 本文件供后续维护 / 开发时快速恢复上下文。改动代码前请先读它，完成后同步更新。

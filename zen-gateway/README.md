@@ -159,6 +159,21 @@ curl -s -X POST -H "Authorization: Bearer <TOKEN>" http://127.0.0.1:18888/api/ga
 - 只读探测：不轮换、不冷却、不改 current。
 - Web 管理端（127.0.0.1:8899 → 网关 → IP 池卡「检查出口」按钮）已集成：逐项显示 `健康`/`IP 被限流 429`/`不可用` 徽标。修改出口后无需重启即可用「检查出口」验证。
 
+### 免费代理批量淘源（`fetch_proxies.py`）
+
+根目录 `fetch_proxies.py`（零依赖 Python 标准库）批量拉取 4 个免费 SOCKS5 列表源 → 连通性验证 → 输出可直接粘贴进 `egress` 的 `socks5://host:port`：
+
+```bash
+python3 fetch_proxies.py --check --limit 300 --timeout 6   # 拉取 + 连通性验证（默认验证目标 opencode.ai:443）
+python3 fetch_proxies.py --check --to 1.2.3.4:443          # 指定验证目标
+python3 fetch_proxies.py --limit 100                       # 仅拉取不验证
+python3 fetch_proxies.py --json                            # JSON 输出（供脚本消费）
+```
+
+- 输出分两栏：`socks5://host:port \t OK/FALL \t ms`，OK 项按延迟升序排前面。
+- 选出的活代理填进 `egress` 后，用 Web/IP 池「检查出口」做**真实请求**验证——连通≠可用，免费数据中心 IP 大多已被 opencode.ai 限流（429），但限流是分时段的，池子轮换 + 健康检查会自动在各出口间浮动挑可用者。
+- 2026-08 实测：859 候选 → 154 连通（18% 存活率），其中大部分对 opencode.ai 返回 429（代理连通但 IP 被限），仅极少数能 200。稳定方案仍建议付费 SOCKS5（Webshare 免费档 10 IP 或 DataImpulse $1/GB）。
+
 ## 验证
 
 ```bash
