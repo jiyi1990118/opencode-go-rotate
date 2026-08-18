@@ -36,6 +36,9 @@ import path from "node:path"
 import { execFileSync } from "node:child_process"
 // 网关访问 token 生成（crypto.randomBytes(32) → 64 hex）；bun 兼容 node:crypto
 import { randomBytes } from "node:crypto"
+// 免费代理候选批量连通性验证（SOCKS5 握手 + CONNECT，与 gateway.mjs 同一思路，纯 JS 零依赖）
+import net from "node:net"
+import { lookup } from "node:dns"
 
 // 测试隔离：bun 的 homedir() 不尊重 $HOME（实测固定返回真实 home），故支持环境变量覆盖。
 // 生产环境不设这两个变量，行为与之前完全一致。
@@ -843,18 +846,154 @@ async function gatewayTest(): Promise<{
 /** 出口池健康检查代理：转发到网关 POST /api/gateway/egress/health（真实最小探测每出口）。
  *  网关不可达 → {ok:false, error}；可达则返回 {ok:true, checkedAt, egress:[{index,url,ok,status,ms,error}]}。 */
 async function gatewayEgressHealthProxy(): Promise<any> {
-  try {
-    const r = await fetch(GATEWAY_BASE + "/api/gateway/egress/health", {
-      method: "POST",
-      headers: gatewayAuthHeaders(),
-      signal: AbortSignal.timeout(90000), // 串行探测所有出口，给足时间
-    })
-    const j: any = await r.json().catch(() => null)
-    if (!r.ok || !j) return { ok: false, error: j?.error?.message ?? `网关健康检查失败 HTTP ${r.status}` }
-    return { ok: true, checkedAt: j.checkedAt, egress: j.egress ?? [] }
-  } catch (e: any) {
-    return { ok: false, error: String(e?.message ?? e) }
+   try {
+     const r = await fetch(GATEWAY_BASE + "/api/gateway/egress/health", {
+       method: "POST",
+       headers: gatewayAuthHeaders(),
+       signal: AbortSignal.timeout(90000), // 串行探测所有出口，给足时间
+     })
+     const j: any = await r.json().catch(() => null)
+     if (!r.ok || !j) return { ok: false, error: j?.error?.message ?? `网关健康检查失败 HTTP ${r.status}` }
+     return { ok: true, checkedAt: j.checkedAt, egress: j.egress ?? [] }
+   } catch (e: any) {
+     return { ok: false, error: String(e?.message ?? e) }
+   }
+ }
+
+/* ---------------- 免费代理批量淘源 + 连通性验证（Web「IP 池」卡集成，零依赖） ----------------
+ * 与根目录 fetch_proxies.py 同思路：拉 4 个免费 SOCKS5 列表源 → 去重 → 逐个做完整
+ * SOCKS5 握手 + CONNECT 隧道到 opencode.ai:443，返回 {url, ok, ms, err} 供前端展示状态。 */
+
+const PROXY_SOURCES = {
+  proxifly: "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt",
+  thespeedx: "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+  monosans: "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+  clarketm: "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+}
+
+const PROBE_HOST = "opencode.ai"
+const PROBE_PORT = 443
+
+/** 解析源文本 → socks5://host:port 唯一列表（容忍 host:port / socks5://host:port）。 */
+function parseProxyCandidates(text: string): string[] {
+  const seen = new Set<string>()
+  for (const raw of text.split("\n")) {
+    const line = raw.trim()
+    if (!line || line.startsWith("#")) continue
+    const m = line.match(/(?:socks5:\/\/)?(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})/)
+    if (!m) continue
+    const port = Number(m[2])
+    if (!(port >= 1 && port <= 65535)) continue
+    seen.add(`socks5://${m[1]}:${port}`)
   }
+  return [...seen]
+}
+
+/** 对单个 socks5 代理做连通性验证：TCP → SOCKS5 握手(无认证/user-pass) → CONNECT 到 opencode.ai:443。
+ *  返回 {ok, ms, err}；任一步失败 ok=false + err。目标主机先本地 DNS 解析为 IPv4（代理只做隧道转发）。 */
+function probeSocks5(url: string, timeoutMs = 5000): Promise<{ ok: boolean; ms: number; err?: string }> {
+  const m = url.match(/^socks5:\/\/(?:(.*)@)?([^:]+):(\d{1,5})$/)
+  if (!m) return Promise.resolve({ ok: false, ms: 0, err: "url 非法" })
+  const [, cred, host, portStr] = m
+  const port = Number(portStr)
+  const [user, pass] = cred ? cred.split(":") : [null, null]
+  return new Promise((resolve) => {
+    const t0 = Date.now()
+    lookup(PROBE_HOST, { family: 4 }, (dnsErr, ip) => {
+      if (dnsErr) return resolve({ ok: false, ms: 0, err: `dns: ${dnsErr.message}` })
+      const sock = net.connect(port, host)
+      let stage = 0 // 0=握手 1=user-pass 认证 2=CONNECT
+      let settled = false
+      let buf = Buffer.alloc(0)
+      const timer = setTimeout(() => fail(`timeout ${timeoutMs}ms`), timeoutMs)
+      const cleanup = () => clearTimeout(timer)
+      const fail = (err: string) => {
+        if (settled) return
+        settled = true; cleanup(); sock.destroy()
+        resolve({ ok: false, ms: Date.now() - t0, err })
+      }
+      const sendConnect = (targetIp: string) => {
+        stage = 2
+        const req = Buffer.concat([
+          Buffer.from([0x05, 0x01, 0x00, 0x01]),
+          Buffer.from(targetIp.split(".").map(Number)),
+          Buffer.from([(PROBE_PORT >> 8) & 0xff, PROBE_PORT & 0xff]),
+        ])
+        sock.write(req)
+      }
+      sock.on("error", (e) => fail(`conn: ${e.message}`))
+      sock.on("connect", () => {
+        const methods = user ? [0x00, 0x02] : [0x00]
+        sock.write(Buffer.from([0x05, methods.length, ...methods]))
+      })
+      sock.on("data", (chunk: Buffer) => {
+        if (settled) return
+        buf = Buffer.concat([buf, chunk])
+        if (stage === 0) {
+          if (buf.length < 2) return
+          const ver = buf[0], method = buf[1]
+          buf = buf.subarray(2)
+          if (ver !== 0x05) return fail("握手版本错误")
+          if (method === 0x00) sendConnect(ip)
+          else if (method === 0x02 && user) {
+            stage = 1
+            const ub = Buffer.from(user, "utf8"), pb = Buffer.from(pass || "", "utf8")
+            sock.write(Buffer.concat([Buffer.from([0x01, ub.length]), ub, Buffer.from([pb.length]), pb]))
+          } else fail("握手方法不被接受")
+        } else if (stage === 1) {
+          if (buf.length < 2) return
+          if (buf[1] !== 0x00) return fail("user-pass 认证失败")
+          buf = buf.subarray(2)
+          sendConnect(ip)
+        } else if (stage === 2) {
+          if (buf.length < 10) return
+          cleanup()
+          if (buf[1] === 0x00) {
+            settled = true; sock.destroy()
+            resolve({ ok: true, ms: Date.now() - t0 })
+          } else {
+            fail(`CONNECT 拒绝 code=${buf[1]}`)
+          }
+        }
+      })
+    })
+  })
+}
+
+/** 拉全部源 → 候选去重 → 并发验证（限制并发 30，防雪崩）。返回带状态的候选列表。 */
+async function fetchFreeProxies(limit = 200, timeoutMs = 5000): Promise<any> {
+  const fetches: Promise<void>[] = []
+  const pool: { url: string; source: string }[] = []
+  const seen = new Set<string>()
+  for (const [name, url] of Object.entries(PROXY_SOURCES)) {
+    fetches.push(
+      fetch(url, { signal: AbortSignal.timeout(15000) })
+        .then((r) => r.text())
+        .then((text) => {
+          for (const u of parseProxyCandidates(text)) {
+            if (seen.has(u)) continue
+            seen.add(u)
+            pool.push({ url: u, source: name })
+          }
+        })
+        .catch(() => {}),
+    )
+  }
+  await Promise.allSettled(fetches)
+  const limited = pool.slice(0, limit)
+  const results: any[] = []
+  const queue = [...limited]
+  const workers = Array.from({ length: Math.min(30, limited.length) }, async () => {
+    for (;;) {
+      const item = queue.shift()
+      if (!item) break
+      const st = await probeSocks5(item.url, timeoutMs)
+      results.push({ url: item.url, source: item.source, ok: st.ok, ms: st.ms, err: st.err ?? null })
+    }
+  })
+  await Promise.allSettled(workers)
+  results.sort((a, b) => Number(b.ok) - Number(a.ok) || (a.ms || 1e9) - (b.ms || 1e9))
+  return { ok: true, total: pool.length, checked: results.length, candidates: results }
 }
 
 /** GET /api/gateway/models 透传：网关 go + zen 双套餐模型清单（各自动态 ∪ 内置）+ 别名。
@@ -1167,6 +1306,18 @@ async function handleWeb(req: any): Promise<Response> {
   // 出口池健康检查（代理到网关真实最小探测，判别隧道 + 该出口 IP 是否被上游限流）
   if (method === "POST" && route === "/api/gateway/egress/health") {
     return json(await gatewayEgressHealthProxy())
+  }
+  // 免费代理批量淘源：拉 4 源 → 连通性验证 → 带状态候选列表（供选择加入 egress）
+  if (method === "POST" && route === "/api/gateway/proxies/fetch") {
+    try {
+      let body: any = {}
+      try { body = await req.json() } catch {}
+      const limit = Math.max(1, Math.min(Number(body?.limit) || 200, 500))
+      const timeout = Math.max(1, Math.min(Number(body?.timeout) || 5000, 15000))
+      return json(await fetchFreeProxies(limit, timeout))
+    } catch (e: any) {
+      return json({ ok: false, error: String(e?.message ?? e) })
+    }
   }
   if (method === "POST") {
     try {
@@ -1982,6 +2133,17 @@ try {
     <div class="muted" style="margin-top:6px">zen 免费档按 IP 限流（429 FreeUsageLimit）；配置 <b>≥2</b> 个出口后网关在被限时自动切到下一个出口。修改后需「重启网关」生效；「检查出口」逐项真实最小探测（每项消耗 ~1 token）。</div>
     <div id="egress-msg" class="msg" style="margin-top:6px"></div>
   </div>
+
+  <div class="card" id="gw-proxy-card">
+    <b>免费代理（批量淘源） <span id="proxy-badge"></span></b>
+    <div class="row" style="margin-top:10px">
+      <button class="primary" id="proxy-fetch-btn" onclick="fetchFreeProxies()">拉取免费代理</button>
+      <span class="muted" style="margin-left:8px;flex:1">拉取后逐个做 SOCKS5 连通验证（opencode.ai:443），可直接选出加入 IP 池。</span>
+    </div>
+    <div id="proxy-list" class="muted" style="margin-top:10px">未拉取。点「拉取免费代理」联网淘一批可用 SOCKS5 出口。</div>
+    <div class="muted" style="margin-top:6px">提示：连通 ≠ 可绕过限流——免费数据中心 IP 大多被 opencode.ai 限（429，分时段）。选几个加入池后点「检查出口」看真实状态。</div>
+    <div id="proxy-msg" class="msg" style="margin-top:6px"></div>
+  </div>
   </div>
 
   <div class="card" id="gw-usage-card">
@@ -2664,6 +2826,61 @@ async function toggleIpRotation() {
     btn.textContent = old
   }
 }
+var proxyCandidates = [] // 免费代理候选缓存：{url, source, ok, ms, err}
+async function fetchFreeProxies() {
+  const btn = document.getElementById("proxy-fetch-btn")
+  const msg = document.getElementById("proxy-msg")
+  const old = btn.textContent
+  btn.textContent = "拉取中…（联网 + 连通验证，约 30s）"; btn.disabled = true
+  try {
+    const r = await api("/api/gateway/proxies/fetch", { limit: 200, timeout: 5000 })
+    if (!r.ok) throw new Error(r.error || "拉取失败")
+    proxyCandidates = r.candidates || []
+    renderProxyList()
+    const good = proxyCandidates.filter((c) => c.ok).length
+    msg.className = "msg"
+    msg.textContent = "共 " + r.total + " 候选，验证 " + r.checked + " 个，可用 " + good + " 个（连通性）"
+  } catch (e) {
+    msg.className = "msg err"; msg.textContent = "拉取失败：" + e.message
+  }
+  btn.textContent = old; btn.disabled = false
+}
+function renderProxyList() {
+  const el = document.getElementById("proxy-list")
+  const badge = document.getElementById("proxy-badge")
+  const good = proxyCandidates.filter((c) => c.ok).length
+  badge.innerHTML = proxyCandidates.length
+    ? '<span class="badge b-' + (good ? "available" : "stopped") + '">' + good + "/" + proxyCandidates.length + " 可用</span>"
+    : ""
+  if (!proxyCandidates.length) { el.textContent = "未拉取。点「拉取免费代理」联网淘一批可用 SOCKS5 出口。"; return }
+  el.innerHTML = proxyCandidates.map((c, i) =>
+    '<div style="display:flex;align-items:center;gap:8px;padding:3px 0;border-bottom:1px solid var(--bd-2)">' +
+      '<span class="badge ' + (c.ok ? "b-available" : "b-invalid") + '">' + (c.ok ? "可用" : "不可用") + '</span>' +
+      '<code style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(c.url) + '">' + esc(c.url) + '</code>' +
+      '<span class="muted" style="width:52px">' + (c.ms != null ? c.ms + "ms" : "-") + '</span>' +
+      (c.ok
+        ? '<button class="small" onclick="addProxyToPool(' + i + ')">加入 IP 池</button>'
+        : '<span class="muted" style="font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis" title="' + esc(c.err || "") + '">' + esc(c.err || "") + '</span>')).join("")
+}
+async function addProxyToPool(i) {
+  const c = proxyCandidates[i]
+  if (!c) return
+  const msg = document.getElementById("proxy-msg")
+  try {
+    const r = await api("/api/gateway/egress", { action: "add", url: c.url })
+    msg.className = "msg"
+    msg.textContent = "已加入 IP 池：" + c.url + "（重启网关后生效）"
+    // 刷新 IP 池卡列表以包含新出口
+    const cfg = await api("/api/gateway/config")
+    renderEgressList(cfg.egress || [], !!cfg.egressEnabled, !!cfg.ipRotation)
+    // 标记已加入（从候选移除）
+    proxyCandidates.splice(i, 1)
+    renderProxyList()
+  } catch (e) {
+    msg.className = "msg err"
+    msg.textContent = (String(e.message).includes("已存在") ? "已在 IP 池中：" : "加入失败：") + c.url
+  }
+}
 async function refreshPlans() {
   try {
     const p = await api("/api/gateway/plans")
@@ -2886,6 +3103,8 @@ export {
   gatewayTest,
   gatewayEgressHealthProxy,
   gatewayCtlExists,
+  fetchFreeProxies,
+  parseProxyCandidates,
   genGatewayToken,
   readGatewayConfig,
   writeGatewayConfig,

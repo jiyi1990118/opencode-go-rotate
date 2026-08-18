@@ -1209,6 +1209,54 @@ describe("WEB_HTML 网关管理区块（主导航 + 套餐卡 + Token 卡）", (
     // IP 轮换启用条件提示
     expect(html).toContain("≥2")
   })
+  test("免费代理淘源卡（gw-proxy-card + 拉取按钮 + 候选状态渲染 + 加入池）", () => {
+    const html: string = (mod as any).WEB_HTML
+    expect(html).toContain('id="gw-proxy-card"')
+    expect(html).toContain('id="proxy-badge"')
+    expect(html).toContain('id="proxy-list"')
+    expect(html).toContain('id="proxy-fetch-btn"')
+    expect(html).toContain('id="proxy-msg"')
+    expect(html).toContain('onclick="fetchFreeProxies()"')
+    expect(html).toContain("async function fetchFreeProxies()")
+    expect(html).toContain("function renderProxyList(")
+    expect(html).toContain("async function addProxyToPool(")
+    expect(html).toContain('api("/api/gateway/proxies/fetch", { limit:')
+    expect(html).toContain('api("/api/gateway/egress", { action: "add", url: c.url })')
+    expect(html).toContain("加入 IP 池")
+    // 空态提示
+    expect(html).toContain("未拉取。点「拉取免费代理」")
+    // 连通 ≠ 可用的引导提示
+    expect(html).toContain("连通 ≠ 可绕过限流")
+  })
+})
+
+describe("免费代理淘源纯函数（parseProxyCandidates）", () => {
+  test("解析 host:port / socks5://host:port / 去重", () => {
+    const fn = (mod as any).parseProxyCandidates
+    const out = fn("1.2.3.4:1080\nsocks5://5.6.7.8:9999\n1.2.3.4:1080\n# comment\njunk line\nsocks5://1.1.1.1:70000\n")
+    expect(out).toEqual(["socks5://1.2.3.4:1080", "socks5://5.6.7.8:9999"])
+  })
+  test("非 socks 行跳过", () => {
+    const fn = (mod as any).parseProxyCandidates
+    expect(fn("http://x:80\nhello:abc\n")).toEqual([])
+  })
+  test("POST /api/gateway/proxies/fetch 路由可达（limit=1 快速，返回 ok 结构而非 500）", async () => {
+    const req = new Request("http://127.0.0.1:8899/api/gateway/proxies/fetch", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ limit: 1, timeout: 1 }),
+    })
+    // 单测进程内 fetch 外部网络可能不通，但必须返回结构化 JSON（ok:true + candidates 或 ok:false + error），绝不为 500
+    const res = await mod.handleWeb(req)
+    expect(res.status).toBe(200)
+    const j = await res.json()
+    expect(typeof j.ok).toBe("boolean")
+    if (j.ok) {
+      expect(Array.isArray(j.candidates)).toBe(true)
+    } else {
+      expect(typeof j.error).toBe("string")
+    }
+  })
 })
 
 describe("WEB_HTML 重构（IA + 设计系统 + P1 修复，2026-08-17）", () => {
