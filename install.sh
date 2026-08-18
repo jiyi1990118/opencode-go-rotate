@@ -63,8 +63,8 @@ for arg in "$@"; do
   [ "$arg" = "--all" ] && ALL_FLAG="yes"
 done
 
-# 判断是"本地运行"还是"curl|bash"
-THIS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+# 判断是"本地运行"还是"curl|bash"：BASH_SOURCE[0] 在 bash -s（stdin 管道）时未定义，回退 $0
+THIS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo '')"
 
 fetch_or_copy() {
   local src="$1" dst="$2"
