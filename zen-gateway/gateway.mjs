@@ -37,9 +37,12 @@
  * 后台：  nohup node gateway.mjs >/tmp/zen-gateway.log 2>&1 &
  */
 import http from "node:http"
+import net from "node:net"
+import tls from "node:tls"
 import os from "node:os"
 import path from "node:path"
 import { execFile, execFileSync } from "node:child_process"
+import { Readable } from "node:stream"
 import {
   readFileSync,
   writeFileSync,
@@ -528,12 +531,250 @@ function readGatewayConfig() {
       tokens: Array.isArray(cfg.tokens)
         ? cfg.tokens.filter((t) => typeof t === "string" && t.length > 0)
         : [],
+      egress: Array.isArray(cfg.egress) ? cfg.egress.filter((e) => typeof e === "string") : [],
     }
   } catch (e) {
     log(`⚠️  readGatewayConfig 失败（${GATEWAY_CONFIG}），回退默认: ${e.message}`)
     return {}
   }
 }
+
+/* ---------------- zen 免费档 IP 轮换（egress 出口池） ----------------
+ * 背景：opencode.ai 免费档按 IP 限流（实测直连固定 IP 高频易 429，换出口 IP 可绕过）。
+ * 方案：gateway-config.json 可选 `egress` 数组，每项 "direct"（本地直连）或 "socks5://[user:pass@]host:port"。
+ *  egress.length<2 时不启用轮换（仅 direct，行为与旧版完全一致）。429 FreeUsageLimitError 时切下一出口重试。 */
+
+/** 归一化出口配置 → 出口对象数组。非法项跳过；仅 direct → 单出口（不启用轮换）。
+ *  纯函数：不读文件不碰全局，直接喂 gateway-config 的 egress 字段。 */
+function parseEgressList(list) {
+  const out = []
+  if (!Array.isArray(list)) return out
+  const seen = new Set()
+  for (const raw of list) {
+    if (typeof raw !== "string" || raw.length === 0) continue
+    const e = raw === "direct" ? { type: "direct" } : parseSocks5Url(raw)
+    if (!e || seen.has(String(raw))) continue
+    out.push({ ...e, raw })
+    seen.add(String(raw))
+  }
+  return out
+}
+
+/** 解析 "socks5://[user:pass@]host:port" → {type:'socks5', host, port, user?, pass?}；非法返回 null。 */
+function parseSocks5Url(url) {
+  let s = String(url)
+  if (!s.startsWith("socks5://")) return null
+  s = s.slice("socks5://".length)
+  let user = null
+  let pass = null
+  const at = s.lastIndexOf("@")
+  if (at >= 0) {
+    const cred = s.slice(0, at)
+    const sep = cred.indexOf(":")
+    user = sep >= 0 ? cred.slice(0, sep) : cred
+    pass = sep >= 0 ? cred.slice(sep + 1) : null
+    s = s.slice(at + 1)
+  }
+  // 移除路径/斜杠残留（如尾斜杠）
+  s = s.replace(/\/.*$/, "")
+  const m = s.match(/^([^:\s]+):(\d{1,5})$/)
+  if (!m) return null
+  const port = Number(m[2])
+  if (!(port >= 1 && port <= 65535)) return null
+  return { type: "socks5", host: m[1], port, user: user || null, pass: pass || null }
+}
+
+/** Socks5 出口请求：手写 SOCKS5 握手 + CONNECT 隧道 → TLS → HTTP/1.1。
+ *  纯逻辑接口（零依赖）：返回与 fetch Response 兼容的对象 {status, headers(Map), ok, text(), body(WebStream)}。
+ *  opts: { method, path, headers:{name:value}, body(String), targetHost, targetPort, timeoutMs, signal }
+ *  body 是 Web ReadableStream（实时透传流式 SSE；非流式由上层 text() 聚合）。 */
+async function socks5Request(egress, targetHost, targetPort, opts) {
+  const { method = "POST", path = "/", headers = {}, body = "", timeoutMs = UPSTREAM_TIMEOUT_MS, signal, secure = true } = opts
+  return new Promise((resolve, reject) => {
+    const sock = net.connect(egress.port, egress.host)
+    let stage = 0 // 0=握手 1=CONNECT 2=隧道建立 3=HTTP 头收集 4=体流
+    let settled = false
+    const timer = setTimeout(() => {
+      if (!settled) { settled = true; sock.destroy(); reject(new Error(`socks5 tunnel timeout (${egress.host}:${egress.port})`)) }
+    }, timeoutMs)
+    const cleanup = () => clearTimeout(timer)
+    const fail = (err) => {
+      if (settled) return
+      settled = true; cleanup(); sock.destroy(); reject(err)
+    }
+    const onAbort = () => fail(new Error("client aborted"))
+    if (signal) {
+      if (signal.aborted) { fail(new Error("client aborted")); return }
+      signal.addEventListener("abort", onAbort, { once: true })
+    }
+    sock.on("error", (e) => fail(new Error(`socks5 connect error: ${e.message}`)))
+    sock.on("connect", () => {
+      const noAuth = !egress.user
+      const methods = noAuth ? [0x00] : [0x00, 0x02]
+      sock.write(Buffer.from([0x05, methods.length, ...methods]))
+    })
+    sock.on("data", (buf) => {
+      if (stage === 0) {
+        if (buf.length < 2) return
+        const chosen = buf[1]
+        if (chosen === 0xff) { fail(new Error("socks5 auth not accepted")); return }
+        if (chosen === 0x02 && egress.user) {
+          const u = Buffer.from(egress.user, "utf8")
+          const p = Buffer.from(egress.pass || "", "utf8")
+          if (u.length > 255 || p.length > 255) { fail(new Error("socks5 user/pass too long")); return }
+          sock.write(Buffer.concat([Buffer.from([0x01, u.length]), u, Buffer.from([p.length]), p]))
+          stage = 0x10
+          return
+        }
+        if (chosen === 0x00) {
+          sock.write(makeConnectReq(targetHost, targetPort))
+          stage = 1
+          return
+        }
+        fail(new Error(`socks5 unexpected auth method ${chosen}`))
+        return
+      }
+      if (stage === 0x10) {
+        if (buf.length < 2 || buf[1] !== 0x00) { fail(new Error("socks5 user-pass auth failed")); return }
+        sock.write(makeConnectReq(targetHost, targetPort))
+        stage = 1
+        return
+      }
+      if (stage === 1) {
+        if (buf.length < 2 || buf[1] !== 0x00) {
+          fail(new Error(`socks5 CONNECT failed (reply code ${buf[1]})`))
+          return
+        }
+        stage = 2
+        // SOCKS5 CONNECT 回复长度按 ATYP 变化：VER REP RSV ATYP(1B) + 地址 + 端口。
+        // ATYP=0x01 IPv4(4B)、0x04 IPv6(16B)、0x03 域名(1B 长度 + N)。用缓冲正确切出 rest（可能带代理早期返回的数据）。
+        const atyp = buf.length >= 4 ? buf[3] : null
+        let connLen = 4
+        if (atyp === 0x01) connLen += 4 + 2
+        else if (atyp === 0x04) connLen += 16 + 2
+        else if (atyp === 0x03) connLen += 1 + (buf.length > 4 ? buf[4] : 0) + 2
+        const rest = buf.length > connLen ? buf.subarray(connLen) : Buffer.alloc(0)
+        // 上游加密（HTTPS）→ 套 TLS；明文（HTTP）→ 直接用原始 socket
+        const beginHttp = (conn, restBuf) => {
+          const hdrs = Object.entries(headers)
+            .map(([k, v]) => `${k}: ${v}`)
+            .join("\r\n")
+          conn.write(
+            `${method} ${path} HTTP/1.1\r\nHost: ${targetHost}\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n${hdrs}\r\n\r\n${body}`
+          )
+          // ---- HTTP 响应解析（流式）----
+          let headBuf = restBuf && restBuf.length ? restBuf : Buffer.alloc(0)
+          let bodyOut = null
+          let resolved = false
+          let bodyBuf = Buffer.alloc(0) // chunked 专用缓冲
+          const feed = (data) => {
+            if (!data || data.length === 0) return
+            if (stage === 3) {
+              headBuf = headBuf.length ? Buffer.concat([headBuf, data]) : data
+              const idx = headBuf.indexOf("\r\n\r\n")
+              if (idx < 0) return
+              const parsed = parseHead(headBuf.slice(0, idx).toString("utf8"))
+              if (!parsed) { fail(new Error("bad http status line")); return }
+              stage = 4
+              const enc = parsed.headers.get("transfer-encoding")
+              const isChunked = enc && enc.toLowerCase().includes("chunked")
+              const clen = Number(parsed.headers.get("content-length") || "0")
+              bodyOut = new Readable({ read() {} })
+              let gotLen = 0
+              const feedBody = (d) => {
+                if (!d || d.length === 0 || bodyOut.destroyed) return
+                if (isChunked) {
+                  bodyBuf = bodyBuf.length ? Buffer.concat([bodyBuf, d]) : d
+                  for (;;) {
+                    const eol = bodyBuf.indexOf("\r\n")
+                    if (eol < 0) return
+                    const size = parseInt(bodyBuf.slice(0, eol).toString("utf8"), 16)
+                    if (isNaN(size)) { bodyOut.destroy(new Error("bad chunk size")); return }
+                    const chunkEnd = eol + 2 + size
+                    if (bodyBuf.length < chunkEnd + 2) return
+                    if (size > 0) bodyOut.push(bodyBuf.slice(eol + 2, eol + 2 + size))
+                    bodyBuf = bodyBuf.slice(chunkEnd + 2)
+                    if (size === 0) { bodyOut.push(null); return }
+                  }
+                } else if (clen > 0) {
+                  const need = clen - gotLen
+                  const take = Math.min(need, d.length)
+                  bodyOut.push(d.subarray(0, take))
+                  gotLen += take
+                  if (gotLen >= clen) bodyOut.push(null)
+                } else {
+                  bodyOut.push(d)
+                }
+              }
+              // 头后的残留体数据立即喂入
+              feedBody(headBuf.slice(idx + 4))
+              cleanup(); if (signal) signal.removeEventListener("abort", onAbort)
+              resolved = true
+              const resObj = {
+                status: parsed.status,
+                ok: parsed.status >= 200 && parsed.status < 300,
+                headers: parsed.headers,
+                body: Readable.toWeb(bodyOut),
+                text: async () => {
+                  let s = ""
+                  for await (const c of bodyOut) s += c.toString()
+                  return s
+                },
+                _raw: bodyOut,
+              }
+              conn.removeAllListeners("error")
+              conn.on("data", (c) => feedBody(c))
+              conn.on("end", () => { if (!bodyOut.destroyed) bodyOut.push(null) })
+              conn.on("error", () => { if (!bodyOut.destroyed) bodyOut.destroy() })
+              resolve(resObj)
+              return
+            }
+            if (stage === 4 && bodyOut) feedBody(data)
+          }
+          conn.on("data", feed)
+        }
+        if (secure) {
+          const tlsSock = tls.connect({ socket: sock, servername: targetHost })
+          tlsSock.on("error", (e) => fail(new Error(`tls handshake error: ${e.message}`)))
+          tlsSock.on("secureConnect", () => {
+            stage = 3
+            beginHttp(tlsSock, rest)
+          })
+        } else {
+          stage = 3
+          beginHttp(sock, rest)
+        }
+        return
+      }
+    })
+  })
+}
+
+function makeConnectReq(host, port) {
+  const hostBuf = Buffer.from(host, "ascii")
+  const header = Buffer.from([0x05, 0x01, 0x00, 0x03, hostBuf.length])
+  const portBuf = Buffer.from([port >> 8, port & 0xff])
+  return Buffer.concat([header, hostBuf, portBuf])
+}
+
+/** 解析 HTTP/1.1 响应头 → {status, headers(Map)}（纯函数） */
+function parseHead(head) {
+  const lines = head.split("\r\n")
+  const statusLine = lines[0].match(/^HTTP\/1\.[01] (\d{3})/)
+  if (!statusLine) return null
+  const status = Number(statusLine[1])
+  const headers = new Map()
+  for (let i = 1; i < lines.length; i++) {
+    const c = lines[i].indexOf(":")
+    if (c < 0) continue
+    headers.set(lines[i].slice(0, c).trim().toLowerCase(), lines[i].slice(c + 1).trim())
+  }
+  return {
+    status,
+    headers: { get: (k) => headers.get(String(k).toLowerCase()) || null },
+  }
+}
+
 
 /** 解析套餐 → ACTIVE_PLAN{id, upstreamBase, defaultModel, builtinModels}。
  *  config：readGatewayConfig() 的返回值（plan 字段）；env：显式覆盖（缺省 process.env）。
@@ -581,6 +822,49 @@ const ACTIVE_TOKEN = ACTIVE_TOKENS.length > 0 ? ACTIVE_TOKENS[0] : null
 const UPSTREAM_BASE = ACTIVE_PLAN.upstreamBase
 const GO_API = UPSTREAM_BASE + "/chat/completions"
 const MODELS_API = UPSTREAM_BASE + "/models"
+
+/* ---------------- zen 档 IP 轮换（egress 出口池）运行时状态 ----------------
+ * 仅在 zen 套餐且 gateway-config 配置了 egress 数组（≥2 出口）时启用；否则零开销、行为与旧版完全一致。
+ * 出口选择：FreeUsageLimitError 时切到下一出口重试一次（成功固化）；平时固定在当前健康出口，不无脑轮换。 */
+const EGRESS_LIST = parseEgressList(_GW_CFG && _GW_CFG.egress)
+const EGRESS_ENABLED = ACTIVE_PLAN.id === "zen" && EGRESS_LIST.length >= 2
+let _egressIdx = 0
+let _egressOk = true // 当前出口是否健康（429 → false 触发切换）
+
+/** 取当前出口；EGRESS_ENABLED 时才轮换（否则恒 direct=null）。 */
+function currentEgress() {
+  if (!EGRESS_ENABLED) return null
+  return EGRESS_LIST[_egressIdx] && EGRESS_LIST[_egressIdx].type === "direct"
+    ? null
+    : EGRESS_LIST[_egressIdx] || null
+}
+
+/** 标记当前出口 429 → 切到下一出口（mod 循环）；记录日志。 */
+function rotateEgress() {
+  if (!EGRESS_ENABLED) return null
+  const prev = EGRESS_LIST[_egressIdx] || { type: "direct" }
+  _egressIdx = (_egressIdx + 1) % EGRESS_LIST.length
+  const next = EGRESS_LIST[_egressIdx]
+  log(`🔁  zen 档出口轮换: ${prev.raw || "direct"} → ${next ? next.raw : "direct"}`)
+  return currentEgress()
+}
+
+/** 请求成功后调用：确认当前出口健康（egressOk 复位，避免连续成功仍误判）。 */
+function egressSucceeded() {
+  if (!EGRESS_ENABLED) return
+  _egressOk = true
+}
+
+/** 当前出口健康状态（测试/状态端点用） */
+function egressSnapshot() {
+  return {
+    enabled: EGRESS_ENABLED,
+    count: EGRESS_LIST.length,
+    index: _egressIdx,
+    current: EGRESS_LIST[_egressIdx] ? EGRESS_LIST[_egressIdx].raw : "direct",
+    list: EGRESS_LIST.map((e) => e.raw),
+  }
+}
 const DEFAULT_MODEL = ACTIVE_PLAN.defaultModel
 
 // 其它 agent 常请求的模型名 → zen 模型。未命中 → 默认模型。
@@ -1013,14 +1297,36 @@ function combineSignals(signalA, signalB) {
 
 /** 发送一次上游请求（不重试），返回 {res, bodyText}（stream 时 bodyText 可能未读完）
  *  clientSignal：客户端断开 signal，触发时取消上游 fetch（E1，防资源泄漏）。 */
-async function upstreamOnce(key, bodyStr, isStream, timeoutMs, clientSignal) {
+async function upstreamOnce(key, bodyStr, isStream, timeoutMs, clientSignal, egress = null) {
+  // egress=null → 本地直连（默认，行为不变）；egress.socks5 → 走 SOCKS5 隧道（zen 档 IP 轮换）。
+  const targetURL = new URL(GO_API)
+  const commonHeaders = {
+    "content-type": "application/json",
+    authorization: `Bearer ${key}`,
+    "user-agent": UPSTREAM_UA,
+  }
+  if (egress && egress.type === "socks5") {
+    const res = await socks5Request(
+      { host: egress.host, port: egress.port, user: egress.user, pass: egress.pass },
+      targetURL.hostname,
+      Number(targetURL.port || (targetURL.protocol === "https:" ? 443 : 80)),
+      {
+        method: "POST",
+        path: targetURL.pathname + targetURL.search,
+        headers: commonHeaders,
+        body: bodyStr,
+        timeoutMs,
+        signal: combineSignals(AbortSignal.timeout(timeoutMs), clientSignal),
+        secure: targetURL.protocol === "https:",
+      }
+    )
+    if (res.ok) return { res, bodyText: "" }
+    const bodyText = await res.text()
+    return { res, bodyText }
+  }
   const res = await fetch(GO_API, {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${key}`,
-      "user-agent": UPSTREAM_UA,
-    },
+    headers: commonHeaders,
     body: bodyStr,
     signal: combineSignals(AbortSignal.timeout(timeoutMs), clientSignal),
   })
@@ -1130,10 +1436,40 @@ async function sendWithRotation(bodyObj, isStream, clientSignal, endpoint = "cha
   const bodyStr = JSON.stringify({ ...bodyObj, model: mappedModel })
   const timeoutMs = isStream ? UPSTREAM_TIMEOUT_MS : PROBE_TIMEOUT_MS
 
-  // 第 1 次
-  let { res, bodyText } = await upstreamOnce(key.key, bodyStr, isStream, timeoutMs, clientSignal)
+  // 第 1 次（用当前出口；EGRESS_ENABLED 时初始即走 egress）
+  let { res, bodyText } = await upstreamOnce(key.key, bodyStr, isStream, timeoutMs, clientSignal, currentEgress())
+
+  // zen 档 IP 轮换：FreeUsageLimitError（免费档按 IP 限流）且启用出口池 → 切下一出口重试一次。
+  if (EGRESS_ENABLED && !res.ok && parseErrorBody(bodyText)?.error?.type === "FreeUsageLimitError") {
+    log(`🔁  zen 档当前出口 429（FreeUsageLimit），切出口重试（key="${key.name}"）`)
+    const nextEgress = rotateEgress()
+    const retry = await upstreamOnce(key.key, bodyStr, isStream, timeoutMs, clientSignal, nextEgress)
+    if (retry.res.ok) {
+      egressSucceeded()
+      usageInc(key.name, "success")
+      let retBody = retry.bodyText
+      if (!isStream) {
+        const full = retry.bodyText || (await retry.res.text())
+        const auto = await retryTruncatedContent(full, bodyObj, mappedModel, key.key, timeoutMs, clientSignal)
+        if (auto) {
+          log(`✅  出口切换后截断重试成功`)
+          appendUsage({ key: key.name, ok: true, model: mappedModel, rotated: false, endpoint })
+          return { res: new Response(null, { status: 200 }), bodyText: auto, upstreamBody: auto, mappedModel }
+        }
+        if (full) retBody = full
+      }
+      appendUsage({ key: key.name, ok: true, model: mappedModel, rotated: false, endpoint })
+      return { res: retry.res, bodyText: retBody, upstreamBody: retBody, mappedModel }
+    }
+    // 出口切换后仍失败：透传（不无限重试；保留新出口，下次请求再判）
+    log(`⚠️  出口切换后仍失败（status=${retry.res.status}），透传`)
+    appendUsage({ key: key.name, ok: false, model: mappedModel, rotated: false, endpoint })
+    return { res: retry.res, bodyText: retry.bodyText, upstreamBody: retry.bodyText, mappedModel }
+  }
+
   if (res.ok || !shouldRotateForError(res.status, parseErrorBody(bodyText))) {
     if (res.ok) {
+      egressSucceeded()
       usageInc(key.name, "success")
       if (!isStream) {
         // 非流式：读取上游 body（供截断判定 + handler 透传；upstreamOnce 成功时 bodyText=""）
@@ -1153,7 +1489,7 @@ async function sendWithRotation(bodyObj, isStream, clientSignal, endpoint = "cha
   // 配额错误 → 轮换 + 重试一次（冷却实际失败的 key，避免并发 401 误伤刚切过去的好 key）
   const errBody = parseErrorBody(bodyText)
   if (ACTIVE_PLAN.id === "zen") {
-    // zen 免费档：同设备限流与账号无关，轮换无意义 → 不轮换不计数直接透传（rotate 内部同样有守卫，双保险）
+    // zen 免费档：非 FreeUsageLimit 的配额错误与账号/UA 相关，轮换出口无意义 → 不轮换不计数直接透传
     log(`🚫  zen 免费档自动轮换已禁用（同设备 UA/频率限流与账号无关），透传上游错误 status=${res.status}（key="${key.name}"）`)
     appendUsage({ key: key.name, ok: false, model: mappedModel, rotated: false, endpoint })
     return { res, bodyText, upstreamBody: bodyText, mappedModel }
@@ -2186,4 +2522,14 @@ export {
   PLANS,
   GATEWAY_CONFIG,
   ZEN_MODELS_ZEN,
+  parseEgressList,
+  parseSocks5Url,
+  socks5Request,
+  parseHead,
+  currentEgress,
+  rotateEgress,
+  egressSucceeded,
+  egressSnapshot,
+  EGRESS_ENABLED,
+  EGRESS_LIST,
 }

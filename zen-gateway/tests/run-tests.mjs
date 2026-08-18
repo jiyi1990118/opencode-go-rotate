@@ -1960,6 +1960,102 @@ t("truncationRetryPlan：ZEN_AUTO_MAX_TOKENS=0 关闭自动重试", () => {
   }
 })
 
+/* ================= zen 档 IP 轮换（egress） ================= */
+group("parseSocks5Url（SOCKS5 出口 URL 解析）")
+
+t("socks5://host:port → 基本解析", () => {
+  assert.deepEqual(gw.parseSocks5Url("socks5://1.2.3.4:1080"), {
+    type: "socks5",
+    host: "1.2.3.4",
+    port: 1080,
+    user: null,
+    pass: null,
+  })
+})
+
+t("socks5://user:pass@host:port → 认证解析", () => {
+  assert.deepEqual(gw.parseSocks5Url("socks5://alice:secret@1.2.3.4:1080"), {
+    type: "socks5",
+    host: "1.2.3.4",
+    port: 1080,
+    user: "alice",
+    pass: "secret",
+  })
+})
+
+t("socks5://host:port/ 尾斜杠容错", () => {
+  const e = gw.parseSocks5Url("socks5://h:1080/")
+  assert.equal(e.host, "h")
+  assert.equal(e.port, 1080)
+})
+
+t("非法输入 → null（无端口/越界端口/http 协议/空串）", () => {
+  assert.equal(gw.parseSocks5Url("socks5://1.2.3.4"), null)
+  assert.equal(gw.parseSocks5Url("socks5://h:70000"), null)
+  assert.equal(gw.parseSocks5Url("socks5://h:0"), null)
+  assert.equal(gw.parseSocks5Url("http://1.2.3.4:80"), null)
+  assert.equal(gw.parseSocks5Url("direct"), null)
+  assert.equal(gw.parseSocks5Url(""), null)
+})
+
+group("parseEgressList（egress 出口池归一化）")
+
+t("direct + socks5 混合解析", () => {
+  const list = gw.parseEgressList(["direct", "socks5://1.2.3.4:1080"])
+  assert.equal(list.length, 2)
+  assert.equal(list[0].type, "direct")
+  assert.equal(list[1].type, "socks5")
+  assert.equal(list[1].host, "1.2.3.4")
+})
+
+t("重复项去重", () => {
+  const list = gw.parseEgressList(["socks5://1.2.3.4:1080", "socks5://1.2.3.4:1080", "direct"])
+  assert.equal(list.length, 2)
+})
+
+t("非法项（非字符串/无端口/空）过滤", () => {
+  const list = gw.parseEgressList(["direct", 123, "junk", "", null, "socks5://bad"])
+  assert.equal(list.length, 1)
+  assert.equal(list[0].type, "direct")
+})
+
+t("非数组 → 空列表", () => {
+  assert.equal(gw.parseEgressList(null).length, 0)
+  assert.equal(gw.parseEgressList("direct").length, 0)
+  assert.equal(gw.parseEgressList(undefined).length, 0)
+})
+
+group("parseHead（HTTP/1.1 响应头解析）")
+
+t("状态行 + 普通头解析", () => {
+  const h = gw.parseHead('HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nContent-Length: 42')
+  assert.equal(h.status, 200)
+  assert.equal(h.headers.get("content-type"), "application/json")
+  assert.equal(h.headers.get("Content-Length"), "42")
+  assert.equal(h.headers.get("missing"), null)
+})
+
+t("HTTP/1.0 状态行", () => {
+  const h = gw.parseHead("HTTP/1.0 404 Not Found\r\nx-a: b")
+  assert.equal(h.status, 404)
+  assert.equal(h.headers.get("x-a"), "b")
+})
+
+t("非法状态行 → null", () => {
+  assert.equal(gw.parseHead("not a status"), null)
+  assert.equal(gw.parseHead(""), null)
+})
+
+t("egressSnapshot / currentEgress / rotateEgress 模块状态（EGRESS_ENABLED 关时零行为）", () => {
+  // 模块加载时按真实 gateway-config 固化；测试环境不配 egress → EGRESS_ENABLED 通常 false。
+  // 只断言数据结构契约，不依赖具体开关。
+  const snap = gw.egressSnapshot()
+  assert.equal(typeof snap.enabled, "boolean")
+  assert.equal(typeof snap.count, "number")
+  assert.equal(typeof snap.index, "number")
+  assert.ok(Array.isArray(snap.list))
+})
+
 /* ================= 汇总 ================= */
 console.log(`\n${"=".repeat(64)}`)
 const total = passed + failures.length

@@ -117,6 +117,29 @@ nohup node gateway.mjs >/tmp/zen-gateway.log 2>&1 &
 | `ZEN_NOTIFY` | 开 | `0` 关闭轮换系统通知（仅 macOS） |
 | `ZEN_PROBE_INTERVAL_MIN` | 关 | 主动探测间隔（分钟）；`>0` 启用，`0`/未设不启用 |
 
+## zen 免费档 IP 轮换（egress 出口池）
+
+> 背景：opencode.ai 免费档（`plan=zen`）按 **IP** 限流（实测：同一 key + 官方 UA 直连固定 IP 高频请求易触发 `429 FreeUsageLimitError`，换出口 IP 可绕过——与账号无关，所以 key 轮换无效）。
+
+在 `gateway-config.json` 配置 `egress` 数组即可启用（**未配置时行为与旧版完全一致**，零开销）：
+
+```jsonc
+{
+  "plan": "zen",
+  "egress": [
+    "direct",                     // 本地直连
+    "socks5://user:pass@host:1080", // SOCKS5 代理（可选认证）
+    "socks5://host2:1080"
+  ]
+}
+```
+
+- `egress` **≥2 项**时启用 IP 轮换；仅 `direct` 或未配置 → 不轮换（单出口直连，向后兼容）。
+- 出口项：`direct` = 本地直连；`socks5://[user:pass@]host:port` = SOCKS5 代理（零依赖手写握手 + CONNECT 隧道，支持无认证与 user-pass 认证）。
+- 触发条件：请求返回 `FreeUsageLimitError`（免费档按 IP 限流）→ **自动切到下一个出口重试一次**，成功则固化该出口，后续请求不再无脑轮换；失败则保留新出口供下次再判。
+- 生效方式：改 `gateway-config.json` 后 `zen-gateway restart`（出口池模块加载时固化一次）。
+- 适用场景：本地直连被限时，挂 1~2 个稳定 SOCKS5 代理作备用出口（免费公开代理存活率极低，建议用付费稳定代理）。
+
 ## 验证
 
 ```bash
