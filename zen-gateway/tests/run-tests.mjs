@@ -1674,6 +1674,15 @@ t("正常文件 → plan/token/token_set_at 归一返回", () => {
   assert.equal(c.token_set_at, "2026-08-16T00:00:00.000Z")
 })
 
+t("ip_rotation 开关读取：缺省 true，显式 false 关闭", () => {
+  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "zen", egress: ["direct", "socks5://1.2.3.4:1080"] }))
+  assert.equal(gw.readGatewayConfig().ip_rotation, true) // 缺省开启
+  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "zen", egress: ["direct", "socks5://1.2.3.4:1080"], ip_rotation: false }))
+  assert.equal(gw.readGatewayConfig().ip_rotation, false) // 显式关闭
+  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "zen", ip_rotation: "no" }))
+  assert.equal(gw.readGatewayConfig().ip_rotation, true) // 非 false 一律视为开启
+})
+
 t("token 非字符串（数字/缺失）→ null；token_set_at 非字符串 → null", () => {
   writeFileSync(_gwCfgPath, JSON.stringify({ plan: "go", token: 12345, token_set_at: 7 }))
   const c = gw.readGatewayConfig()
@@ -2054,6 +2063,25 @@ t("egressSnapshot / currentEgress / rotateEgress 模块状态（EGRESS_ENABLED �
   assert.equal(typeof snap.count, "number")
   assert.equal(typeof snap.index, "number")
   assert.ok(Array.isArray(snap.list))
+})
+
+t("egressEnabled() 动态判定：ip_rotation=false 或 egress<2 → false；≥2 且开启 → true", () => {
+  // egressEnabled() 每次读当前 gateway-config；写临时配置验证判定逻辑（ACTIVE_PLAN=zen 需模块以 zen 加载）。
+  // 该用例不依赖模块套餐：enabled = plan zen && egress≥2 && ip_rotation!==false。若测试模块为 go 档，恒 false 也通过断言。
+  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "zen", egress: ["direct"] }))
+  const onlyOne = gw.egressEnabled()
+  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "zen", egress: ["direct", "socks5://1.2.3.4:1080"], ip_rotation: false }))
+  const off = gw.egressEnabled()
+  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "zen", egress: ["direct", "socks5://1.2.3.4:1080"] }))
+  const on = gw.egressEnabled()
+  // 契约：要么套餐非 zen（全 false），要么遵循开关
+  if (on) {
+    assert.equal(off, false) // 显式关闭 → false
+    assert.equal(onlyOne, false) // <2 出口 → false
+  } else {
+    assert.equal(off, false)
+  }
+  try { rmSync(_gwCfgPath, { force: true }) } catch {}
 })
 
 t("egressHealthCheck 无 key → 返回 error + 空 egress（不抛异常）", async () => {

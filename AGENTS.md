@@ -2,6 +2,8 @@
 
 > 本文件供后续维护 / 开发时快速恢复上下文。改动代码前请先读它，完成后同步更新。
 
+> **✅ IP 轮换总开关已交付（2026-08-18，主线程，用户需求「再添加一个 ip 轮换 开关（关闭时候直接走本地）」）**：`gateway-config.json` 新增可选 `ip_rotation: boolean`（缺省 `true`；`false` = 即使有出口池也直接走本地直连、不轮换）。**关键设计：开关与出口增删均「按需读当前配置」动态判定（`egressEnabled()`/`egressList()` 取代启动固化的 `EGRESS_ENABLED`/`EGRESS_LIST` 常量），Web 开关无需重启网关即时生效**——优于旧版「改 egress 需 restart 生效」；`egressSnapshot()` 同步动态化。网关侧改动：`readGatewayConfig` 返回 `ip_rotation: boolean`；`currentEgress/rotateEgress/egressSucceeded/sendWithRotation` 改用 `egressEnabled()`；新增导出 `egressEnabled/egressList`（删除 `EGRESS_ENABLED/EGRESS_LIST` 导出）。Web：IP 池卡顶部加「IP 轮换总开关」按钮（`toggleIpRotation()` → `POST /api/gateway/egress {action:"toggle"}`，写 `ip_rotation`，返回 `needsRestart:false`）、badge 三态（关闭直连/未启用需≥2出口/已启用）、空池文案区分开关关/开；`gatewayConfigPayload` 加 `ipRotation`，`egressEnabled` 语义合并开关（`ip_rotation && egress.length>=2`）。**单测**：gateway 249→**251**（+2：readGatewayConfig ip_rotation 缺省/显式关/非 false 视为开 + egressEnabled 动态判定契约）；插件 150→**150**（既有 egress 路由测试补 toggle 断言 6 条 + WEB_HTML 新断言 6 条）。**真实验证（铁证）**：Web toggle 关闭 → 文件写入 `ip_rotation:false` → 真实请求 429 直连透传（本机 IP 已被限，证明走本地）；toggle 开 → 真实请求日志 `🔁 zen 档出口轮换: socks5://159.195.49.27:1080 → socks5://159.195.61.240:1080`（证明走出口池非本地）。真实配置现 `ip_rotation:true + 6 出口 + plan zen`；副本已同步+网关/web 重启生效。文档：zen-gateway/README.md 配置示例加 `ip_rotation` + 新增开关说明与 Web 一键开/关。遗留（非阻塞）：`/api/gateway/status` 的 `egress` 字段仍为 null（`gatewayStatusSummary` 未加 egress 详情，需要时可下轮补）。
+
 ## 项目是什么
 
 opencode 的 **opencode-go 多 key 自动轮换**插件 + CLI + Web 管理界面。

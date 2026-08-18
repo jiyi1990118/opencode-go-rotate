@@ -532,6 +532,7 @@ function readGatewayConfig() {
         ? cfg.tokens.filter((t) => typeof t === "string" && t.length > 0)
         : [],
       egress: Array.isArray(cfg.egress) ? cfg.egress.filter((e) => typeof e === "string") : [],
+      ip_rotation: cfg.ip_rotation !== false, // 缺省开启；显式 false 关闭
     }
   } catch (e) {
     log(`⚠️  readGatewayConfig 失败（${GATEWAY_CONFIG}），回退默认: ${e.message}`)
@@ -824,45 +825,62 @@ const GO_API = UPSTREAM_BASE + "/chat/completions"
 const MODELS_API = UPSTREAM_BASE + "/models"
 
 /* ---------------- zen 档 IP 轮换（egress 出口池）运行时状态 ----------------
- * 仅在 zen 套餐且 gateway-config 配置了 egress 数组（≥2 出口）时启用；否则零开销、行为与旧版完全一致。
- * 出口选择：FreeUsageLimitError 时切到下一出口重试一次（成功固化）；平时固定在当前健康出口，不无脑轮换。 */
-const EGRESS_LIST = parseEgressList(_GW_CFG && _GW_CFG.egress)
-const EGRESS_ENABLED = ACTIVE_PLAN.id === "zen" && EGRESS_LIST.length >= 2
+ * 仅在 zen 套餐且 gateway-config 配置了 egress 数组（≥2 出口）且 ip_rotation!==false 时启用；否则零开销、行为与旧版完全一致。
+ * 出口选择：FreeUsageLimitError 时切到下一出口重试一次（成功固化）；平时固定在当前健康出口，不无脑轮换。
+ * 开关 / 列表均「按需读当前配置」动态判定——Web 改 ip_rotation 或 egress 后无需重启即时生效。 */
+const EGRESS_LIST_INIT = parseEgressList(_GW_CFG && _GW_CFG.egress)
 let _egressIdx = 0
 let _egressOk = true // 当前出口是否健康（429 → false 触发切换）
 
-/** 取当前出口；EGRESS_ENABLED 时才轮换（否则恒 direct=null）。 */
+/** 动态出口表：从当前 gateway-config 实时解析（增删/开关即时生效）。 */
+function egressList() {
+  return parseEgressList(readGatewayConfig().egress)
+}
+
+/** IP 轮换是否启用（动态）：zen 套餐 + egress≥2 + ip_rotation 未显式关闭。 */
+function egressEnabled() {
+  if (ACTIVE_PLAN.id !== "zen") return false
+  const cfg = readGatewayConfig()
+  if (cfg.ip_rotation === false) return false
+  return parseEgressList(cfg.egress).length >= 2
+}
+
+/** 取当前出口；egressEnabled() 时才轮换（否则恒 direct=null）。 */
 function currentEgress() {
-  if (!EGRESS_ENABLED) return null
-  return EGRESS_LIST[_egressIdx] && EGRESS_LIST[_egressIdx].type === "direct"
-    ? null
-    : EGRESS_LIST[_egressIdx] || null
+  if (!egressEnabled()) return null
+  const L = egressList()
+  if (!L.length) return null
+  const e = L[_egressIdx % L.length]
+  return e && e.type === "direct" ? null : e || null
 }
 
 /** 标记当前出口 429 → 切到下一出口（mod 循环）；记录日志。 */
 function rotateEgress() {
-  if (!EGRESS_ENABLED) return null
-  const prev = EGRESS_LIST[_egressIdx] || { type: "direct" }
-  _egressIdx = (_egressIdx + 1) % EGRESS_LIST.length
-  const next = EGRESS_LIST[_egressIdx]
+  if (!egressEnabled()) return null
+  const L = egressList()
+  if (!L.length) return null
+  const prev = L[_egressIdx % L.length] || { type: "direct" }
+  _egressIdx = (_egressIdx + 1) % L.length
+  const next = L[_egressIdx]
   log(`🔁  zen 档出口轮换: ${prev.raw || "direct"} → ${next ? next.raw : "direct"}`)
   return currentEgress()
 }
 
 /** 请求成功后调用：确认当前出口健康（egressOk 复位，避免连续成功仍误判）。 */
 function egressSucceeded() {
-  if (!EGRESS_ENABLED) return
+  if (!egressEnabled()) return
   _egressOk = true
 }
 
 /** 当前出口健康状态（测试/状态端点用） */
  function egressSnapshot() {
+   const L = egressList()
    return {
-     enabled: EGRESS_ENABLED,
-     count: EGRESS_LIST.length,
+     enabled: egressEnabled(),
+     count: L.length,
      index: _egressIdx,
-     current: EGRESS_LIST[_egressIdx] ? EGRESS_LIST[_egressIdx].raw : "direct",
-     list: EGRESS_LIST.map((e) => e.raw),
+     current: L[_egressIdx % Math.max(L.length, 1)] ? L[_egressIdx % L.length].raw : "direct",
+     list: L.map((e) => e.raw),
    }
  }
 
@@ -1475,11 +1493,11 @@ async function sendWithRotation(bodyObj, isStream, clientSignal, endpoint = "cha
   const bodyStr = JSON.stringify({ ...bodyObj, model: mappedModel })
   const timeoutMs = isStream ? UPSTREAM_TIMEOUT_MS : PROBE_TIMEOUT_MS
 
-  // 第 1 次（用当前出口；EGRESS_ENABLED 时初始即走 egress）
+  // 第 1 次（用当前出口；egressEnabled() 时初始即走 egress）
   let { res, bodyText } = await upstreamOnce(key.key, bodyStr, isStream, timeoutMs, clientSignal, currentEgress())
 
   // zen 档 IP 轮换：FreeUsageLimitError（免费档按 IP 限流）且启用出口池 → 切下一出口重试一次。
-  if (EGRESS_ENABLED && !res.ok && parseErrorBody(bodyText)?.error?.type === "FreeUsageLimitError") {
+  if (egressEnabled() && !res.ok && parseErrorBody(bodyText)?.error?.type === "FreeUsageLimitError") {
     log(`🔁  zen 档当前出口 429（FreeUsageLimit），切出口重试（key="${key.name}"）`)
     const nextEgress = rotateEgress()
     const retry = await upstreamOnce(key.key, bodyStr, isStream, timeoutMs, clientSignal, nextEgress)
@@ -2585,6 +2603,6 @@ export {
   egressSucceeded,
   egressSnapshot,
   egressHealthCheck,
-  EGRESS_ENABLED,
-  EGRESS_LIST,
+  egressEnabled,
+  egressList,
 }

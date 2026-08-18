@@ -900,10 +900,11 @@ type GatewayConfig = {
   token_set_at: string | null
   tokens: string[]
   egress: string[]
+  ip_rotation: boolean // IP 轮换总开关（默认 true；false = 即使有出口池也直接走本地直连）
 }
 
 function defaultGatewayConfig(): GatewayConfig {
-  return { plan: "go", token: null, token_set_at: null, tokens: [], egress: [] }
+  return { plan: "go", token: null, token_set_at: null, tokens: [], egress: [], ip_rotation: true }
 }
 
 function readGatewayConfig(): GatewayConfig {
@@ -923,6 +924,7 @@ function readGatewayConfig(): GatewayConfig {
       egress: Array.isArray(raw.egress)
         ? raw.egress.filter((e: unknown): e is string => typeof e === "string" && e.length > 0)
         : [],
+      ip_rotation: raw.ip_rotation !== false, // 缺省开启；显式 false 关闭
     }
   } catch (e) {
     log(`readGatewayConfig error: ${(e as Error).message}`)
@@ -938,6 +940,7 @@ function writeGatewayConfig(patch: {
   token?: string | null
   tokens?: string[] | null
   egress?: string[] | null
+  ip_rotation?: boolean
 }): GatewayConfig {
   return withLockSync<GatewayConfig>(() => {
     const cfg = readGatewayConfig()
@@ -945,6 +948,9 @@ function writeGatewayConfig(patch: {
       if (patch.plan !== "go" && patch.plan !== "zen")
         throw new Error(`plan 必须是 "go" 或 "zen"，收到: ${patch.plan}`)
       cfg.plan = patch.plan
+    }
+    if (patch.ip_rotation !== undefined) {
+      cfg.ip_rotation = patch.ip_rotation === true // 严格布尔；非 true 视为关闭
     }
     if (patch.egress !== undefined) {
       if (patch.egress !== null && !Array.isArray(patch.egress))
@@ -1003,7 +1009,8 @@ function gatewayConfigPayload() {
     authEnabled: cfg.tokens.length > 0,
     tokenSetAt: cfg.token_set_at,
     egress: cfg.egress,
-    egressEnabled: cfg.egress.length >= 2,
+    ipRotation: cfg.ip_rotation,               // 总开关（false = 关闭，走本地直连）
+    egressEnabled: cfg.ip_rotation && cfg.egress.length >= 2, // 实际轮换启用（开关开 && ≥2 出口）
     needsRestart: false, // GET 只读；needsRestart:true 仅由 POST 写操作返回
   }
 }
@@ -1277,7 +1284,13 @@ if (action === "clear") {
               writeGatewayConfig({ egress: valid as string[] })
               return { ok: true, egress: list(), needsRestart: true }
             }
-            throw new Error(`未知 action: ${action || "(空)"}（支持 add/del/clear/set）`)
+            if (action === "toggle") {
+              // IP 轮换总开关：开→关→开。关闭时即使有出口池也走本地直连（网关动态判定，无需重启）
+              const on = readGatewayConfig().ip_rotation
+              writeGatewayConfig({ ip_rotation: !on })
+              return { ok: true, ipRotation: !on, egress: list(), needsRestart: false }
+            }
+            throw new Error(`未知 action: ${action || "(空)"}（支持 add/del/clear/set/toggle）`)
           }
          return null
       }
@@ -1955,6 +1968,11 @@ try {
   <div class="card" id="gw-egress-card">
     <b>IP 池（轮换出口） <span id="egress-badge"></span></b>
     <div class="row" style="margin-top:10px">
+      <span class="muted" style="display:flex;align-items:center;gap:8px;flex:1">IP 轮换总开关：
+        <button id="ip-rotation-btn" class="primary" onclick="toggleIpRotation()">开启</button>
+      </span>
+    </div>
+    <div class="row" style="margin-top:10px">
       <input id="egress-input" type="text" placeholder="socks5://user:pass@host:port 或 direct" style="flex:1;min-width:0" />
       <button class="primary" onclick="addEgress()">＋ 添加出口</button>
       <button id="egress-check-btn" onclick="checkEgressHealth()">检查出口</button>
@@ -2549,14 +2567,26 @@ function tokenBadge(on) {
     on ? '<span class="badge b-running">鉴权开启</span>' : '<span class="badge b-stopped">鉴权关闭</span>'
 }
 var egressHealth = {} // 出口健康检查结果缓存：{ [url]: {ok,status,ms,error} }
-function renderEgressList(egress, enabled) {
+var ipRotationOn = true // IP 轮换总开关（false = 走本地直连）
+function renderEgressList(egress, enabled, ipRotation) {
   const el = document.getElementById("egress-list")
   const badge = document.getElementById("egress-badge")
-  badge.innerHTML = enabled
-    ? '<span class="badge b-running">IP 轮换已启用</span>'
-    : '<span class="badge b-stopped">未启用（需 ≥2 个出口）</span>'
+  ipRotation = ipRotation === undefined ? ipRotationOn : ipRotation
+  ipRotationOn = ipRotation
+  const btn = document.getElementById("ip-rotation-btn")
+  if (btn) {
+    btn.textContent = ipRotation ? "开启" : "关闭"
+    btn.className = ipRotation ? "primary" : ""
+  }
+  badge.innerHTML = !ipRotation
+    ? '<span class="badge b-stopped">IP 轮换已关闭（直连）</span>'
+    : (enabled
+        ? '<span class="badge b-running">IP 轮换已启用</span>'
+        : '<span class="badge b-stopped">未启用（需 ≥2 个出口）</span>')
   if (!Array.isArray(egress) || !egress.length) {
-    el.textContent = "未配置出口（直连）。zen 免费档被限流时添加 SOCKS5 代理出口可换 IP。"
+    el.textContent = !ipRotation
+      ? "IP 轮换已关闭，所有请求走本地直连。开启后可用下方出口池换 IP。"
+      : "未配置出口（直连）。zen 免费档被限流时添加 SOCKS5 代理出口可换 IP。"
     return
   }
   el.innerHTML = egress.map((e, i) => {
@@ -2584,7 +2614,7 @@ async function checkEgressHealth() {
     egressHealth = {}
     ;(r.egress || []).forEach((x) => { egressHealth[x.url] = { ok: x.ok, status: x.status, ms: x.ms, error: x.error } })
     const c = await api("/api/gateway/config")
-    renderEgressList(c.egress || [], !!c.egressEnabled)
+    renderEgressList(c.egress || [], !!c.egressEnabled, !!c.ipRotation)
     const good = (r.egress || []).filter((x) => x.ok).length
     msg.className = "msg"
     msg.textContent = "检查完成：" + good + "/" + (r.egress || []).length + " 个出口可用（" + r.checkedAt + "）"
@@ -2619,6 +2649,21 @@ async function clearEgress() {
     msg.className = "msg"; msg.textContent = "已清空出口池（重启网关后生效）"
   } catch (e) { msg.className = "msg err"; msg.textContent = "清空失败：" + e.message }
 }
+async function toggleIpRotation() {
+  const msg = document.getElementById("egress-msg")
+  const btn = document.getElementById("ip-rotation-btn")
+  const old = btn.textContent
+  try {
+    const r = await api("/api/gateway/egress", { action: "toggle" })
+    ipRotationOn = !!r.ipRotation
+    renderEgressList(r.egress || [], r.egress && r.egress.length >= 2, ipRotationOn)
+    msg.className = "msg"
+    msg.textContent = ipRotationOn ? "IP 轮换已开启（即时生效）" : "IP 轮换已关闭，所有请求走本地直连（即时生效）"
+  } catch (e) {
+    msg.className = "msg err"; msg.textContent = "切换失败：" + e.message
+    btn.textContent = old
+  }
+}
 async function refreshPlans() {
   try {
     const p = await api("/api/gateway/plans")
@@ -2634,7 +2679,7 @@ async function refreshGatewayConfig() {
     document.getElementById("plan-zen").checked = c.plan === "zen"
     tokenBadge(!!c.authEnabled)
     renderTokenList(c.tokens || []) // 多 key 掩码列表（明文仅本会话生成/编辑后持有，GET 永不明文）
-    renderEgressList(c.egress || [], !!c.egressEnabled) // IP 轮换出口池 + 启用徽标
+    renderEgressList(c.egress || [], !!c.egressEnabled, !!c.ipRotation) // IP 轮换出口池 + 启用徽标
   } catch (e) { showTokenMsg("配置读取失败：" + e.message, true) }
 }
 function showTokenMsg(m, isErr) {

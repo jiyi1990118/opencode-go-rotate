@@ -1080,6 +1080,30 @@ describe("网关配置路由（/api/gateway/plans + /api/gateway/config）", () 
     )
     expect((await clr.json()).egress).toEqual([])
     expect(mod.readGatewayConfig().egress).toEqual([])
+    // toggle：开关 开→关→开（ip_rotation 字段写入 + 无需重启）
+    const t1 = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "toggle" }) }),
+    )
+    const tj1 = await t1.json()
+    expect(tj1.ok).toBe(true)
+    expect(tj1.ipRotation).toBe(false)
+    expect(tj1.needsRestart).toBe(false) // 网关动态判定，无需重启
+    expect(mod.readGatewayConfig().ip_rotation).toBe(false)
+    // 开关关闭 + 有出口 → egressEnabled false（实际走本地直连）
+    mod.writeGatewayConfig({ egress: ["direct", "socks5://1.2.3.4:1080"], ip_rotation: false })
+    const g2 = await (await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/config"))).json()
+    expect(g2.ipRotation).toBe(false)
+    expect(g2.egressEnabled).toBe(false) // 即使 ≥2 出口，开关关 → 不启用
+    expect(g2.egress).toEqual(["direct", "socks5://1.2.3.4:1080"]) // 出口仍保留
+    // 再 toggle 回开
+    const t2 = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "toggle" }) }),
+    )
+    expect((await t2.json()).ipRotation).toBe(true)
+    expect(mod.readGatewayConfig().ip_rotation).toBe(true)
+    const g3 = await (await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/config"))).json()
+    expect(g3.ipRotation).toBe(true)
+    expect(g3.egressEnabled).toBe(true) // 开关开 + ≥2 → 启用
     // 未知 action → 400
     const unk = await mod.handleWeb(
       new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "boom" }) }),
@@ -1170,11 +1194,18 @@ describe("WEB_HTML 网关管理区块（主导航 + 套餐卡 + Token 卡）", (
     expect(html).toContain('api("/api/gateway/egress", { action: "del", index:')
     expect(html).toContain('api("/api/gateway/egress", { action: "clear" })')
     expect(html).toContain('api("/api/gateway/egress/health", {})')
-    expect(html).toContain("renderEgressList(c.egress || [], !!c.egressEnabled)")
+    expect(html).toContain("renderEgressList(c.egress || [], !!c.egressEnabled, !!c.ipRotation)")
     expect(html).toContain("egressHealth[") // 健康结果缓存渲染
     expect(html).toContain('class="badge b-available"') // 健康徽标
     expect(html).toContain('class="badge b-warn"')      // 429 被限流徽标
     expect(html).toContain('class="badge b-invalid"')   // 不可用徽标
+    // IP 轮换总开关（关闭走本地直连）
+    expect(html).toContain('id="ip-rotation-btn"')
+    expect(html).toContain('onclick="toggleIpRotation()"')
+    expect(html).toContain("async function toggleIpRotation()")
+    expect(html).toContain('api("/api/gateway/egress", { action: "toggle" })')
+    expect(html).toContain("IP 轮换已关闭")
+    expect(html).toContain("所有请求走本地直连")
     // IP 轮换启用条件提示
     expect(html).toContain("≥2")
   })

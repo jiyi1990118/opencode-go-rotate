@@ -126,6 +126,7 @@ nohup node gateway.mjs >/tmp/zen-gateway.log 2>&1 &
 ```jsonc
 {
   "plan": "zen",
+  "ip_rotation": true,          // IP 轮换总开关（可选，缺省 true；false = 关闭，即使有出口池也走本地直连）
   "egress": [
     "direct",                     // 本地直连
     "socks5://user:pass@host:1080", // SOCKS5 代理（可选认证）
@@ -137,6 +138,8 @@ nohup node gateway.mjs >/tmp/zen-gateway.log 2>&1 &
 - `egress` **≥2 项**时启用 IP 轮换；仅 `direct` 或未配置 → 不轮换（单出口直连，向后兼容）。
 - 出口项：`direct` = 本地直连；`socks5://[user:pass@]host:port` = SOCKS5 代理（零依赖手写握手 + CONNECT 隧道，支持无认证与 user-pass 认证）。
 - 触发条件：请求返回 `FreeUsageLimitError`（免费档按 IP 限流）→ **自动切到下一个出口重试一次**，成功则固化该出口，后续请求不再无脑轮换；失败则保留新出口供下次再判。
+- **IP 轮换总开关 `ip_rotation: false`**：关闭时即使配置了出口池也**直接走本地直连、不轮换**（如免费代理全军覆没时可一键关闭）。开启/关闭与出口增删**无需重启网关即时生效**（模块按需读当前配置）。
+- Web 管理端（127.0.0.1:8899 → 网关 → IP 池卡）顶部有「IP 轮换总开关」按钮，一键开/关（写 `ip_rotation`，即时生效，无需重启）。
 - 生效方式：改 `gateway-config.json` 后 `zen-gateway restart`（出口池模块加载时固化一次）。
 - 适用场景：本地直连被限时，挂 1~2 个稳定 SOCKS5 代理作备用出口（免费公开代理存活率极低，建议用付费稳定代理）。
 
