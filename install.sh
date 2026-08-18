@@ -9,6 +9,8 @@
 #     bash install.sh
 #   完整安装（插件 + CLI + 配置 + zen-gateway 网关服务）:
 #     bash install.sh --all
+#   仅安装 zen-gateway 网关服务（+ go-rotate CLI/插件与 PATH，装完 `zen-gateway status` 立即可用）:
+#     bash install.sh zen-gateway
 #   卸载:
 #     bash install.sh uninstall [-y]               # 仅卸载插件/CLI/配置
 #     bash install.sh uninstall --gateway [-y]     # 同时卸载 zen-gateway 网关服务
@@ -17,7 +19,8 @@
 #   1. 插件 go-rotate.ts  -> ~/.config/opencode/plugins/
 #   2. CLI  go-rotate     -> ~/.local/bin/  (并加入 PATH)
 #   3. 默认配置 go-keys.json (若不存在)
-#   4. [--all] zen-gateway 网关服务（macOS launchd / Linux systemd --user，开机自启）
+#   4. [--all / zen-gateway 模式] zen-gateway 网关服务（macOS launchd / Linux systemd --user，开机自启）
+#   zen-gateway 模式还会安装 CLI + 插件并确保 PATH，装完可直接用 zen-gateway/go-rotate 命令
 # 可重复运行（幂等，不会覆盖已有配置）。
 # ============================================================
 set -euo pipefail
@@ -78,6 +81,43 @@ fetch_or_copy() {
   fi
 }
 
+# 定位 node（≥18）：优先 PATH；找不到时探测常见 nvm/系统安装位置。
+# 用在常驻服务注册前，保证 systemd/launchd 都拿到真实绝对路径。
+node_or_detect() {
+  local n; n="$(command -v node 2>/dev/null || true)"
+  [ -n "$n" ] && { echo "$n"; return 0; }
+  for cand in \
+    "$HOME/.nvm/versions/node/"*"/bin/node" \
+    "$NVM_DIR/versions/node/"*"/bin/node" \
+    /opt/node*/bin/node /usr/local/node*/bin/node /usr/local/bin/node /usr/bin/node \
+    "$HOME/.local/node/"*"/bin/node"; do
+    [ -x "$cand" ] && { echo "$(cd "$(dirname "$cand")" && pwd)/node"; return 0; }
+  done
+  return 1
+}
+
+# 把 BIN_DIR 加入当前进程 PATH + 持久化到 shell rc（幂等；新终端仍生效）
+ensure_path() {
+  if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+    export PATH="$BIN_DIR:$PATH"
+  fi
+  local rc=""
+  [ -n "${ZSH_VERSION:-}" ] && rc="$HOME/.zshrc"
+  [ -n "${BASH_VERSION:-}" ] && [ -z "$rc" ] && rc="$HOME/.bashrc"
+  [ -z "$rc" ] && [ -f "$HOME/.zshrc" ] && rc="$HOME/.zshrc"
+  [ -z "$rc" ] && [ -f "$HOME/.bashrc" ] && rc="$HOME/.bashrc"
+  if [ -n "$rc" ]; then
+    if ! grep -q "export PATH=.*$BIN_DIR" "$rc" 2>/dev/null; then
+      printf '\nexport PATH="%s:$PATH"\n' "$BIN_DIR" >> "$rc"
+      warn "已将 $BIN_DIR 加入 PATH ($rc)。新终端生效。"
+      return
+    fi
+    ok "PATH 已包含 $BIN_DIR"
+  else
+    warn "未找到 shell 配置文件，请手动将 $BIN_DIR 加入 PATH。"
+  fi
+}
+
 # ================== zen-gateway 服务安装 ==================
 # 用法: bash install.sh zen-gateway  或  bash install.sh --zen-gateway
 # 卸载: bash install.sh zen-gateway-uninstall
@@ -88,12 +128,14 @@ install_zen_gateway() {
   info "=============================================="
   info " zen-gateway · opencode zen → OpenAI 兼容网关（常驻服务）"
   info "=============================================="
-  command -v node >/dev/null 2>&1 || die "需要 node（≥18）。请先安装 Node.js"
-
   local NODE_BIN GATEWAY_DIR
-  NODE_BIN="$(command -v node)"
+  NODE_BIN="$(node_or_detect || true)"
+  if [ -z "$NODE_BIN" ]; then
+    die "需要 node（≥18）。已探测 PATH 与常见 nvm/系统路径均未找到。\n请先安装 Node.js（https://nodejs.org/ 或 nvm），再运行本命令。"
+  fi
   GATEWAY_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/zen-gateway"
   OS="$(uname -s)"
+
 
   # 1) gateway.mjs —— 程序本体放 ~/.local/share/zen-gateway/（应用数据目录，非配置）
   mkdir -p "$GATEWAY_DIR"
@@ -136,6 +178,16 @@ JSON
   chmod +x "$BIN_DIR/zen-gateway"
   ok "管理脚本 => $BIN_DIR/zen-gateway"
 
+  # 2.5) go-rotate CLI + 插件（zen-gateway 场景下同样可用 `go-rotate gateway status` / Web）。
+  #      幂等：已存在则保留。
+  fetch_or_copy "go-rotate" "$BIN_DIR/go-rotate"
+  chmod +x "$BIN_DIR/go-rotate"
+  ok "CLI      => $BIN_DIR/go-rotate"
+  mkdir -p "$PLUGIN_DIR"
+  fetch_or_copy "go-rotate.ts" "$PLUGIN_DIR/go-rotate.ts"
+  ok "插件     => $PLUGIN_DIR/go-rotate.ts"
+  ensure_path
+
   if [ "$OS" = "Darwin" ]; then
     install_zen_gateway_darwin "$NODE_BIN" "$GATEWAY_DIR"
   elif [ "$OS" = "Linux" ]; then
@@ -145,13 +197,26 @@ JSON
     echo "    node $GATEWAY_DIR/gateway.mjs"
   fi
 
+  # 3) 装完自动验证（Linux systemd 场景最常见）：healthz 可达即确认命令可用
+  if [ "$OS" = "Linux" ] || [ "$OS" = "Darwin" ]; then
+    local i; for i in $(seq 1 20); do
+      if curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:18888/healthz" 2>/dev/null | grep -q 200; then
+        ok "网关健康检查通过（http://127.0.0.1:18888/healthz）"
+        break
+      fi
+      sleep 0.5
+    done
+  fi
+
   echo ""
-  echo "  常用命令："
-  echo "    zen-gateway status     # 查看状态"
+  echo "  常用命令（已加入 PATH）："
+  echo "    zen-gateway status     # 查看状态（或 go-rotate gateway status）"
   echo "    zen-gateway start      # 启动"
   echo "    zen-gateway stop       # 停止"
   echo "    zen-gateway logs -f    # 跟踪日志"
   echo "    zen-gateway uninstall  # 卸载（不动 go-keys.json / auth.json）"
+  echo "    go-rotate gateway plan zen   # 切 zen 免费档（默认 go 档）"
+  echo "    go-rotate add <name> sk-...  # 填入 opencode 账号 key"
   echo "  卸载服务：bash install.sh zen-gateway-uninstall"
   echo ""
 }
@@ -337,22 +402,8 @@ fetch_or_copy "go-rotate" "$cli_dst"
 chmod +x "$cli_dst"
 ok "CLI  => $cli_dst"
 
-# 3) 确保 CLI 在 PATH
-if ! [[ ":$PATH:" == *":$BIN_DIR:"* ]]; then
-  rc=""
-  [ -n "${ZSH_VERSION:-}" ] && rc="$HOME/.zshrc"
-  [ -n "${BASH_VERSION:-}" ] && [ -z "$rc" ] && rc="$HOME/.bashrc"
-  [ -z "$rc" ] && [ -f "$HOME/.zshrc" ] && rc="$HOME/.zshrc"
-  [ -z "$rc" ] && [ -f "$HOME/.bashrc" ] && rc="$HOME/.bashrc"
-  if [ -n "$rc" ]; then
-    if ! grep -q "export PATH=.*$BIN_DIR" "$rc" 2>/dev/null; then
-      printf '\nexport PATH="%s:$PATH"\n' "$BIN_DIR" >> "$rc"
-      warn "已将 $BIN_DIR 加入 PATH ($rc)。新终端生效。"
-    fi
-  else
-    warn "未找到 shell 配置文件，请手动将 $BIN_DIR 加入 PATH。"
-  fi
-fi
+# 3) 确保 CLI 在 PATH（复用 ensure_path：当前进程生效 + 持久化 rc）
+ensure_path
 
 # 4) 默认配置（不覆盖已有）
 config="$DATA_DIR/go-keys.json"
