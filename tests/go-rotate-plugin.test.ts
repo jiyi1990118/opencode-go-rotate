@@ -854,6 +854,24 @@ describe("网关配置（gateway-config.json：套餐 + token）", () => {
     expect(() => mod.writeGatewayConfig({ token: "" })).toThrow()
     expect(existsSync(LOCK_FILE)).toBe(false)
   })
+  test("writeGatewayConfig egress 写入（direct + socks5）与非法拒绝", () => {
+    mod.writeGatewayConfig({ egress: ["direct", "socks5://user:pass@1.2.3.4:1080", "socks5://proxy.example.com:9988"] })
+    const c = mod.readGatewayConfig()
+    expect(c.egress).toHaveLength(3)
+    expect(c.egress[0]).toBe("direct")
+    expect(c.egress[1]).toBe("socks5://user:pass@1.2.3.4:1080")
+    expect(() => mod.writeGatewayConfig({ egress: ["http://bad:80"] })).toThrow(/direct|socks5/)
+    expect(existsSync(LOCK_FILE)).toBe(false)
+  })
+  test("validateEgressItem 格式校验矩阵", () => {
+    expect(mod.validateEgressItem("direct")).toBe("direct")
+    expect(mod.validateEgressItem("socks5://1.2.3.4:1080")).toBe("socks5://1.2.3.4:1080")
+    expect(mod.validateEgressItem("socks5://user:pass@proxy.example.com:9988")).toBe("socks5://user:pass@proxy.example.com:9988")
+    expect(mod.validateEgressItem("socks5://1.2.3.4:70000")).toBeNull() // 端口越界
+    expect(mod.validateEgressItem("socks5://1.2.3.4:0")).toBeNull()
+    expect(mod.validateEgressItem("https://1.2.3.4:443")).toBeNull()
+    expect(mod.validateEgressItem("")).toBeNull()
+  })
 })
 
 describe("网关配置路由（/api/gateway/plans + /api/gateway/config）", () => {
@@ -1003,6 +1021,58 @@ describe("网关配置路由（/api/gateway/plans + /api/gateway/config）", () 
       expect(r.status).toBe(400)
     }
   })
+  test("POST /api/gateway/egress add/del/clear/set + GET 透传 egress + 非法拒绝", async () => {
+    mod.writeGatewayConfig({ egress: [] })
+    // add 两个出口 → egressEnabled true
+    for (const url of ["direct", "socks5://1.2.3.4:1080"]) {
+      const r = await mod.handleWeb(
+        new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "add", url }) }),
+      )
+      const j = await r.json()
+      expect(j.ok).toBe(true)
+      expect(j.needsRestart).toBe(true)
+    }
+    let cfg = mod.readGatewayConfig()
+    expect(cfg.egress).toEqual(["direct", "socks5://1.2.3.4:1080"])
+    // GET /api/gateway/config 透传 egress + enabled 标志
+    const g = await (await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/config"))).json()
+    expect(g.egress).toEqual(["direct", "socks5://1.2.3.4:1080"])
+    expect(g.egressEnabled).toBe(true)
+    // 重复 add → 400
+    const dup = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "add", url: "direct" }) }),
+    )
+    expect(dup.status).toBe(400)
+    // 非法格式 → 400
+    const bad = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "add", url: "http://x:80" }) }),
+    )
+    expect(bad.status).toBe(400)
+    // del index 0 → 剩 1 项 → egressEnabled false
+    const del = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "del", index: 0 }) }),
+    )
+    expect((await del.json()).ok).toBe(true)
+    cfg = mod.readGatewayConfig()
+    expect(cfg.egress).toEqual(["socks5://1.2.3.4:1080"])
+    expect((await (await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/config"))).json()).egressEnabled).toBe(false)
+    // set 覆盖整池
+    const set = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "set", list: ["direct", "socks5://a:1080", "socks5://b:9988"] }) }),
+    )
+    expect((await set.json()).egress).toEqual(["direct", "socks5://a:1080", "socks5://b:9988"])
+    // clear → 空池
+    const clr = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "clear" }) }),
+    )
+    expect((await clr.json()).egress).toEqual([])
+    expect(mod.readGatewayConfig().egress).toEqual([])
+    // 未知 action → 400
+    const unk = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "boom" }) }),
+    )
+    expect(unk.status).toBe(400)
+  })
 })
 
 describe("WEB_HTML 网关管理区块（主导航 + 套餐卡 + Token 卡）", () => {
@@ -1067,6 +1137,25 @@ describe("WEB_HTML 网关管理区块（主导航 + 套餐卡 + Token 卡）", (
     // 旧单 token 输入框与旧生成函数已移除（不再引用不存在的元素）
     expect(html).not.toContain('id="token-input"')
     expect(html).not.toContain("crypto.getRandomValues")
+  })
+  test("IP 池卡（gw-egress-card + egress-list + 增删清函数 + 启用徽标）", () => {
+    const html: string = (mod as any).WEB_HTML
+    expect(html).toContain('id="gw-egress-card"')
+    expect(html).toContain('id="egress-badge"')
+    expect(html).toContain('id="egress-list"')
+    expect(html).toContain('id="egress-input"')
+    expect(html).toContain('onclick="addEgress()"')
+    expect(html).toContain('onclick="clearEgress()"')
+    expect(html).toContain("function renderEgressList(")
+    expect(html).toContain("async function addEgress()")
+    expect(html).toContain("async function delEgress(")
+    expect(html).toContain("async function clearEgress()")
+    expect(html).toContain('api("/api/gateway/egress", { action: "add", url')
+    expect(html).toContain('api("/api/gateway/egress", { action: "del", index:')
+    expect(html).toContain('api("/api/gateway/egress", { action: "clear" })')
+    expect(html).toContain("renderEgressList(c.egress || [], !!c.egressEnabled)")
+    // IP 轮换启用条件提示
+    expect(html).toContain("≥2")
   })
 })
 

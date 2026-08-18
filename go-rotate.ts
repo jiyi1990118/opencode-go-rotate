@@ -882,10 +882,11 @@ type GatewayConfig = {
   token: string | null
   token_set_at: string | null
   tokens: string[]
+  egress: string[]
 }
 
 function defaultGatewayConfig(): GatewayConfig {
-  return { plan: "go", token: null, token_set_at: null, tokens: [] }
+  return { plan: "go", token: null, token_set_at: null, tokens: [], egress: [] }
 }
 
 function readGatewayConfig(): GatewayConfig {
@@ -902,6 +903,9 @@ function readGatewayConfig(): GatewayConfig {
       token: tokens.length > 0 ? tokens[0] : null,
       token_set_at: typeof raw.token_set_at === "string" ? raw.token_set_at : null,
       tokens,
+      egress: Array.isArray(raw.egress)
+        ? raw.egress.filter((e: unknown): e is string => typeof e === "string" && e.length > 0)
+        : [],
     }
   } catch (e) {
     log(`readGatewayConfig error: ${(e as Error).message}`)
@@ -909,15 +913,31 @@ function readGatewayConfig(): GatewayConfig {
   }
 }
 
-/** 写网关配置（plan / tokens 至少给一个；tokens:null = 清空关鉴权）。token 单值写兼容 → tokens=[v]。
- *  旧字段 token 始终同步为 tokens[0]（旧版网关只读 token 也能用第一个 key）。返回写后配置。 */
-function writeGatewayConfig(patch: { plan?: string; token?: string | null; tokens?: string[] | null }): GatewayConfig {
+/** 写网关配置（plan / tokens / egress 至少给一个；tokens:null = 清空关鉴权）。token 单值写兼容 → tokens=[v]。
+ *  旧字段 token 始终同步为 tokens[0]（旧版网关只读 token 也能用第一个 key）。egress=IP 轮换出口池（zen 免费档），
+ *  "direct" / "socks5://[user:pass@]host:port"，≥2 项启用轮换。返回写后配置。 */
+function writeGatewayConfig(patch: {
+  plan?: string
+  token?: string | null
+  tokens?: string[] | null
+  egress?: string[] | null
+}): GatewayConfig {
   return withLockSync<GatewayConfig>(() => {
     const cfg = readGatewayConfig()
     if (patch.plan !== undefined) {
       if (patch.plan !== "go" && patch.plan !== "zen")
         throw new Error(`plan 必须是 "go" 或 "zen"，收到: ${patch.plan}`)
       cfg.plan = patch.plan
+    }
+    if (patch.egress !== undefined) {
+      if (patch.egress !== null && !Array.isArray(patch.egress))
+        throw new Error("egress 必须是字符串数组或 null（清空）")
+      cfg.egress =
+        patch.egress === null
+          ? []
+          : patch.egress.filter((e) => typeof e === "string" && e.length > 0)
+      if (cfg.egress.some((e) => e !== "direct" && !e.startsWith("socks5://")))
+        throw new Error(`egress 只支持 "direct" 或 "socks5://host:port"（收到: ${cfg.egress.join(", ")}）`)
     }
     if (patch.tokens !== undefined) {
       if (patch.tokens !== null && !Array.isArray(patch.tokens))
@@ -955,7 +975,7 @@ function genGatewayToken(): string {
   return "sk-" + randomBytes(24).toString("hex")
 }
 
-/** GET /api/gateway/config 载荷：token 一律掩码返回，绝不返回明文 */
+/** GET /api/gateway/config 载荷：token 一律掩码返回，绝不返回明文；egress 出口池原样列出 */
 function gatewayConfigPayload() {
   const cfg = readGatewayConfig()
   return {
@@ -965,8 +985,25 @@ function gatewayConfigPayload() {
     tokenCount: cfg.tokens.length,
     authEnabled: cfg.tokens.length > 0,
     tokenSetAt: cfg.token_set_at,
+    egress: cfg.egress,
+    egressEnabled: cfg.egress.length >= 2,
     needsRestart: false, // GET 只读；needsRestart:true 仅由 POST 写操作返回
   }
+}
+
+/** 校验单个 egress 项：只接受 "direct" 或 "socks5://[user:pass@]host:port"。非法返回 null。 */
+function validateEgressItem(raw: string): string | null {
+  const s = String(raw).trim()
+  if (!s) return null
+  if (s === "direct") return "direct"
+  if (!s.startsWith("socks5://")) return null
+  const rest = s.slice("socks5://".length)
+  // user:pass@host:port 或 host:port；host 可为域名或 IP；port 必须 1-65535
+  const m = rest.match(/^(?:[^/@]+@)?([^/:@]+):(\d{1,5})[\/]?$/)
+  if (!m) return null
+  const port = Number(m[2])
+  if (!(port >= 1 && port <= 65535)) return null
+  return s
 }
 
 /** GET /api/gateway/plans 载荷：两档套餐元数据 + 当前套餐 */
@@ -1181,13 +1218,47 @@ async function handleWeb(req: any): Promise<Response> {
              writeGatewayConfig({ tokens: cfg.tokens.filter((_, i) => i !== idx) })
              return { ok: true, needsRestart: true }
            }
-           if (action === "clear") {
-             writeGatewayConfig({ tokens: null })
-             return { ok: true, needsRestart: true }
-           }
-           throw new Error(`未知 action: ${action || "(空)"}（支持 gen/del/clear）`)
-         }
-        return null
+if (action === "clear") {
+              writeGatewayConfig({ tokens: null })
+              return { ok: true, needsRestart: true }
+            }
+            throw new Error(`未知 action: ${action || "(空)"}（支持 gen/del/clear）`)
+          }
+          // 网关 IP 池（egress 出口轮换）管理：add/del/clear/set。仅 zen 免费档用于绕过按 IP 限流。
+          if (route === "/api/gateway/egress") {
+            const action = String(body.action || "")
+            const list = () => readGatewayConfig().egress
+            if (action === "add") {
+              const e = validateEgressItem(String(body.url || ""))
+              if (!e) throw new Error("出口格式非法：仅支持 \"direct\" 或 \"socks5://[user:pass@]host:port\"")
+              const cfg = readGatewayConfig()
+              if (cfg.egress.includes(e)) throw new Error(`出口已存在: ${e}`)
+              writeGatewayConfig({ egress: [...cfg.egress, e] })
+              return { ok: true, egress: list(), needsRestart: true }
+            }
+            if (action === "del") {
+              const idx = Number(body.index)
+              const cfg = readGatewayConfig()
+              if (!Number.isInteger(idx) || idx < 0 || idx >= cfg.egress.length)
+                throw new Error(`index 越界（当前 ${cfg.egress.length} 个出口）`)
+              writeGatewayConfig({ egress: cfg.egress.filter((_, i) => i !== idx) })
+              return { ok: true, egress: list(), needsRestart: true }
+            }
+            if (action === "clear") {
+              writeGatewayConfig({ egress: null })
+              return { ok: true, egress: [], needsRestart: true }
+            }
+            if (action === "set") {
+              const arr = Array.isArray(body.list) ? body.list.map((x: unknown) => String(x)) : []
+              if (arr.length === 0) throw new Error("list 不能为空")
+              const valid = arr.map((x) => validateEgressItem(x))
+              if (valid.some((v) => v === null)) throw new Error("出口格式非法（只支持 direct / socks5://host:port）")
+              writeGatewayConfig({ egress: valid as string[] })
+              return { ok: true, egress: list(), needsRestart: true }
+            }
+            throw new Error(`未知 action: ${action || "(空)"}（支持 add/del/clear/set）`)
+          }
+         return null
       }
       const res = run()
       if (res === null) return json({ error: "unknown route" }, 404)
@@ -1858,6 +1929,18 @@ try {
     <div class="muted" style="margin-top:6px">生成/设置后需「重启网关」生效。其它 agent 连网关时用任一 key（curl -H "Authorization: Bearer &lt;key&gt;"）。</div>
     <div id="token-msg" class="msg" style="margin-top:6px"></div>
   </div>
+
+  <div class="card" id="gw-egress-card">
+    <b>IP 池（轮换出口） <span id="egress-badge"></span></b>
+    <div class="row" style="margin-top:10px">
+      <input id="egress-input" type="text" placeholder="socks5://user:pass@host:port 或 direct" style="flex:1;min-width:0" />
+      <button class="primary" onclick="addEgress()">＋ 添加出口</button>
+      <button class="danger" onclick="clearEgress()">清空全部</button>
+    </div>
+    <div id="egress-list" class="muted" style="margin-top:10px">加载中…</div>
+    <div class="muted" style="margin-top:6px">zen 免费档按 IP 限流（429 FreeUsageLimit）；配置 <b>≥2</b> 个出口后网关在被限时自动切到下一个出口。修改后需「重启网关」生效。</div>
+    <div id="egress-msg" class="msg" style="margin-top:6px"></div>
+  </div>
   </div>
 
   <div class="card" id="gw-usage-card">
@@ -2442,6 +2525,50 @@ function tokenBadge(on) {
   document.getElementById("token-badge").innerHTML =
     on ? '<span class="badge b-running">鉴权开启</span>' : '<span class="badge b-stopped">鉴权关闭</span>'
 }
+function renderEgressList(egress, enabled) {
+  const el = document.getElementById("egress-list")
+  const badge = document.getElementById("egress-badge")
+  badge.innerHTML = enabled
+    ? '<span class="badge b-running">IP 轮换已启用</span>'
+    : '<span class="badge b-stopped">未启用（需 ≥2 个出口）</span>'
+  if (!Array.isArray(egress) || !egress.length) {
+    el.textContent = "未配置出口（直连）。zen 免费档被限流时添加 SOCKS5 代理出口可换 IP。"
+    return
+  }
+  el.innerHTML = egress.map((e, i) =>
+    '<div style="display:flex;align-items:center;gap:8px;padding:3px 0;border-bottom:1px solid var(--bd-2)">' +
+      '<code style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(e) + '</code>' +
+      (i === 0 ? '<span class="badge b-go">当前</span>' : "") +
+      '<button class="small" onclick="delEgress(' + i + ')">删除</button></div>').join("")
+}
+async function addEgress() {
+  const input = document.getElementById("egress-input")
+  const url = (input.value || "").trim()
+  const msg = document.getElementById("egress-msg")
+  if (!url) { msg.className = "msg err"; msg.textContent = "请输入出口（direct 或 socks5://host:port）"; return }
+  try {
+    const r = await api("/api/gateway/egress", { action: "add", url })
+    input.value = ""
+    renderEgressList(r.egress || [], (r.egress || []).length >= 2)
+    msg.className = "msg"; msg.textContent = "已添加出口（重启网关后生效）"
+  } catch (e) { msg.className = "msg err"; msg.textContent = "添加失败：" + e.message }
+}
+async function delEgress(i) {
+  const msg = document.getElementById("egress-msg")
+  try {
+    const r = await api("/api/gateway/egress", { action: "del", index: i })
+    renderEgressList(r.egress || [], (r.egress || []).length >= 2)
+    msg.className = "msg"; msg.textContent = "已删除出口（重启网关后生效）"
+  } catch (e) { msg.className = "msg err"; msg.textContent = "删除失败：" + e.message }
+}
+async function clearEgress() {
+  const msg = document.getElementById("egress-msg")
+  try {
+    const r = await api("/api/gateway/egress", { action: "clear" })
+    renderEgressList(r.egress || [], false)
+    msg.className = "msg"; msg.textContent = "已清空出口池（重启网关后生效）"
+  } catch (e) { msg.className = "msg err"; msg.textContent = "清空失败：" + e.message }
+}
 async function refreshPlans() {
   try {
     const p = await api("/api/gateway/plans")
@@ -2457,6 +2584,7 @@ async function refreshGatewayConfig() {
     document.getElementById("plan-zen").checked = c.plan === "zen"
     tokenBadge(!!c.authEnabled)
     renderTokenList(c.tokens || []) // 多 key 掩码列表（明文仅本会话生成/编辑后持有，GET 永不明文）
+    renderEgressList(c.egress || [], !!c.egressEnabled) // IP 轮换出口池 + 启用徽标
   } catch (e) { showTokenMsg("配置读取失败：" + e.message, true) }
 }
 function showTokenMsg(m, isErr) {
@@ -2665,6 +2793,7 @@ export {
   genGatewayToken,
   readGatewayConfig,
   writeGatewayConfig,
+  validateEgressItem,
   maskGatewayToken,
   gatewayConfigPayload,
   gatewayPlansPayload,
