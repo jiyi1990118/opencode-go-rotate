@@ -844,10 +844,12 @@ async function gatewayTest(): Promise<{
 }
 
 /** 出口池健康检查代理：转发到网关 POST /api/gateway/egress/health（真实最小探测每出口）。
- *  网关不可达 → {ok:false, error}；可达则返回 {ok:true, checkedAt, egress:[{index,url,ok,status,ms,error}]}。 */
-async function gatewayEgressHealthProxy(): Promise<any> {
-   try {
-     const r = await fetch(GATEWAY_BASE + "/api/gateway/egress/health", {
+ *  网关不可达 → {ok:false, error}；可达则返回 {ok:true, checkedAt, egress:[{index,url,ok,status,ms,error}]}。
+ *  expectUrl 可选：只探测指定出口（限流池移回前验证是否解限）。 */
+async function gatewayEgressHealthProxy(expectUrl?: string): Promise<any> {
+  try {
+    const q = expectUrl ? "?url=" + encodeURIComponent(expectUrl) : ""
+    const r = await fetch(GATEWAY_BASE + "/api/gateway/egress/health" + q, {
        method: "POST",
        headers: gatewayAuthHeaders(),
        signal: AbortSignal.timeout(90000), // 串行探测所有出口，给足时间
@@ -1039,11 +1041,12 @@ type GatewayConfig = {
   token_set_at: string | null
   tokens: string[]
   egress: string[]
+  limited: string[] // 已被上游限流（429）的出口，从主池移出单独管理（不参与轮换）
   ip_rotation: boolean // IP 轮换总开关（默认 true；false = 即使有出口池也直接走本地直连）
 }
 
 function defaultGatewayConfig(): GatewayConfig {
-  return { plan: "go", token: null, token_set_at: null, tokens: [], egress: [], ip_rotation: true }
+  return { plan: "go", token: null, token_set_at: null, tokens: [], egress: [], limited: [], ip_rotation: true }
 }
 
 function readGatewayConfig(): GatewayConfig {
@@ -1063,6 +1066,9 @@ function readGatewayConfig(): GatewayConfig {
       egress: Array.isArray(raw.egress)
         ? raw.egress.filter((e: unknown): e is string => typeof e === "string" && e.length > 0)
         : [],
+      limited: Array.isArray(raw.limited)
+        ? raw.limited.filter((e: unknown): e is string => typeof e === "string" && e.length > 0)
+        : [],
       ip_rotation: raw.ip_rotation !== false, // 缺省开启；显式 false 关闭
     }
   } catch (e) {
@@ -1079,6 +1085,7 @@ function writeGatewayConfig(patch: {
   token?: string | null
   tokens?: string[] | null
   egress?: string[] | null
+  limited?: string[] | null
   ip_rotation?: boolean
 }): GatewayConfig {
   return withLockSync<GatewayConfig>(() => {
@@ -1090,6 +1097,16 @@ function writeGatewayConfig(patch: {
     }
     if (patch.ip_rotation !== undefined) {
       cfg.ip_rotation = patch.ip_rotation === true // 严格布尔；非 true 视为关闭
+    }
+    if (patch.limited !== undefined) {
+      if (patch.limited !== null && !Array.isArray(patch.limited))
+        throw new Error("limited 必须是字符串数组或 null（清空）")
+      cfg.limited =
+        patch.limited === null
+          ? []
+          : patch.limited.filter((e) => typeof e === "string" && e.length > 0)
+      if (cfg.limited.some((e) => e !== "direct" && !e.startsWith("socks5://")))
+        throw new Error(`limited 只支持 "direct" 或 "socks5://host:port"（收到: ${cfg.limited.join(", ")}）`)
     }
     if (patch.egress !== undefined) {
       if (patch.egress !== null && !Array.isArray(patch.egress))
@@ -1148,6 +1165,7 @@ function gatewayConfigPayload() {
     authEnabled: cfg.tokens.length > 0,
     tokenSetAt: cfg.token_set_at,
     egress: cfg.egress,
+    limited: cfg.limited,
     ipRotation: cfg.ip_rotation,               // 总开关（false = 关闭，走本地直连）
     egressEnabled: cfg.ip_rotation && cfg.egress.length >= 2, // 实际轮换启用（开关开 && ≥2 出口）
     needsRestart: false, // GET 只读；needsRestart:true 仅由 POST 写操作返回
@@ -1303,9 +1321,14 @@ async function handleWeb(req: any): Promise<Response> {
   if (method === "POST" && route === "/api/gateway/test") {
     return json(await gatewayTest())
   }
-  // 出口池健康检查（代理到网关真实最小探测，判别隧道 + 该出口 IP 是否被上游限流）
+  // 出口池健康检查（代理到网关真实最小探测，判别隧道 + 该出口 IP 是否被上游限流）。body.url 可选：只测指定出口（限流池用）
   if (method === "POST" && route === "/api/gateway/egress/health") {
-    return json(await gatewayEgressHealthProxy())
+    let wantUrl: string | undefined
+    try {
+      const b: any = await req.json()
+      if (typeof b?.url === "string" && b.url) wantUrl = b.url
+    } catch {}
+    return json(await gatewayEgressHealthProxy(wantUrl))
   }
   // 免费代理批量淘源：拉 4 源 → 连通性验证 → 带状态候选列表（供选择加入 egress）
   if (method === "POST" && route === "/api/gateway/proxies/fetch") {
@@ -1460,7 +1483,57 @@ if (action === "clear") {
               if (add.length > 0) writeGatewayConfig({ egress: [...cfg.egress, ...add] })
               return { ok: true, added: add, skipped, egress: list(), needsRestart: true }
             }
-            throw new Error(`未知 action: ${action || "(空)"}（支持 add/del/clear/set/toggle/bulk-add）`)
+            if (action === "move-to-limited") {
+              // 健康检查发现被限流的出口（429）→ 从主池移到「限流池」单独管理（不参与轮换）
+              const raw = Array.isArray(body.urls) ? body.urls.map((x: unknown) => String(x)) : []
+              if (raw.length === 0) throw new Error("urls 不能为空")
+              const cfg = readGatewayConfig()
+              const moved: string[] = []
+              const egressSet = new Set(cfg.egress)
+              const limitedSet = new Set(cfg.limited)
+              for (const u of raw) {
+                const e = validateEgressItem(u)
+                if (!e) continue
+                if (egressSet.has(e)) egressSet.delete(e) // 从主池移除
+                if (!limitedSet.has(e)) limitedSet.add(e)  // 加入限流池
+                moved.push(e)
+              }
+              writeGatewayConfig({
+                egress: [...egressSet],
+                limited: [...limitedSet],
+              })
+              return { ok: true, moved, egress: list(), limited: [...limitedSet], needsRestart: true }
+            }
+            if (action === "restore") {
+              // 限流池出口重新探测发现可用 → 移回主池
+              const raw = Array.isArray(body.urls) ? body.urls.map((x: unknown) => String(x)) : []
+              if (raw.length === 0) throw new Error("urls 不能为空")
+              const cfg = readGatewayConfig()
+              const restored: string[] = []
+              const egressSet = new Set(cfg.egress)
+              const limitedSet = new Set(cfg.limited)
+              for (const u of raw) {
+                const e = validateEgressItem(u)
+                if (!e) continue
+                if (limitedSet.has(e)) limitedSet.delete(e)
+                if (!egressSet.has(e)) egressSet.add(e)
+                restored.push(e)
+              }
+              writeGatewayConfig({
+                egress: [...egressSet],
+                limited: [...limitedSet],
+              })
+              return { ok: true, restored, egress: list(), limited: [...limitedSet], needsRestart: true }
+            }
+            if (action === "set-limited") {
+              // 直接重设限流池（删除单项/清空）
+              const arr = Array.isArray(body.list) ? body.list.map((x: unknown) => String(x)) : []
+              const valid = arr.map((x) => validateEgressItem(x))
+              if (valid.some((v) => v === null)) throw new Error("list 格式非法（只支持 direct / socks5://host:port）")
+              writeGatewayConfig({ limited: valid as string[] })
+              return { ok: true, limited: valid as string[], needsRestart: true }
+            }
+            throw new Error(`未知 action: ${action || "(空)"}（支持 add/del/clear/set/toggle/bulk-add/move-to-limited/restore/set-limited）`)
           }
          return null
       }
@@ -2166,11 +2239,25 @@ try {
       <input id="egress-input" type="text" placeholder="socks5://user:pass@host:port 或 direct" style="flex:1;min-width:0" />
       <button class="primary" onclick="addEgress()">＋ 添加出口</button>
       <button id="egress-check-btn" onclick="checkEgressHealth()">检查出口</button>
+      <button id="egress-checkall-btn" class="primary" onclick="checkAllHealth()">检查所有 IP 健康度</button>
       <button class="danger" onclick="clearEgress()">清空全部</button>
     </div>
     <div id="egress-list" class="muted" style="margin-top:10px">加载中…</div>
     <div class="muted" style="margin-top:6px">zen 免费档按 IP 限流（429 FreeUsageLimit）；配置 <b>≥2</b> 个出口后网关在被限时自动切到下一个出口。修改后需「重启网关」生效；「检查出口」逐项真实最小探测（每项消耗 ~1 token）。</div>
     <div id="egress-msg" class="msg" style="margin-top:6px"></div>
+  </div>
+
+  <div class="card" id="gw-limited-card">
+    <b>限流池（被上游限流的出口） <span id="limited-badge"></span></b>
+    <div class="row" style="margin-top:10px">
+      <button id="limited-check-btn" onclick="checkLimitedHealth()">健康检查</button>
+      <button id="limited-restore-btn" onclick="restoreSelectedLimited()">移回 IP 池</button>
+      <span class="muted" style="margin-left:8px;flex:1">429 被限流的出口移到这里单独管理，不参与轮换；重新探测解限后可移回主池。</span>
+    </div>
+    <div id="limited-toolbar" class="proxy-toolbar" style="display:none"></div>
+    <div id="limited-list" class="proxy-grid muted" style="margin-top:10px">无被限流的出口。</div>
+    <div class="muted" style="margin-top:6px">「健康检查」对每个限流出口做真实最小探测——状态变为可用即解除限流，勾选后「移回 IP 池」。</div>
+    <div id="limited-msg" class="msg" style="margin-top:6px"></div>
   </div>
 
   <div class="card" id="gw-proxy-card">
@@ -2775,6 +2862,9 @@ function tokenBadge(on) {
 }
 var egressHealth = {} // 出口健康检查结果缓存：{ [url]: {ok,status,ms,error} }
 var ipRotationOn = true // IP 轮换总开关（false = 走本地直连）
+var currentEgressList = [] // 当前渲染的 egress 列表（供 moveToLimited 按下标操作）
+var limitedHealth = {} // 限流池健康检查结果缓存：{ [url]: {ok,status,ms,error} }
+var limitedSel = {} // 限流池勾选状态：{ index: true }
 function renderEgressList(egress, enabled, ipRotation) {
   const el = document.getElementById("egress-list")
   const badge = document.getElementById("egress-badge")
@@ -2791,22 +2881,28 @@ function renderEgressList(egress, enabled, ipRotation) {
         ? '<span class="badge b-running">IP 轮换已启用</span>'
         : '<span class="badge b-stopped">未启用（需 ≥2 个出口）</span>')
   if (!Array.isArray(egress) || !egress.length) {
+    currentEgressList = []
     el.textContent = !ipRotation
       ? "IP 轮换已关闭，所有请求走本地直连。开启后可用下方出口池换 IP。"
       : "未配置出口（直连）。zen 免费档被限流时添加 SOCKS5 代理出口可换 IP。"
     return
   }
+  currentEgressList = egress
   el.innerHTML = egress.map((e, i) => {
     let h = ""
     const st = egressHealth[e]
+    let limitedBtn = ""
     if (st) {
       if (st.ok) h = '<span class="badge b-available" title="' + esc(st.ms + "ms") + '">健康 ' + st.status + '</span>'
-      else if (st.status === 429) h = '<span class="badge b-warn" title="' + esc(st.error || "") + '">IP 被限流 429</span>'
-      else h = '<span class="badge b-invalid" title="' + esc(st.error || "") + '">不可用</span>'
+      else if (st.status === 429) {
+        h = '<span class="badge b-warn" title="' + esc(st.error || "") + '">IP 被限流 429</span>'
+        limitedBtn = '<button class="small" onclick="moveToLimited(' + i + ')">→ 限流池</button>'
+      }
+      else h = '<span class="badge b-invalid" title="' + esc(st.error || "") + '">不可用</button></span>'
     }
     return '<div style="display:flex;align-items:center;gap:8px;padding:3px 0;border-bottom:1px solid var(--bd-2)">' +
       '<code style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(e) + '</code>' +
-      h +
+      h + limitedBtn +
       (i === 0 ? '<span class="badge b-go">当前</span>' : "") +
       '<button class="small" onclick="delEgress(' + i + ')">删除</button></div>'
   }).join("")
@@ -2827,6 +2923,122 @@ async function checkEgressHealth() {
     msg.textContent = "检查完成：" + good + "/" + (r.egress || []).length + " 个出口可用（" + r.checkedAt + "）"
   } catch (e) { msg.className = "msg err"; msg.textContent = "检查失败：" + e.message }
   if (btn) { btn.textContent = "检查出口"; btn.disabled = false }
+}
+function renderLimitedList(limited) {
+  const el = document.getElementById("limited-list")
+  const badge = document.getElementById("limited-badge")
+  badge.innerHTML = limited && limited.length
+    ? '<span class="badge b-warn">' + limited.length + " 个被限流</span>"
+    : '<span class="badge b-stopped">0 个</span>'
+  const toolbar = document.getElementById("limited-toolbar")
+  if (toolbar) toolbar.style.display = limited && limited.length ? "flex" : "none"
+  if (!limited || !limited.length) { el.textContent = "无被限流的出口。"; return }
+  el.innerHTML = limited.map((e, i) => {
+    const st = limitedHealth[e]
+    const isSel = !!limitedSel[i]
+    let h = ""
+    if (st) {
+      if (st.ok) h = '<span class="badge b-available" title="' + esc((st.ms || 0) + "ms") + '">已解除 ' + st.status + '</span>'
+      else if (st.status === 429) h = '<span class="badge b-warn">仍限流 429</span>'
+      else h = '<span class="badge b-invalid">不可用</span>'
+    } else {
+      h = '<span class="badge b-stopped">未探测</span>'
+    }
+    return '<label class="proxy-item">' +
+      '<input type="checkbox" ' + (isSel ? "checked" : "") +
+        ' onchange="limitedSel[' + i + ']=this.checked;updateLimitedSelCount()">' +
+      '<code title="' + esc(e) + '">' + esc(e.indexOf("//") >= 0 ? e.slice(e.indexOf("//") + 2) : e) + '</code>' +
+      h +
+      '<button class="small" onclick="delLimited(' + i + ')">删除</button>' +
+      '</label>'
+  }).join("")
+  updateLimitedSelCount()
+}
+function updateLimitedSelCount() {
+  const c = document.getElementById("limited-selcount")
+  if (c) c.textContent = Object.keys(limitedSel).filter((k) => limitedSel[k]).length
+}
+async function moveToLimited(i) {
+  const url = currentEgressList[i]
+  if (!url) return
+  const msg = document.getElementById("egress-msg")
+  try {
+    const r = await api("/api/gateway/egress", { action: "move-to-limited", urls: [url] })
+    renderLimitedList(r.limited || [])
+    const c = await api("/api/gateway/config")
+    renderEgressList(c.egress || [], !!c.egressEnabled, !!c.ipRotation)
+    msg.className = "msg"
+    msg.textContent = "已移入限流池：" + url + "（重启网关后生效，不再参与轮换）"
+  } catch (e) { msg.className = "msg err"; msg.textContent = "移入失败：" + e.message }
+}
+async function delLimited(i) {
+  const cfg = await api("/api/gateway/config")
+  const limited = cfg.limited || []
+  const target = limited[i]
+  if (!target) return
+  const msg = document.getElementById("limited-msg")
+  try {
+    const after = limited.filter((_, ix) => ix !== i)
+    await api("/api/gateway/egress", { action: "set-limited", list: after })
+    if (limitedHealth[target]) delete limitedHealth[target]
+    renderLimitedList(after)
+    msg.className = "msg"; msg.textContent = "已删除限流出口：" + target
+  } catch (e) { msg.className = "msg err"; msg.textContent = "删除失败：" + e.message }
+}
+async function checkLimitedHealth() {
+  const msg = document.getElementById("limited-msg")
+  const btn = document.getElementById("limited-check-btn")
+  if (btn) { btn.textContent = "检查中…"; btn.disabled = true }
+  try {
+    const cfg = await api("/api/gateway/config")
+    const limited = cfg.limited || []
+    if (!limited.length) { msg.className = "msg"; msg.textContent = "限流池为空"; return }
+    // 逐个真实最小探测（网关 egress/health?url= 对指定出口探 429 是否解除）
+    limitedHealth = {}
+    let done = 0
+    for (const url of limited) {
+      const r = await api("/api/gateway/egress/health", { url })
+      const got = (r.egress || [])[0]
+      if (got) limitedHealth[url] = { ok: got.ok, status: got.status, ms: got.ms, error: got.error }
+      done++
+    }
+    renderLimitedList(limited)
+    const restored = Object.keys(limitedHealth).filter((u) => limitedHealth[u] && limitedHealth[u].ok).length
+    msg.className = "msg"
+    msg.textContent = "检查完成：" + done + " 项，" + (limited.length - restored) + " 个仍限流，" + restored + " 个已解除（勾选可移回 IP 池）"
+  } catch (e) { msg.className = "msg err"; msg.textContent = "检查失败：" + e.message }
+  if (btn) { btn.textContent = "健康检查"; btn.disabled = false }
+}
+async function checkAllHealth() {
+  // IP 池「检查所有 IP 健康度」：主池 egress + 限流池 limited 全部出口一次性健康检查
+  const btn = document.getElementById("egress-checkall-btn")
+  if (btn) { btn.textContent = "检查中…"; btn.disabled = true }
+  try {
+    await checkEgressHealth()
+    await checkLimitedHealth()
+  } catch (e) {
+    const msg = document.getElementById("egress-msg")
+    if (msg) { msg.className = "msg err"; msg.textContent = "检查失败：" + e.message }
+  }
+  if (btn) { btn.textContent = "检查所有 IP 健康度"; btn.disabled = false }
+}
+async function restoreSelectedLimited() {
+  const cfg = await api("/api/gateway/config")
+  const limited = cfg.limited || []
+  const urls = limited.filter((_, i) => limitedSel[i])
+  const msg = document.getElementById("limited-msg")
+  if (!urls.length) { msg.className = "msg err"; msg.textContent = "未勾选任何出口（先健康检查，勾选已解除的）"; return }
+  try {
+    const r = await api("/api/gateway/egress", { action: "restore", urls })
+    // 清勾选 + 刷新两池
+    limitedSel = {}
+    limitedHealth = {}
+    renderLimitedList(r.limited || [])
+    const c = await api("/api/gateway/config")
+    renderEgressList(c.egress || [], !!c.egressEnabled, !!c.ipRotation)
+    msg.className = "msg"
+    msg.textContent = "已移回 IP 池：" + (r.restored || []).join(", ") + "（重启网关后生效）"
+  } catch (e) { msg.className = "msg err"; msg.textContent = "移回失败：" + e.message }
 }
 async function addEgress() {
   const input = document.getElementById("egress-input")

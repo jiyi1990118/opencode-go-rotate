@@ -884,40 +884,56 @@ function egressSucceeded() {
    }
  }
 
- /** 出口池健康检查：对每个出口（或指定 index）发一次真实最小探测，判断「隧道是否通 + 该出口 IP 是否被上游限流」。
+ /** 出口池健康检查：对每个出口（或指定 index / 自定义 url 列表）发一次真实最小探测，判断「隧道是否通 + 该出口 IP 是否被上游限流」。
  *  串行执行（避免瞬时并发雪崩与配额浪费），每项 PROBE_TIMEOUT_MS 超时。不轮换、不冷却、不改 current —— 纯只读探测。
- *  出口列表取「当前配置文件」（readGatewayConfig 实时），Web 端添加后无需重启即可探测。
+ *  出口列表默认取「当前配置文件」（readGatewayConfig 实时），Web 端添加后无需重启即可探测；
+ *  传入 expectUrl 时从配置 egress 列表中查找该 url（用于限流池探测时把某项纳入）。
  *  返回 { checkedAt, egress: [{index, url, ok, status, ms, error}] }；ok=false 时 status 可能缺失。 */
- async function egressHealthCheck(onlyIndex = null) {
+ async function egressHealthCheck(onlyIndex = null, expectUrl = null) {
    const cfg = loadConfig()
    const key = currentKey(cfg)
    if (!key) return { checkedAt: new Date().toISOString(), error: "no key in go-keys.json", egress: [] }
-   const list = parseEgressList(readGatewayConfig().egress)
+   let list = parseEgressList(readGatewayConfig().egress)
    if (list.length === 0) list.push({ type: "direct", raw: "direct" })
+   // 限流池探测：把期望的 url（可能在 egress 池中 index 越界）单独作为探测对象
+   if (expectUrl) {
+     const only = parseEgressList([expectUrl])
+     if (only.length) list = only
+   }
    const probe = { model: DEFAULT_MODEL, messages: [{ role: "user", content: "ping" }], max_tokens: 1 }
    const probeBody = JSON.stringify(probe)
-   const out = []
+   // 并发探测（CHK_CONCURRENCY 并发上限，防雪崩 + 提速——避免 N 个超时项串行吃满 N×15s）
+   const CHK_CONC = 5
+   const targets = []
    for (let i = 0; i < list.length; i++) {
      if (onlyIndex != null && i !== onlyIndex) continue
-     const e = list[i]
-     const start = Date.now()
-     const entry = { index: i, url: e.raw }
-     try {
-       const { res, bodyText } = await upstreamOnce(key.key, probeBody, false, PROBE_TIMEOUT_MS, null,
-         e.type === "socks5" ? e : null)
-       entry.ms = Date.now() - start
-       entry.status = res.status
-       entry.ok = res.ok
-       if (!res.ok) {
-         const t = parseErrorBody(bodyText)?.error?.type || ""
-         entry.error = `HTTP ${res.status}${t ? " (" + t + ")" : ""}`
+     targets.push({ e: list[i], index: i })
+   }
+   const out = []
+   for (let base = 0; base < targets.length; base += CHK_CONC) {
+     const batch = targets.slice(base, base + CHK_CONC)
+     const res = await Promise.all(batch.map(async ({ e, index }) => {
+       const start = Date.now()
+       const entry = { index, url: e.raw }
+       try {
+         const r = await upstreamOnce(key.key, probeBody, false, PROBE_TIMEOUT_MS, null,
+           e.type === "socks5" ? e : null)
+         entry.ms = Date.now() - start
+         entry.status = r.res.status
+         entry.ok = r.res.ok
+         if (!r.res.ok) {
+           const t = parseErrorBody(r.bodyText)?.error?.type || ""
+           entry.error = `HTTP ${r.res.status}${t ? " (" + t + ")" : ""}`
+         }
+       } catch (err) {
+         entry.ms = Date.now() - start
+         entry.ok = false
+         entry.error = err.message
        }
-     } catch (err) {
-       entry.ms = Date.now() - start
-       entry.ok = false
-       entry.error = err.message
-     }
-     out.push(entry)
+       return entry
+     }))
+     // 保持原顺序
+     out.push(...res.sort((a, b) => a.index - b.index))
    }
    return { checkedAt: new Date().toISOString(), egress: out }
  }
@@ -2234,15 +2250,16 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, gatewayConfigSummary(loadConfig(), readRawConfig()))
   }
   if (method === "POST" && route === "/api/gateway/egress/health") {
-    // 出口池健康检查：真实最小探测每出口（HTTP 状态可判别限流；不改配置/不轮换）。?index=N 只测单个。
+    // 出口池健康检查：真实最小探测每出口（HTTP 状态可判别限流；不改配置/不轮换）。?index=N 只测单个 / ?url=xxx 测指定出口。
     let onlyIndex = null
     const idx = url.searchParams.get("index")
     if (idx != null) {
       onlyIndex = Number(idx)
       if (!Number.isInteger(onlyIndex) || onlyIndex < 0) onlyIndex = null
     }
+    const expectUrl = url.searchParams.get("url")
     try {
-      return sendJson(res, 200, await egressHealthCheck(onlyIndex))
+      return sendJson(res, 200, await egressHealthCheck(onlyIndex, expectUrl))
     } catch (e) {
       log(`⚠️  egress 健康检查失败: ${e.message}`)
       return sendJson(res, 500, { error: e.message })
