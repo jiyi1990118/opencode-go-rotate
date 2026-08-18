@@ -77,6 +77,7 @@
 | POST | `/api/web/off` | `{}` | `{ok,shutting_down,auto_web:false}` | `auto_web=false` + 300ms 后停 server |
 | POST | `/api/web/on` | `{}` | `{ok,auto_web:true,restarted}` | 开自动启动 + **立即重启**（server 未运行时拉起；`restarted` 表示本次是否真的拉起） |
 | POST | `/api/log/clear` | `{}` | `{ok,status}` | 清空日志 + 删归档 |
+| POST | `/api/gateway/test` | `{}` | `{ok, status?, ms?, model?, detail}` | **网关功能测试**：经网关发一条最小 chat 请求，验证「网关进程 → 上游 opencode → 模型返回」全链路（healthz 只证明进程在，本端点证明真能出结果）。成功 `ok:true` + 延迟 + 响应片段；失败分类（429 FreeUsageLimit → 免费档限流「非 key 问题」/ 401·402 → 配额鉴权 / 不可达 → 网络错误）。消耗约 8 token/次 |
 | 其它 | 任意未匹配 | - | 404 `{"error":"not found"}` | POST 处理抛错时 400 `{"error":msg}` |
 
 所有写操作带**跨进程文件锁**（`withLockSync`：O_EXCL + 陈旧锁检测 + 5s 超时降级）与**原子写**（.tmp + rename），与 CLI / zen-gateway 同一套并发安全机制。

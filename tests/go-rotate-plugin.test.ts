@@ -679,6 +679,11 @@ describe("网关管理 UI（WEB_HTML 内嵌）", () => {
     expect(html).toContain('api("/api/gateway/" + action, {})')
     expect(html).toContain("setTimeout(refreshGateway, 800)")
     expect(html).toContain("async function refreshGwLog()")
+    // 网关功能测试：按钮 + JS 处理函数 + 结果消息区 + 后端路由调用
+    expect(html).toContain('id="gw-test" onclick="gwTest()"')
+    expect(html).toContain("async function gwTest()")
+    expect(html).toContain('id="gw-test-msg"')
+    expect(html).toContain('api("/api/gateway/test", {})')
     // 徽标三态样式（running 绿 / stopped 灰 / error 红）
     expect(html).toContain(".b-running")
     expect(html).toContain(".b-stopped")
@@ -760,6 +765,22 @@ describe("网关管理路由（POST /api/gateway/start|stop|restart，假脚本�
     expect(res.status).toBe(404)
     const j = await res.json()
     expect(j.error).toBe("unknown route")
+  })
+})
+
+describe("网关功能测试路由（POST /api/gateway/test，测试 env 网关不可达 → 优雅降级）", () => {
+  test("网关不可达 → {ok:false} detail 含失败原因，不抛异常，status 200 传输层", async () => {
+    const req = new Request("http://127.0.0.1:8899/api/gateway/test", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    })
+    const res = await mod.handleWeb(req)
+    expect(res.status).toBe(200)
+    const j = await res.json()
+    expect(j.ok).toBe(false)
+    expect(typeof j.detail).toBe("string")
+    expect(j.detail.length).toBeGreaterThan(0)
   })
 })
 

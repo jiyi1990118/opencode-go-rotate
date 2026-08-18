@@ -776,6 +776,70 @@ async function gatewayStatus(): Promise<{
   return out
 }
 
+/** 网关功能测试（真实端到端）：经网关发一条最小 chat 请求验证全链路（网关进程 → 上游 opencode → 模型返回）。
+ *  healthz 只证明网关进程在；本测试证明「当前网关配置 + 当前 key + 上游」真的能出结果。
+ *  - 模型取当前套餐默认（go→hy3 / zen→hy3-free），由网关负责别名/回退
+ *  - 上游可能慢（推理模型/限流），超时取 20s
+ *  - 返回 { ok, status?, ms?, model?, detail }；ok=false 时 detail 含可展示原因分类
+ */
+async function gatewayTest(): Promise<{
+  ok: boolean
+  status?: number
+  ms?: number
+  model?: string
+  detail: string
+}> {
+  const plan = readGatewayConfig().plan === "zen" ? "zen" : "go"
+  const model = plan === "zen" ? "hy3-free" : "hy3"
+  const headers: Record<string, string> = { "content-type": "application/json", ...gatewayAuthHeaders() }
+  const t0 = Date.now()
+  try {
+    const r = await fetch(GATEWAY_BASE + "/v1/chat/completions", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: "Reply with exactly: OK" }],
+        max_tokens: 8,
+        stream: false,
+      }),
+      signal: AbortSignal.timeout(20000),
+    })
+    const ms = Date.now() - t0
+    const text = await r.text().catch(() => "")
+    if (r.ok) {
+      // 200：网关 + 上游链路通（读到 choices 更稳）。如果 body 不可解析仍视为 ok（上游非 JSON 分支少见）
+      try {
+        const j = JSON.parse(text)
+        const c = j?.choices?.[0]?.message?.content
+        const reason = String(j?.choices?.[0]?.finish_reason ?? "")
+        const snippet = typeof c === "string" && c.trim() ? c.trim().slice(0, 60) : "(无文本，推理模型截断属正常)"
+        return { ok: true, status: r.status, ms, model, detail: `HTTP ${r.status} ${ms}ms · 模型 ${model} 响应: ${snippet}（finish_reason=${reason || "-"}）` }
+      } catch {
+        return { ok: true, status: r.status, ms, model, detail: `HTTP ${r.status} ${ms}ms · 模型 ${model} 响应（body 非 JSON，链路通）` }
+      }
+    }
+    // 失败：分类上游错误
+    let msg = text
+    let errType = ""
+    try {
+      const j = JSON.parse(text)
+      msg = j?.error?.message ?? text
+      errType = String(j?.error?.type ?? "")
+    } catch {}
+    const why = `${r.status} ${String(msg).slice(0, 120)}`
+    if (r.status === 429 && /FreeUsageLimit/i.test(errType))
+      return { ok: false, status: r.status, ms, model, detail: `免费档限流（FreeUsageLimitError，按 UA/频率限流，非 key 问题）: ${why}` }
+    if (r.status === 401 || r.status === 402 || /insufficient|balance/i.test(String(msg)))
+      return { ok: false, status: r.status, ms, model, detail: `配额/鉴权（402/401）: ${why}` }
+    if (r.status === 429 || /quota|rate|limit|exceeded/i.test(String(msg)))
+      return { ok: false, status: r.status, ms, model, detail: `上游限流（429）: ${why}` }
+    return { ok: false, status: r.status, ms, model, detail: `网关返回错误: ${why}` }
+  } catch (e: any) {
+    return { ok: false, detail: `网关不可达/请求失败: ${String(e?.message ?? e)}` }
+  }
+}
+
 /** GET /api/gateway/models 透传：网关 go + zen 双套餐模型清单（各自动态 ∪ 内置）+ 别名。
  *  网关不可达/失败 → {ok:false, error}，前端降级显示。 */
 async function gatewayModelsProxy(): Promise<any> {
@@ -1034,6 +1098,10 @@ async function handleWeb(req: any): Promise<Response> {
   // 手动刷新 go + zen 双套餐模型清单（异步调网关 /v1/models/refresh，先于通用 POST 块处理）
   if (method === "POST" && route === "/api/gateway/models/refresh") {
     return json(await gatewayModelsRefresh())
+  }
+  // 网关功能测试（真实端到端：经网关发最小 chat 请求，验证网关→上游→模型全链路）
+  if (method === "POST" && route === "/api/gateway/test") {
+    return json(await gatewayTest())
   }
   if (method === "POST") {
     try {
@@ -1748,6 +1816,11 @@ try {
       <button id="gw-stop" onclick="gwManage('stop')">停止</button>
       <button id="gw-restart" onclick="gwManage('restart')">重启</button>
     </div>
+    <div class="row" style="margin-bottom:10px">
+      <span class="muted" style="flex:1">功能测试（真实发一条请求验证网关→上游→模型全链路）：</span>
+      <button id="gw-test" onclick="gwTest()">网关功能测试</button>
+    </div>
+    <div id="gw-test-msg" class="msg" style="margin-top:6px"></div>
     <div id="gw-body"><span class="muted">加载中…</span></div>
     <div id="gw-ctl-msg" class="msg" style="margin-top:6px"></div>
   </div>
@@ -2279,6 +2352,24 @@ async function gwManage(action) {
     btn.disabled = false
   }
 }
+/* 网关功能测试：真实端到端（经网关发最小 chat 请求），结果写 gw-test-msg */
+async function gwTest() {
+  const btn = document.getElementById("gw-test")
+  const msg = document.getElementById("gw-test-msg")
+  if (btn) btn.disabled = true
+  msg.textContent = "测试中…（真实请求上游，可能需几秒）"
+  msg.className = "msg"
+  try {
+    const r = await api("/api/gateway/test", {})
+    msg.textContent = (r.ok ? "✅ " : "⚠️ ") + (r.detail || (r.ok ? "网关功能正常" : "测试失败"))
+    msg.className = r.ok ? "msg" : "msg err"
+  } catch (e) {
+    msg.textContent = "测试失败：" + e.message
+    msg.className = "msg err"
+  }
+  if (btn) setTimeout(() => { btn.disabled = false }, 1000)
+  setTimeout(refreshGateway, 1500)
+}
 
 /* ---- 网关日志（/api/gateway/log，只读文本 + 手动刷新；已移入「统计 · 分析与日志」区块） ---- */
 async function refreshGwLog() {
@@ -2549,6 +2640,7 @@ export {
   gatewayStatus,
   gatewayManage,
   gatewayLog,
+  gatewayTest,
   gatewayCtlExists,
   genGatewayToken,
   readGatewayConfig,
