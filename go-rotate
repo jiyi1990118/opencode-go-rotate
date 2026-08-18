@@ -722,11 +722,11 @@ def _gateway_boot():
     if p == "windows":
         if not _gateway_loaded():
             # 计划任务：登录时自启 + 立即运行；执行 zen-gateway.cmd 包装脚本（install.ps1 生成，设置 env 后启动 node gateway.mjs）
-            _schtasks([
-                "/Create", "/F", "/TN", GATEWAY_LABEL,
-                "/TR", f'"{GATEWAY_WRAPPER}"',
-                "/SC", "ONLOGON", "/RU", os.environ.get("USERNAME", ""),
-            ])
+            # /RU 缺省=当前用户；USERNAME 为空时显式省略（schtasks 自动补当前用户），避免传空值报错
+            args = ["/Create", "/F", "/TN", GATEWAY_LABEL, "/TR", f'"{GATEWAY_WRAPPER}"', "/SC", "ONLOGON"]
+            if os.environ.get("USERNAME"):
+                args += ["/RU", os.environ["USERNAME"]]
+            _schtasks(args)
             rc, _, _ = _schtasks(["/Run", "/TN", GATEWAY_LABEL])
             return rc == 0
         return True
