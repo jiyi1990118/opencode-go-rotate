@@ -782,6 +782,19 @@ describe("网关功能测试路由（POST /api/gateway/test，测试 env 网关�
     expect(typeof j.detail).toBe("string")
     expect(j.detail.length).toBeGreaterThan(0)
   })
+  test("POST /api/gateway/egress/health 网关不可达 → {ok:false, error} 不抛异常", async () => {
+    const req = new Request("http://127.0.0.1:8899/api/gateway/egress/health", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    })
+    const res = await mod.handleWeb(req)
+    expect(res.status).toBe(200)
+    const j = await res.json()
+    expect(j.ok).toBe(false)
+    expect(typeof j.error).toBe("string")
+    expect(j.error.length).toBeGreaterThan(0)
+  })
 })
 
 /* ================= go + zen 双套餐模型动态查看（Web 面板 + 路由，隔离不可达网关降级） ================= */
@@ -1146,14 +1159,22 @@ describe("WEB_HTML 网关管理区块（主导航 + 套餐卡 + Token 卡）", (
     expect(html).toContain('id="egress-input"')
     expect(html).toContain('onclick="addEgress()"')
     expect(html).toContain('onclick="clearEgress()"')
+    expect(html).toContain('onclick="checkEgressHealth()"')
+    expect(html).toContain('id="egress-check-btn"')
     expect(html).toContain("function renderEgressList(")
     expect(html).toContain("async function addEgress()")
     expect(html).toContain("async function delEgress(")
     expect(html).toContain("async function clearEgress()")
+    expect(html).toContain("async function checkEgressHealth()")
     expect(html).toContain('api("/api/gateway/egress", { action: "add", url')
     expect(html).toContain('api("/api/gateway/egress", { action: "del", index:')
     expect(html).toContain('api("/api/gateway/egress", { action: "clear" })')
+    expect(html).toContain('api("/api/gateway/egress/health", {})')
     expect(html).toContain("renderEgressList(c.egress || [], !!c.egressEnabled)")
+    expect(html).toContain("egressHealth[") // 健康结果缓存渲染
+    expect(html).toContain('class="badge b-available"') // 健康徽标
+    expect(html).toContain('class="badge b-warn"')      // 429 被限流徽标
+    expect(html).toContain('class="badge b-invalid"')   // 不可用徽标
     // IP 轮换启用条件提示
     expect(html).toContain("≥2")
   })

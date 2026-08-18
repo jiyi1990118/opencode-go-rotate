@@ -856,16 +856,55 @@ function egressSucceeded() {
 }
 
 /** 当前出口健康状态（测试/状态端点用） */
-function egressSnapshot() {
-  return {
-    enabled: EGRESS_ENABLED,
-    count: EGRESS_LIST.length,
-    index: _egressIdx,
-    current: EGRESS_LIST[_egressIdx] ? EGRESS_LIST[_egressIdx].raw : "direct",
-    list: EGRESS_LIST.map((e) => e.raw),
-  }
-}
-const DEFAULT_MODEL = ACTIVE_PLAN.defaultModel
+ function egressSnapshot() {
+   return {
+     enabled: EGRESS_ENABLED,
+     count: EGRESS_LIST.length,
+     index: _egressIdx,
+     current: EGRESS_LIST[_egressIdx] ? EGRESS_LIST[_egressIdx].raw : "direct",
+     list: EGRESS_LIST.map((e) => e.raw),
+   }
+ }
+
+ /** 出口池健康检查：对每个出口（或指定 index）发一次真实最小探测，判断「隧道是否通 + 该出口 IP 是否被上游限流」。
+ *  串行执行（避免瞬时并发雪崩与配额浪费），每项 PROBE_TIMEOUT_MS 超时。不轮换、不冷却、不改 current —— 纯只读探测。
+ *  出口列表取「当前配置文件」（readGatewayConfig 实时），Web 端添加后无需重启即可探测。
+ *  返回 { checkedAt, egress: [{index, url, ok, status, ms, error}] }；ok=false 时 status 可能缺失。 */
+ async function egressHealthCheck(onlyIndex = null) {
+   const cfg = loadConfig()
+   const key = currentKey(cfg)
+   if (!key) return { checkedAt: new Date().toISOString(), error: "no key in go-keys.json", egress: [] }
+   const list = parseEgressList(readGatewayConfig().egress)
+   if (list.length === 0) list.push({ type: "direct", raw: "direct" })
+   const probe = { model: DEFAULT_MODEL, messages: [{ role: "user", content: "ping" }], max_tokens: 1 }
+   const probeBody = JSON.stringify(probe)
+   const out = []
+   for (let i = 0; i < list.length; i++) {
+     if (onlyIndex != null && i !== onlyIndex) continue
+     const e = list[i]
+     const start = Date.now()
+     const entry = { index: i, url: e.raw }
+     try {
+       const { res, bodyText } = await upstreamOnce(key.key, probeBody, false, PROBE_TIMEOUT_MS, null,
+         e.type === "socks5" ? e : null)
+       entry.ms = Date.now() - start
+       entry.status = res.status
+       entry.ok = res.ok
+       if (!res.ok) {
+         const t = parseErrorBody(bodyText)?.error?.type || ""
+         entry.error = `HTTP ${res.status}${t ? " (" + t + ")" : ""}`
+       }
+     } catch (err) {
+       entry.ms = Date.now() - start
+       entry.ok = false
+       entry.error = err.message
+     }
+     out.push(entry)
+   }
+   return { checkedAt: new Date().toISOString(), egress: out }
+ }
+
+ const DEFAULT_MODEL = ACTIVE_PLAN.defaultModel
 
 // 其它 agent 常请求的模型名 → zen 模型。未命中 → 默认模型。
 // 注意：hy3 是推理模型（会先输出 reason，需要预留 max_tokens 余量）。
@@ -2176,6 +2215,21 @@ const server = http.createServer(async (req, res) => {
   if (method === "GET" && route === "/api/gateway/config") {
     return sendJson(res, 200, gatewayConfigSummary(loadConfig(), readRawConfig()))
   }
+  if (method === "POST" && route === "/api/gateway/egress/health") {
+    // 出口池健康检查：真实最小探测每出口（HTTP 状态可判别限流；不改配置/不轮换）。?index=N 只测单个。
+    let onlyIndex = null
+    const idx = url.searchParams.get("index")
+    if (idx != null) {
+      onlyIndex = Number(idx)
+      if (!Number.isInteger(onlyIndex) || onlyIndex < 0) onlyIndex = null
+    }
+    try {
+      return sendJson(res, 200, await egressHealthCheck(onlyIndex))
+    } catch (e) {
+      log(`⚠️  egress 健康检查失败: ${e.message}`)
+      return sendJson(res, 500, { error: e.message })
+    }
+  }
   if (method === "POST" && route === "/v1/chat/completions") {
     log(`➡️  POST /v1/chat/completions`)
     return handleChatCompletions(req, res)
@@ -2530,6 +2584,7 @@ export {
   rotateEgress,
   egressSucceeded,
   egressSnapshot,
+  egressHealthCheck,
   EGRESS_ENABLED,
   EGRESS_LIST,
 }

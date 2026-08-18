@@ -140,6 +140,22 @@ nohup node gateway.mjs >/tmp/zen-gateway.log 2>&1 &
 - 生效方式：改 `gateway-config.json` 后 `zen-gateway restart`（出口池模块加载时固化一次）。
 - 适用场景：本地直连被限时，挂 1~2 个稳定 SOCKS5 代理作备用出口（免费公开代理存活率极低，建议用付费稳定代理）。
 
+### 健康检查（每出口真实最小探测）
+
+`POST /api/gateway/egress/health`（带鉴权头）——对配置的每个出口发一次最小请求（`hy3-free` + `max_tokens:1`），返回隧道连通性 + 该出口 IP 是否被上游限流：
+
+```bash
+curl -s -X POST -H "Authorization: Bearer <TOKEN>" http://127.0.0.1:18888/api/gateway/egress/health
+# → {"checkedAt":"2026-08-18T09:57:00Z","egress":[
+#      {"index":0,"url":"socks5://1.2.3.4:1080","ms":2000,"status":429,"ok":false,"error":"HTTP 429 (FreeUsageLimitError)"},
+#      {"index":1,"url":"socks5://5.6.7.8:1080","ms":1200,"status":200,"ok":true}]}
+```
+
+- 状态语义：`ok:true`（HTTP 200）= 该出口 IP 当前未被限流、隧道通；`429 FreeUsageLimit` = 代理活着但该 IP 被限；`error` = 隧道连接失败/超时（代理挂了）。
+- 每项 15s 超时、**串行**执行（探测 n 项 ≈ n×15s 上限）；真实消耗每项 ~1 token。
+- 只读探测：不轮换、不冷却、不改 current。
+- Web 管理端（127.0.0.1:8899 → 网关 → IP 池卡「检查出口」按钮）已集成：逐项显示 `健康`/`IP 被限流 429`/`不可用` 徽标。修改出口后无需重启即可用「检查出口」验证。
+
 ## 验证
 
 ```bash

@@ -840,6 +840,23 @@ async function gatewayTest(): Promise<{
   }
 }
 
+/** 出口池健康检查代理：转发到网关 POST /api/gateway/egress/health（真实最小探测每出口）。
+ *  网关不可达 → {ok:false, error}；可达则返回 {ok:true, checkedAt, egress:[{index,url,ok,status,ms,error}]}。 */
+async function gatewayEgressHealthProxy(): Promise<any> {
+  try {
+    const r = await fetch(GATEWAY_BASE + "/api/gateway/egress/health", {
+      method: "POST",
+      headers: gatewayAuthHeaders(),
+      signal: AbortSignal.timeout(90000), // 串行探测所有出口，给足时间
+    })
+    const j: any = await r.json().catch(() => null)
+    if (!r.ok || !j) return { ok: false, error: j?.error?.message ?? `网关健康检查失败 HTTP ${r.status}` }
+    return { ok: true, checkedAt: j.checkedAt, egress: j.egress ?? [] }
+  } catch (e: any) {
+    return { ok: false, error: String(e?.message ?? e) }
+  }
+}
+
 /** GET /api/gateway/models 透传：网关 go + zen 双套餐模型清单（各自动态 ∪ 内置）+ 别名。
  *  网关不可达/失败 → {ok:false, error}，前端降级显示。 */
 async function gatewayModelsProxy(): Promise<any> {
@@ -1140,6 +1157,10 @@ async function handleWeb(req: any): Promise<Response> {
   if (method === "POST" && route === "/api/gateway/test") {
     return json(await gatewayTest())
   }
+  // 出口池健康检查（代理到网关真实最小探测，判别隧道 + 该出口 IP 是否被上游限流）
+  if (method === "POST" && route === "/api/gateway/egress/health") {
+    return json(await gatewayEgressHealthProxy())
+  }
   if (method === "POST") {
     try {
       let body: any = {}
@@ -1297,7 +1318,8 @@ async function startWeb(force = false) {
   }
   try {
     // 端口绑定失败即认为已有实例在跑（满足"web 只启动一个"）
-    server = Bun.serve({ port: WEB_PORT, fetch: handleWeb })
+    // idleTimeout 放宽到 120s：egress 健康检查串行探测所有出口最坏 ~90s，默认 10s 会被掐断。
+    server = Bun.serve({ port: WEB_PORT, fetch: handleWeb, idleTimeout: 120 })
     webStarted = true
     log(`🌐 Web 管理界面: http://localhost:${WEB_PORT}`)
   } catch {
@@ -1935,10 +1957,11 @@ try {
     <div class="row" style="margin-top:10px">
       <input id="egress-input" type="text" placeholder="socks5://user:pass@host:port 或 direct" style="flex:1;min-width:0" />
       <button class="primary" onclick="addEgress()">＋ 添加出口</button>
+      <button id="egress-check-btn" onclick="checkEgressHealth()">检查出口</button>
       <button class="danger" onclick="clearEgress()">清空全部</button>
     </div>
     <div id="egress-list" class="muted" style="margin-top:10px">加载中…</div>
-    <div class="muted" style="margin-top:6px">zen 免费档按 IP 限流（429 FreeUsageLimit）；配置 <b>≥2</b> 个出口后网关在被限时自动切到下一个出口。修改后需「重启网关」生效。</div>
+    <div class="muted" style="margin-top:6px">zen 免费档按 IP 限流（429 FreeUsageLimit）；配置 <b>≥2</b> 个出口后网关在被限时自动切到下一个出口。修改后需「重启网关」生效；「检查出口」逐项真实最小探测（每项消耗 ~1 token）。</div>
     <div id="egress-msg" class="msg" style="margin-top:6px"></div>
   </div>
   </div>
@@ -2525,6 +2548,7 @@ function tokenBadge(on) {
   document.getElementById("token-badge").innerHTML =
     on ? '<span class="badge b-running">鉴权开启</span>' : '<span class="badge b-stopped">鉴权关闭</span>'
 }
+var egressHealth = {} // 出口健康检查结果缓存：{ [url]: {ok,status,ms,error} }
 function renderEgressList(egress, enabled) {
   const el = document.getElementById("egress-list")
   const badge = document.getElementById("egress-badge")
@@ -2535,11 +2559,37 @@ function renderEgressList(egress, enabled) {
     el.textContent = "未配置出口（直连）。zen 免费档被限流时添加 SOCKS5 代理出口可换 IP。"
     return
   }
-  el.innerHTML = egress.map((e, i) =>
-    '<div style="display:flex;align-items:center;gap:8px;padding:3px 0;border-bottom:1px solid var(--bd-2)">' +
+  el.innerHTML = egress.map((e, i) => {
+    let h = ""
+    const st = egressHealth[e]
+    if (st) {
+      if (st.ok) h = '<span class="badge b-available" title="' + esc(st.ms + "ms") + '">健康 ' + st.status + '</span>'
+      else if (st.status === 429) h = '<span class="badge b-warn" title="' + esc(st.error || "") + '">IP 被限流 429</span>'
+      else h = '<span class="badge b-invalid" title="' + esc(st.error || "") + '">不可用</span>'
+    }
+    return '<div style="display:flex;align-items:center;gap:8px;padding:3px 0;border-bottom:1px solid var(--bd-2)">' +
       '<code style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(e) + '</code>' +
+      h +
       (i === 0 ? '<span class="badge b-go">当前</span>' : "") +
-      '<button class="small" onclick="delEgress(' + i + ')">删除</button></div>').join("")
+      '<button class="small" onclick="delEgress(' + i + ')">删除</button></div>'
+  }).join("")
+}
+async function checkEgressHealth() {
+  const msg = document.getElementById("egress-msg")
+  const btn = msg.ownerDocument ? document.getElementById("egress-check-btn") : null
+  if (btn) { btn.textContent = "检查中…"; btn.disabled = true }
+  try {
+    const r = await api("/api/gateway/egress/health", {})
+    if (!r.ok) throw new Error(r.error || "网关无响应")
+    egressHealth = {}
+    ;(r.egress || []).forEach((x) => { egressHealth[x.url] = { ok: x.ok, status: x.status, ms: x.ms, error: x.error } })
+    const c = await api("/api/gateway/config")
+    renderEgressList(c.egress || [], !!c.egressEnabled)
+    const good = (r.egress || []).filter((x) => x.ok).length
+    msg.className = "msg"
+    msg.textContent = "检查完成：" + good + "/" + (r.egress || []).length + " 个出口可用（" + r.checkedAt + "）"
+  } catch (e) { msg.className = "msg err"; msg.textContent = "检查失败：" + e.message }
+  if (btn) { btn.textContent = "检查出口"; btn.disabled = false }
 }
 async function addEgress() {
   const input = document.getElementById("egress-input")
@@ -2789,6 +2839,7 @@ export {
   gatewayManage,
   gatewayLog,
   gatewayTest,
+  gatewayEgressHealthProxy,
   gatewayCtlExists,
   genGatewayToken,
   readGatewayConfig,

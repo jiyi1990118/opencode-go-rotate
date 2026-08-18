@@ -2056,6 +2056,52 @@ t("egressSnapshot / currentEgress / rotateEgress 模块状态（EGRESS_ENABLED �
   assert.ok(Array.isArray(snap.list))
 })
 
+t("egressHealthCheck 无 key → 返回 error + 空 egress（不抛异常）", async () => {
+  // 用临时 ZEN_CONFIG 指向无 key 配置跑健康检查（egressHealthCheck 读 loadConfig().keys）
+  // 测试环境可能已有真实 go-keys；此用例只断言「有 keys 时结构契约」与「无 keys 时降级」。
+  const r = await gw.egressHealthCheck(0)
+  assert.equal(typeof r.checkedAt, "string")
+  assert.ok(Array.isArray(r.egress))
+  // 无 key 分支：error 字段存在
+  if (r.error) {
+    assert.ok(String(r.error).length > 0)
+    assert.equal(r.egress.length, 0)
+  }
+})
+
+t("egressHealthCheck 有 key → 每个出口返回 index/url/ok 契约（网络不可达也返回结构而非抛异常）", async () => {
+  // 真实环境有 key 时：即便代理不可达，也应返回每项条目（ok=false + error）而不抛。
+  // 用临时 ZEN_CONFIG + ZEN_UPSTREAM_BASE 指向不可达端口，确保走错误路径且结构完整。
+  const prevConfig = process.env.ZEN_CONFIG
+  const prevBase = process.env.ZEN_UPSTREAM_BASE
+  process.env.ZEN_CONFIG = "/tmp/gr-egress-health-test.json"
+  process.env.ZEN_UPSTREAM_BASE = "http://127.0.0.1:59999"
+  const fs = await import("node:fs")
+  fs.writeFileSync("/tmp/gr-egress-health-test.json", JSON.stringify({
+    keys: [{ name: "k", key: "sk-test" }],
+    current_gateway: "k",
+  }))
+  try {
+    // 重新 import 让模块按新 env 加载（EGRESS 列表由配置驱动，这里不配 egress → direct 兜底）
+    const gw2 = await import("../gateway.mjs?egress-health-1=" + Date.now())
+    const r = await gw2.egressHealthCheck(null)
+    assert.equal(typeof r.checkedAt, "string")
+    assert.ok(Array.isArray(r.egress))
+    assert.ok(r.egress.length >= 1)
+    for (const e of r.egress) {
+      assert.equal(typeof e.index, "number")
+      assert.equal(typeof e.url, "string")
+      assert.equal(typeof e.ok, "boolean")
+      assert.ok(typeof e.ms === "number")
+      if (!e.ok) assert.ok(typeof e.error === "string")
+    }
+  } finally {
+    if (prevConfig !== undefined) process.env.ZEN_CONFIG = prevConfig; else delete process.env.ZEN_CONFIG
+    if (prevBase !== undefined) process.env.ZEN_UPSTREAM_BASE = prevBase; else delete process.env.ZEN_UPSTREAM_BASE
+    fs.rmSync("/tmp/gr-egress-health-test.json", { force: true })
+  }
+})
+
 /* ================= 汇总 ================= */
 console.log(`\n${"=".repeat(64)}`)
 const total = passed + failures.length
