@@ -98,6 +98,8 @@ node gateway.mjs                 # 前台运行，Ctrl+C 停止
 nohup node gateway.mjs >/tmp/zen-gateway.log 2>&1 &
 ```
 
+> **独立部署（无 opencode 机器）**：本网关不依赖 opencode 本体——UA 自动回退官方版本、鉴权只用 `go-keys.json` 的 `sk-` key、`plan=zen` 即免费档。Linux systemd / macOS launchd 完整部署步骤见 [`docs/部署指南-独立机器.md`](../docs/部署指南-独立机器.md)。
+
 默认绑定 `127.0.0.1:18888`（避开 go-rotate 的 8899 与 tui-control 的 7792-7811）。
 
 ### 环境变量
@@ -137,22 +139,22 @@ curl -sN http://127.0.0.1:18888/v1/chat/completions \
 
 若设置了 `ZEN_GATEWAY_TOKEN`，所有请求加 `-H 'Authorization: Bearer <token>'`。
 
-## 服务化运行（macOS launchd，推荐）
+## 服务化运行（macOS launchd / Linux systemd，推荐）
 
-把 zen-gateway 做成 macOS 常驻服务（LaunchAgent）：**开机自启**、崩溃自动重启、日志持久化到
-`~/Library/Logs/zen-gateway.log`，用 `zen-gateway` 命令统一管理。适合作为长驻的「供应服务」。
+把 zen-gateway 做成常驻服务：**开机自启**、崩溃自动重启、日志持久化，用 `zen-gateway` 命令统一管理。适合作为长驻的「供应服务」。macOS 用 launchd LaunchAgent，Linux 用 systemd **--user** unit，安装脚本自动识别系统。
 
 ### 安装（一键）
 
 ```bash
-bash install.sh zen-gateway      # 或 bash install.sh --zen-gateway
+bash install.sh zen-gateway      # 或 bash install.sh --zen-gateway（需 Node ≥ 18）
 ```
 
-安装内容：
+安装内容（自动识别 macOS / Linux）：
 - 拷贝 `gateway.mjs` → `~/.local/share/zen-gateway/gateway.mjs`
-- 生成 LaunchAgent `~/Library/LaunchAgents/com.go-rotate.zen-gateway.plist`（由模板替换真实绝对路径）
+- 创建默认 `go-keys.json`（`~/.config/opencode/`）与 `gateway-config.json`（`~/.local/share/zen-gateway/`，0600）——安装即可用，后续 `go-rotate add` 填 key、`go-rotate gateway plan zen|go` 切套餐
 - 拷贝管理脚本 → `~/.local/bin/zen-gateway`
-- `launchctl bootstrap gui/$(id -u)` 加载并立即启动（旧版 macOS 自动回退 `launchctl load`）
+- macOS：生成 LaunchAgent `~/Library/LaunchAgents/com.go-rotate.zen-gateway.plist` 并 `launchctl bootstrap`
+- Linux：生成 systemd user unit `~/.config/systemd/user/zen-gateway.service` 并 `systemctl --user enable --now`
 
 > 若你之前用 `nohup node gateway.mjs &` 手动跑过网关，请先停掉它（`pkill -f gateway.mjs`），
 > 否则旧实例会占用 18888 端口，导致服务实例 `EADDRINUSE`（KeepAlive 会反复重启但它占不到端口）。
@@ -161,29 +163,28 @@ bash install.sh zen-gateway      # 或 bash install.sh --zen-gateway
 
 | 命令 | 说明 |
 |---|---|
-| `zen-gateway status` | 查看状态（running / stopped，含健康检查 + launchd 详情） |
+| `zen-gateway status` | 查看状态（running / stopped，含健康检查 + launchd/systemd 详情） |
 | `zen-gateway start` | 启动（幂等，已在运行则提示） |
 | `zen-gateway stop` | 停止（幂等，未运行则提示） |
 | `zen-gateway restart` | 重启 |
 | `zen-gateway logs [-f]` | 查看 / 跟踪日志（`-f` 跟随） |
-| `zen-gateway uninstall [-y]` | 卸载服务（bootout + 删 plist/日志，**不动 go-keys.json / auth.json**） |
+| `zen-gateway uninstall [-y]` | 卸载服务（bootout/disable + 删 unit/plist/日志，**不动 go-keys.json / auth.json**） |
 
 ### 卸载
 
 ```bash
 zen-gateway uninstall            # 交互确认
-# 或用 install.sh 一键卸载（含删 gateway.mjs 与管理脚本、bootout）：
+# 或用 install.sh 一键卸载（含删 gateway.mjs 与管理脚本、bootout/disable）：
 bash install.sh zen-gateway-uninstall -y
 ```
 
-### 服务细节
+### macOS 服务细节
 
 - **label**：`com.go-rotate.zen-gateway`（项目品牌命名，对任何用户可移植，不用 `com.jary.*`）。
-- **plist**：`RunAtLoad=true`（开机自启）`KeepAlive=true`（崩溃自动重启）`ProcessType=Background`
-  （无 UI 后台服务，不抢占前台交互任务的响应优先级）。
+- **plist**：`RunAtLoad=true`（开机自启）`KeepAlive=true`（崩溃自动重启）`ProcessType=Background`（无 UI 后台服务）。
 - **日志**：`StandardOutPath`/`StandardErrorPath` → `~/Library/Logs/zen-gateway.log`。
   网关自身还会写 `/tmp/opencode-go-rotate.log`（与 go-rotate 同文件，含 key 轮换记录）。
-- **端口/环境变量**：默认不注入环境变量，走代码默认值（`127.0.0.1:18888` / `hy3`）。
+- **端口/环境变量**：默认不注入环境变量，走代码默认值（`127.0.0.1:18888` / 默认模型）。
   如需改端口/上游/加 token，编辑 `~/Library/LaunchAgents/com.go-rotate.zen-gateway.plist`
   的 `EnvironmentVariables`（模板里留了注释示例），然后：
   ```bash
@@ -191,22 +192,12 @@ bash install.sh zen-gateway-uninstall -y
   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.go-rotate.zen-gateway.plist
   ```
 
-### Linux（systemd 参考）
+### Linux（systemd --user）细节
 
-macOS 用 launchd；Linux 用户可仿照下面 5 行的 systemd unit 实现同类常驻（`Node_HOME` 填 `command -v node`）：
-
-```ini
-[Unit]
-Description=zen-gateway (opencode zen -> OpenAI gateway)
-After=network.target
-[Service]
-ExecStart=/usr/bin/env node /opt/zen-gateway/gateway.mjs
-Restart=always
-RestartSec=3
-Environment=ZEN_GATEWAY_PORT=18888
-[Install]
-WantedBy=multi-user.target
-```
+- **unit**：`~/.config/systemd/user/zen-gateway.service`（模板 `zen-gateway/systemd/zen-gateway.user.service`，安装时替换占位符）。
+- **自启**：`systemctl --user enable --now`；如需**开机**自启（无人登录场景），执行 `loginctl enable-linger $USER`。
+- **日志**：`~/.local/share/zen-gateway/logs/gateway.log`（由 unit 内 `ZEN_LOG_FILE` 指向）。
+- **环境变量**：默认内置 `ZEN_UPSTREAM_UA=opencode/1.18.18`（无 opencode 机器也自动回退官方 UA），其余走代码默认值；编辑 unit 加 `Environment=` 行后 `systemctl --user daemon-reload && systemctl --user restart zen-gateway`。
 
 ### Anthropic Messages 端点（claude code）
 
@@ -297,6 +288,7 @@ claude -p "hi"                                     # 或 claude -p --model claud
 
 - 复用 `~/.config/opencode/go-keys.json`（与 go-rotate 同一个文件，增删 key 用 `go-rotate` 或 Web 界面）。
 - 每次请求取**当前 key**；上游返回 401/402/429 或消息含 `quota/insufficient/balance/rate limit/exceeded` → 当前 key 进冷却（优先解析错误里的 `reset at <time>`，否则用 `cooldown_minutes`）→ 切下一个可用 key → **重试一次**。
+- **`plan=zen` 免费档自动轮换已禁用**（2026-08-18）：同设备 UA/频率限流与账号无关，轮换无效反而误伤冷却——401/402/CreditsError 等配额类错误一律**透传不轮换、不冷却**（`FreeUsageLimitError` 本就不轮换）。`plan=go` 付费档保留自动轮换；手动轮换（`gateway next` / Web）不受影响。
 - 写配置与 go-rotate 用**同一把文件锁**（`go-keys.json.lock`）+ 原子写（tmp+rename），跨进程安全。
 - 轮换结果同步写 `~/.local/share/opencode/auth.json`，保证与 opencode 插件路径一致。
 

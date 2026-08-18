@@ -88,7 +88,7 @@ readUsageFile / utcDateKey / windowDays / rotate / syncAuth / AUTH_FILE / __setD
    - `?days=abc` → 回退 days=7
 5. **回归**（临时实例）：healthz 200（keys=3 current=act1）、`/api/usage` 内存计数正常、`/v1/models` 26 个、`POST /v1/chat/completions`（假 key）→ 401 AuthError（预期，上游拒绝），usage.jsonl 追加 1 行 `{key:act2, ok:false, rotated:true}`（语义：首次失败不单独写行，rotated 行记录重试后的新 key 与状态）
 6. **清理**：18921/18922 进程已 kill，端口释放；真实 18888 常驻服务全程未重启；真实 go-keys.json md5 与基线一致（未污染）。
-7. **⚠️ 事故与还原（必须记录）**：第 5 步 chat 回归的假 key 401 触发了 `rotate() → syncAuth()`，**把临时假 key 写进了真实 auth.json**（`AUTH_FILE` 是 gateway.mjs 硬编码常量，无 env 覆盖——`ZEN_CONFIG` 只隔离 go-keys.json）。已按真实 go-keys.json 的 `test` key（`sk-epyPd50...`）还原 auth.json。**教训：gateway.mjs 的轮换类集成测试必然写真实 auth.json，测后必须还原；或先备份 auth.json。**
+7. **⚠️ 事故与还原（必须记录）**：第 5 步 chat 回归的假 key 401 触发了 `rotate() → syncAuth()`，**把临时假 key 写进了真实 auth.json**（`AUTH_FILE` 是 gateway.mjs 硬编码常量，无 env 覆盖——`ZEN_CONFIG` 只隔离 go-keys.json）。已按真实 go-keys.json 的 `test` key（`sk-***`）还原 auth.json。**教训：gateway.mjs 的轮换类集成测试必然写真实 auth.json，测后必须还原；或先备份 auth.json。**
 
 ## 验证记录（真实执行）
 
@@ -181,7 +181,7 @@ auth.json**（见上文 §事故记录）。本次为 `AUTH_FILE` 补 env 覆盖
    - 启动日志：`auth=/tmp/gr-ga-*/auth.json`（env 生效）
    - `POST /v1/chat/completions`（假 key）→ mock 401 → `✅ 轮换到 key "k2"`（日志）
    - **临时 auth.json 被更新为 k2 假 key**（`sk-FAKE-k2-...`）
-   - **真实 `~/.local/share/opencode/auth.json` md5 前后一致**：`e4e9a727d22bc1535129f1b62fc9237c`（key 前缀 `sk-epyPd50wz...` 不变）
+   - **真实 `~/.local/share/opencode/auth.json` md5 前后一致**：`e4e9a727d22bc1535129f1b62fc9237c`（key 前缀 `sk-***` 不变）
 4. **不设 `ZEN_AUTH_FILE` 回归**（临时端口 18933 + 仅 `ZEN_CONFIG` 隔离 + mock 上游 18934 固定 200）：
    - 启动日志：`auth=/Users/jary/.local/share/opencode/auth.json`（**真实路径**，默认行为不变）
    - healthz 200、chat 200（mock 200 → 不触发轮换）→ 无写操作

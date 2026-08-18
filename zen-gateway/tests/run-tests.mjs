@@ -244,27 +244,45 @@ t("重置动态表后恢复默认行为", () => {
   gw.__setDynamicModels([])
   assert.equal(gw.mapModel("my-fake-model"), "hy3")
 })
-t("zen 档：付费别名回退套餐默认（gpt-4o-mini → hy3-free，不发出付费模型）", async () => {
-  const cfgPath = "/tmp/zen-gateway-unittest-gwcfg-zen.json"
-  writeFileSync(cfgPath, JSON.stringify({ plan: "zen", token: "a".repeat(64) }))
-  const savedCfg = process.env.ZEN_GATEWAY_CONFIG
-  const savedDefault = process.env.ZEN_DEFAULT_MODEL
-  process.env.ZEN_GATEWAY_CONFIG = cfgPath
-  delete process.env.ZEN_DEFAULT_MODEL
+{
+  // zen 档：付费别名回退套餐默认 —— 必须用顶层块真 await（不能用 t() 的 async fn：t() 不 await，
+  // 会使本 import 与后续 gwA import 在同一微任务批次求值、读取同步阶段最终 env，污染 gwA 的 ACTIVE_PLAN）。
+  let ok = true
+  let err = null
+  let nameZenMap = "zen 档：付费别名回退套餐默认（gpt-4o-mini → hy3-free，不发出付费模型）"
   try {
-    const zen = await import("../gateway.mjs?plan-zen-map=" + Date.now())
-    assert.equal(zen.mapModel("gpt-4o-mini"), "hy3-free")          // 付费别名 → 回退默认
-    assert.equal(zen.mapModel("gpt-4o"), "hy3-free")               // 付费别名 → 回退默认
-    assert.equal(zen.mapModel("grok-code"), "hy3-free")            // hy3 付费 → 回退默认
-    assert.equal(zen.mapModel("hy3-free"), "hy3-free")             // free 内置原样
-    assert.equal(zen.mapModel("deepseek-v4-flash-free"), "deepseek-v4-flash-free")
-    assert.equal(zen.mapModel("unknown-xyz"), "hy3-free")          // 未知名默认
-  } finally {
-    process.env.ZEN_GATEWAY_CONFIG = savedCfg
-    if (savedDefault === undefined) delete process.env.ZEN_DEFAULT_MODEL
-    else process.env.ZEN_DEFAULT_MODEL = savedDefault
+    const cfgPath = "/tmp/zen-gateway-unittest-gwcfg-zen.json"
+    writeFileSync(cfgPath, JSON.stringify({ plan: "zen", token: "a".repeat(64) }))
+    const savedCfg = process.env.ZEN_GATEWAY_CONFIG
+    const savedDefault = process.env.ZEN_DEFAULT_MODEL
+    process.env.ZEN_GATEWAY_CONFIG = cfgPath
+    delete process.env.ZEN_DEFAULT_MODEL
+    try {
+      const zen = await import("../gateway.mjs?plan-zen-map=" + Date.now())
+      assert.equal(zen.mapModel("gpt-4o-mini"), "hy3-free")          // 付费别名 → 回退默认
+      assert.equal(zen.mapModel("gpt-4o"), "hy3-free")               // 付费别名 → 回退默认
+      assert.equal(zen.mapModel("grok-code"), "hy3-free")            // hy3 付费 → 回退默认
+      assert.equal(zen.mapModel("hy3-free"), "hy3-free")             // free 内置原样
+      assert.equal(zen.mapModel("deepseek-v4-flash-free"), "deepseek-v4-flash-free")
+      assert.equal(zen.mapModel("unknown-xyz"), "hy3-free")          // 未知名默认
+    } finally {
+      process.env.ZEN_GATEWAY_CONFIG = savedCfg
+      if (savedDefault === undefined) delete process.env.ZEN_DEFAULT_MODEL
+      else process.env.ZEN_DEFAULT_MODEL = savedDefault
+    }
+  } catch (e) {
+    ok = false
+    err = e
   }
-})
+  if (ok) {
+    passed++
+    groups[groups.length - 1].count++
+    console.log(`  ✅ ${nameZenMap}`)
+  } else {
+    failures.push({ group: currentGroup, name: nameZenMap, error: err })
+    console.log(`  ❌ ${nameZenMap}\n     ${String((err && err.message) || err).split("\n").join("\n     ")}`)
+  }
+}
 t("go 档：付费别名不受影响（gpt-4o-mini → deepseek-v4-flash 仍在内置表）", () => {
   assert.equal(gw.mapModel("gpt-4o-mini"), "deepseek-v4-flash")
   assert.equal(gw.mapModel("gpt-4o"), "glm-5.2")
@@ -1108,7 +1126,8 @@ t("不设 ZEN_AUTH_FILE 时 AUTH_FILE 指向真实路径（仅字符串断言，
 process.env.ZEN_AUTH_FILE = path.join(zauthTmp, "auth.json")
 let gwA = null
 try {
-  gwA = await import("../gateway.mjs?zauth-isolation=1")
+  process.env.ZEN_GATEWAY_CONFIG = "/tmp/zen-gateway-unittest-gateway-config.json" // 防御：确保 gwA 实例为 go 档（文件缺失→resolvePlan 回退 go；防前面 t() 内 async import 的 env 竞态残留）
+gwA = await import("../gateway.mjs?zauth-isolation=1")
 } catch (e) {
   failures.push({ group: currentGroup, name: "fresh import（ZEN_AUTH_FILE 已设）", error: e })
   console.log(`  ❌ fresh import（ZEN_AUTH_FILE 已设）: ${String((e && e.message) || e)}`)
@@ -1300,6 +1319,73 @@ t("syncAuth 容错：auth.json 损坏 → 静默失败不抛错、文件原样�
   }
 }
 
+{
+  // zen 免费档自动轮换禁用（2026-08-18 用户实测：同设备 UA/频率限流与账号无关）：rotate() 必须被跳过——
+  // current_gateway 不变、失败 key 不冷却、不写 last_status；go 档行为不受影响（既有测试已覆盖 go 档轮换）。
+  let ok = true
+  let err = null
+  try {
+    const tmpDir = "/tmp/zen-gw-norotate-test"
+    rmSync(tmpDir, { recursive: true, force: true })
+    mkdirSync(tmpDir, { recursive: true })
+    const cfgPath = tmpDir + "/go-keys.json"
+    const gwCfgPath = tmpDir + "/gateway-config.json"
+    writeFileSync(cfgPath, JSON.stringify(
+      {
+        current: "bad",
+        current_gateway: "bad",
+        keys: [
+          { name: "bad", key: "sk-fake-bad" },
+          { name: "good", key: "sk-fake-good" },
+        ],
+      },
+      null, 2,
+    ))
+    writeFileSync(gwCfgPath, JSON.stringify({ plan: "zen" }))
+    const savedCfg = process.env.ZEN_CONFIG
+    const savedGwCfg = process.env.ZEN_GATEWAY_CONFIG
+    const savedLog = process.env.ZEN_LOG_FILE
+    process.env.ZEN_CONFIG = cfgPath
+    process.env.ZEN_GATEWAY_CONFIG = gwCfgPath
+    process.env.ZEN_LOG_FILE = "/tmp/zen-gw-norotate-test/gw.log"
+    try {
+      const gwZen = await import("../gateway.mjs?zen-norotate=" + Date.now())
+      const cfg2 = await gwZen.rotate({ error: { message: "Insufficient balance" } }, 402, "bad")
+      // ① 不轮换：current_gateway 维持 bad
+      assert.equal(cfg2.current_gateway, "bad")
+      const savedCfg2 = JSON.parse(readFileSync(cfgPath, "utf8"))
+      assert.equal(savedCfg2.current_gateway, "bad")
+      // ② 不冷却失败 key、不写 last_status
+      assert.ok(!("cooldown_until_gateway" in savedCfg2.keys[0]))
+      assert.ok(!("last_status" in savedCfg2.keys[0]))
+      assert.ok(!("cooldown_until_gateway" in savedCfg2.keys[1]))
+      // ③ go 档回归：用 go 档配置重载 → 同一场景仍轮换（防止误伤付费档）
+      writeFileSync(gwCfgPath, JSON.stringify({ plan: "go" }))
+      const gwGo = await import("../gateway.mjs?go-norotate-regress=" + Date.now())
+      const cfg3 = await gwGo.rotate({ error: { message: "Insufficient balance" } }, 402, "bad")
+      assert.equal(cfg3.current_gateway, "good")
+    } finally {
+      process.env.ZEN_CONFIG = savedCfg
+      process.env.ZEN_GATEWAY_CONFIG = savedGwCfg
+      if (savedLog === undefined) delete process.env.ZEN_LOG_FILE
+      else process.env.ZEN_LOG_FILE = savedLog
+      try { rmSync(tmpDir, { recursive: true, force: true }) } catch {}
+    }
+  } catch (e) {
+    ok = false
+    err = e
+  }
+  const name4 = "zen 档自动轮换禁用：rotate() 跳过（current_gateway 不变/不冷却/不写状态），go 档回归仍轮换"
+  if (ok) {
+    passed++
+    groups[groups.length - 1].count++
+    console.log(`  ✅ ${name4}`)
+  } else {
+    failures.push({ group: currentGroup, name: name4, error: err })
+    console.log(`  ❌ ${name4}\n     ${String((err && err.message) || err).split("\n").join("\n     ")}`)
+  }
+}
+
 delete process.env.ZEN_AUTH_FILE // 清理：本组为最后一组，避免 env 残留
 try {
   rmSync(zauthTmp, { recursive: true, force: true })
@@ -1466,6 +1552,68 @@ t("拷贝语义：push models / 改 aliases 不污染模块常量", () => {
   assert.ok(!("__POLLUTED__" in m2.aliases))
 })
 
+t("plans 双套餐明细：go 内置 26 / zen 内置 7，各自动态为空时 models=内置（去重升序）", () => {
+  gw.__setDynamicModels([])
+  const m = gw.gatewayModelsSummary()
+  assert.equal(m.active, "go") // 默认 go 档
+  assert.equal(m.plans.go.id, "go")
+  assert.equal(m.plans.zen.id, "zen")
+  assert.equal(m.plans.go.builtin.length, 26)
+  assert.equal(m.plans.zen.builtin.length, 7)
+  assert.ok(m.plans.go.models.includes("hy3"))
+  assert.ok(m.plans.zen.models.includes("hy3-free"))
+  assert.equal(m.plans.go.models.length, 26)
+  assert.equal(m.plans.zen.models.length, 7)
+  assert.deepEqual(m.plans.zen.models, [...m.plans.zen.models].sort())
+  // 向后兼容：models 仍是当前套餐（go）合并清单
+  assert.deepEqual(m.models, m.plans.go.models)
+})
+
+t("plans 差异化动态表：go/zen 各自并入动态模型且互不串扰", () => {
+  gw.__setDynamicModels(["my-go-dyn", "hy3-free"], "go")
+  gw.__setDynamicModels(["my-zen-dyn"], "zen")
+  const m = gw.gatewayModelsSummary()
+  assert.ok(m.plans.go.models.includes("my-go-dyn"))
+  assert.ok(!m.plans.go.models.includes("my-zen-dyn")) // go 不并入 zen 动态
+  assert.equal(m.plans.go.dynamic.length, 2)
+  assert.ok(m.plans.zen.models.includes("my-zen-dyn"))
+  assert.ok(m.plans.zen.models.includes("hy3-free")) // 动态与内置交集去重后仍存在
+  assert.ok(!m.plans.zen.models.includes("my-go-dyn"))
+  assert.equal(m.plans.zen.dynamic.length, 1)
+  // 当前套餐合并清单 models 同步含 go 动态
+  assert.ok(m.models.includes("my-go-dyn"))
+  // 清理，避免污染后续用例
+  gw.__setDynamicModels([], "go")
+  gw.__setDynamicModels([], "zen")
+})
+
+t("plans 子对象同样拷贝：push 不污染模块常量", () => {
+  const m = gw.gatewayModelsSummary()
+  m.plans.go.models.push("__POLLUTED__")
+  m.plans.zen.dynamic.push("__POLLUTED__")
+  const m2 = gw.gatewayModelsSummary()
+  assert.ok(!m2.plans.go.models.includes("__POLLUTED__"))
+  assert.ok(!m2.plans.zen.dynamic.includes("__POLLUTED__"))
+})
+
+t("sortedModelUnion：去重排序（动态 ∩ 内置交集只留一份）+ null/非数组容错", () => {
+  assert.deepEqual(gw.sortedModelUnion(["zzz", "hy3", "aaa"], ["hy3"]), ["aaa", "hy3", "zzz"])
+  assert.deepEqual(gw.sortedModelUnion(null, ["b"]), ["b"])
+  assert.deepEqual(gw.sortedModelUnion(["a"], []), ["a"])
+})
+
+t("__setDynamicModels(planId) 定向设置：只改指定档，另一档不受影响", () => {
+  gw.__setDynamicModels(["only-go"], "go")
+  assert.deepEqual(gw.DYNAMIC_GO, ["only-go"])
+  assert.deepEqual(gw.DYNAMIC_ZEN, [])
+  gw.__setDynamicModels(["only-zen"], "zen")
+  assert.deepEqual(gw.DYNAMIC_GO, ["only-go"])
+  assert.deepEqual(gw.DYNAMIC_ZEN, ["only-zen"])
+  gw.__setDynamicModels([]) // 缺省：两档同清，回归旧语义
+  assert.equal(gw.DYNAMIC_GO.length, 0)
+  assert.equal(gw.DYNAMIC_ZEN.length, 0)
+})
+
 group("getLogRing（内存环形日志缓冲）")
 
 t("LOG_RING_MAX === 200", () => {
@@ -1620,6 +1768,79 @@ t("文件 token 非字符串（数字/null）→ null", () => {
   assert.equal(gw.resolveToken({ token: null }, {}), null)
 })
 
+group("resolveTokens（多 key 解析，env 优先）")
+
+t("env ZEN_GATEWAY_TOKEN → 单元素数组（向后兼容）", () => {
+  assert.deepEqual(gw.resolveTokens({ tokens: ["a", "b"] }, { ZEN_GATEWAY_TOKEN: "env-token" }), ["env-token"])
+})
+
+t("env 空串 → 视为未设置，回退文件 tokens", () => {
+  assert.deepEqual(gw.resolveTokens({ tokens: ["a", "b"] }, { ZEN_GATEWAY_TOKEN: "" }), ["a", "b"])
+})
+
+t("文件 tokens 数组优先于单 token 字段", () => {
+  assert.deepEqual(gw.resolveTokens({ token: "old", tokens: ["a", "b"] }, {}), ["a", "b"])
+})
+
+t("无 tokens → 回退单 token（旧配置兼容）", () => {
+  assert.deepEqual(gw.resolveTokens({ token: "old" }, {}), ["old"])
+})
+
+t("tokens 空数组/无任何配置 → []（鉴权关闭）", () => {
+  assert.deepEqual(gw.resolveTokens({ tokens: [] }, {}), [])
+  assert.deepEqual(gw.resolveTokens({}, {}), [])
+  assert.deepEqual(gw.resolveTokens(null, {}), [])
+})
+
+group("gatewayAuth（多 key 鉴权，模块固化 ACTIVE_TOKENS）")
+
+t("tokens 任一 Bearer 匹配即放行；不匹配拒绝；x-api-key 同域", async () => {
+  const cfgPath = "/tmp/zen-gateway-unittest-gwcfg-tokens.json"
+  writeFileSync(cfgPath, JSON.stringify({ plan: "zen", tokens: ["sk-alpha", "sk-beta"] }))
+  const savedCfg = process.env.ZEN_GATEWAY_CONFIG
+  process.env.ZEN_GATEWAY_CONFIG = cfgPath
+  try {
+    const m = await import("../gateway.mjs?multi-token-auth=" + Date.now())
+    const req = (headers) => ({ headers })
+    assert.equal(m.gatewayAuth(req({ authorization: "Bearer sk-alpha" })), true)
+    assert.equal(m.gatewayAuth(req({ authorization: "Bearer sk-beta" })), true)
+    assert.equal(m.gatewayAuth(req({ authorization: "Bearer sk-gamma" })), false)
+    assert.equal(m.gatewayAuth(req({ authorization: "Bearer " })), false)
+    assert.equal(m.gatewayAuth(req({ "x-api-key": "sk-alpha" })), true)
+    assert.equal(m.gatewayAuth(req({})), false)
+    assert.equal(m.gatewayStatusSummary({}, { running: true }).tokenCount, 2)
+  } finally {
+    process.env.ZEN_GATEWAY_CONFIG = savedCfg
+  }
+})
+
+t("无 token（空数组）→ 鉴权关闭放行一切", async () => {
+  const cfgPath = "/tmp/zen-gateway-unittest-gwcfg-notokens.json"
+  writeFileSync(cfgPath, JSON.stringify({ plan: "zen", token: null }))
+  const savedCfg = process.env.ZEN_GATEWAY_CONFIG
+  process.env.ZEN_GATEWAY_CONFIG = cfgPath
+  try {
+    const m = await import("../gateway.mjs?no-token-auth=" + Date.now())
+    assert.equal(m.gatewayAuth(req({ authorization: "Bearer whatever" })), true)
+    assert.equal(m.gatewayAuth(req({})), true)
+  } finally {
+    process.env.ZEN_GATEWAY_CONFIG = savedCfg
+  }
+})
+
+t("readGatewayConfig：tokens 数组过滤非字符串/空项", async () => {
+  const cfgPath = "/tmp/zen-gateway-unittest-gwcfg-normalize.json"
+  writeFileSync(cfgPath, JSON.stringify({ plan: "zen", token: "old", tokens: ["sk-a", 123, "", "sk-b"] }))
+  const savedCfg = process.env.ZEN_GATEWAY_CONFIG
+  process.env.ZEN_GATEWAY_CONFIG = cfgPath
+  try {
+    const m = await import("../gateway.mjs?token-normalize=" + Date.now())
+    assert.deepEqual(m.resolveTokens({ tokens: m.readGatewayConfig().tokens }, {}), ["sk-a", "sk-b"])
+  } finally {
+    process.env.ZEN_GATEWAY_CONFIG = savedCfg
+  }
+})
+
 group("ACTIVE_PLAN / ACTIVE_TOKEN / ZEN_MODELS_ZEN（模块加载固化态）")
 
 t("ACTIVE_PLAN 导出：测试 env 默认 go 档（base=go/v1、defaultModel=hy3、builtinModels=26）", () => {
@@ -1655,6 +1876,88 @@ t("status 的 defaultModel/upstreamBase/modelCount 随 ACTIVE_PLAN（默认 go �
   assert.equal(s.defaultModel, "hy3")
   assert.equal(s.upstreamBase, "https://opencode.ai/zen/go/v1")
   assert.equal(s.modelCount, 26)
+})
+
+group("自适配：UA 探测 / FreeUsageLimit 不轮换 / 截断自动重试判定")
+
+t("resolveUpstreamUA：env ZEN_UPSTREAM_UA 优先（探测不执行）", () => {
+  assert.equal(
+    gw.resolveUpstreamUA(() => { throw new Error("should not exec") }, { ZEN_UPSTREAM_UA: "opencode/9.9.9" }),
+    "opencode/9.9.9",
+  )
+})
+
+t("resolveUpstreamUA：探测成功 → opencode/<版本>", () => {
+  assert.equal(gw.resolveUpstreamUA(() => "1.18.18\n", {}), "opencode/1.18.18")
+})
+
+t("resolveUpstreamUA：预发布版本后缀原样保留", () => {
+  assert.equal(gw.resolveUpstreamUA(() => "1.19.0-beta.3\n", {}), "opencode/1.19.0-beta.3")
+})
+
+t("resolveUpstreamUA：探测失败（未安装/超时）→ 回退稳定默认", () => {
+  assert.equal(gw.resolveUpstreamUA(() => { throw new Error("ENOENT") }, {}), "opencode/1.18.18")
+})
+
+t("resolveUpstreamUA：输出无版本号 → 回退默认", () => {
+  assert.equal(gw.resolveUpstreamUA(() => "opencode CLI\n", {}), "opencode/1.18.18")
+})
+
+t("shouldRotateForError：FreeUsageLimitError（zen 免费档限流）不触发轮换", () => {
+  assert.equal(
+    gw.shouldRotateForError(429, { error: { type: "FreeUsageLimitError", message: "Rate limit exceeded" } }),
+    false,
+  )
+})
+
+t("shouldRotateForError：普通 429 / 401 / 402 照旧触发轮换", () => {
+  assert.equal(gw.shouldRotateForError(429, { error: { type: "CreditsError", message: "Insufficient balance" } }), true)
+  assert.equal(gw.shouldRotateForError(401, { error: { type: "AuthError" } }), true)
+  assert.equal(gw.shouldRotateForError(402, { error: { type: "PaymentRequired" } }), true)
+})
+
+t("shouldRotateForError：200 但消息含配额关键词仍触发，无关消息不触发", () => {
+  assert.equal(gw.shouldRotateForError(200, { error: { message: "quota exceeded" } }), true)
+  assert.equal(gw.shouldRotateForError(200, { error: { message: "unrelated" } }), false)
+})
+
+t("truncationRetryPlan：content 空 + finish=max_tokens → 放大 2 倍（下限 4096）", () => {
+  const body = JSON.stringify({ choices: [{ finish_reason: "max_tokens", message: { content: null } }] })
+  assert.equal(gw.truncationRetryPlan(body, { max_tokens: 30 }), 4096)
+  assert.equal(gw.truncationRetryPlan(body, { max_tokens: 4096 }), 8192)
+})
+
+t("truncationRetryPlan：content 非空 / finish=stop / 坏 JSON → null", () => {
+  assert.equal(
+    gw.truncationRetryPlan(JSON.stringify({ choices: [{ finish_reason: "max_tokens", message: { content: "hi" } }] }), { max_tokens: 30 }),
+    null,
+  )
+  assert.equal(
+    gw.truncationRetryPlan(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: null } }] }), { max_tokens: 30 }),
+    null,
+  )
+  assert.equal(gw.truncationRetryPlan("not json", { max_tokens: 30 }), null)
+})
+
+t("truncationRetryPlan：无 max_tokens → 4096；放大上限 131072 钳制；已达上限不重试", () => {
+  const body = JSON.stringify({ choices: [{ finish_reason: "max_tokens", message: { content: null } }] })
+  assert.equal(gw.truncationRetryPlan(body, {}), 4096)
+  assert.equal(gw.truncationRetryPlan(body, { max_tokens: 100000 }), 131072)
+  assert.equal(gw.truncationRetryPlan(body, { max_tokens: 131072 }), null)
+})
+
+t("truncationRetryPlan：ZEN_AUTO_MAX_TOKENS=0 关闭自动重试", () => {
+  const prev = process.env.ZEN_AUTO_MAX_TOKENS
+  process.env.ZEN_AUTO_MAX_TOKENS = "0"
+  try {
+    assert.equal(
+      gw.truncationRetryPlan(JSON.stringify({ choices: [{ finish_reason: "max_tokens", message: { content: null } }] }), { max_tokens: 30 }),
+      null,
+    )
+  } finally {
+    if (prev === undefined) delete process.env.ZEN_AUTO_MAX_TOKENS
+    else process.env.ZEN_AUTO_MAX_TOKENS = prev
+  }
 })
 
 /* ================= 汇总 ================= */

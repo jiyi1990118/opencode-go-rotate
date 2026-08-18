@@ -763,6 +763,9 @@ describe("网关管理路由（POST /api/gateway/start|stop|restart，假脚本�
   })
 })
 
+/* ================= go + zen 双套餐模型动态查看（Web 面板 + 路由，隔离不可达网关降级） ================= */
+
+
 describe("key 健康探测路由（/api/keys/check 仅 POST，防呆）", () => {
   test("GET → 404 不触发探测；POST → 正常返回 results（空 keys 零网络请求）", async () => {
     // 空 key 配置：checkAllKeys 不循环、不探测、不写 last_status，零真实网络请求
@@ -786,10 +789,10 @@ describe("key 健康探测路由（/api/keys/check 仅 POST，防呆）", () => 
 /* ================= 网关配置（gateway-config.json：套餐 + token，GOROTATE_GATEWAY_CONFIG 隔离） ================= */
 
 describe("网关配置（gateway-config.json：套餐 + token）", () => {
-  test("genToken 返回 64 hex（0-9a-f）", () => {
-    const t = mod.genToken()
-    expect(t).toMatch(/^[0-9a-f]{64}$/)
-    expect(mod.genToken()).not.toBe(t) // 随机性：两次不同
+  test("genGatewayToken 返回 sk- + 48 hex（51 字符）", () => {
+    const t = mod.genGatewayToken()
+    expect(t).toMatch(/^sk-[0-9a-f]{48}$/)
+    expect(mod.genGatewayToken()).not.toBe(t) // 随机性：两次不同
   })
   test("readGatewayConfig 文件缺失回退默认（go / 无 token）", () => {
     try { unlinkSync(GW_CONFIG_FILE) } catch {}
@@ -808,13 +811,15 @@ describe("网关配置（gateway-config.json：套餐 + token）", () => {
     expect(existsSync(LOCK_FILE)).toBe(false)
     expect(existsSync(GW_CONFIG_FILE + ".tmp")).toBe(false)
   })
-  test("writeGatewayConfig token 写入 + token_set_at 记录", () => {
-    const t = mod.genToken()
+  test("writeGatewayConfig token 写入 + token_set_at 记录（tokens 数组同步 + legacy token 字段）", () => {
+    const t = mod.genGatewayToken()
     const c = mod.writeGatewayConfig({ token: t })
     expect(c.token).toBe(t)
+    expect(c.tokens).toEqual([t]) // 单值写 → tokens=[v]（新多 key 布局）
     expect(typeof c.token_set_at).toBe("string")
     const raw = JSON.parse(readFileSync(GW_CONFIG_FILE, "utf8"))
     expect(raw.token).toBe(t)
+    expect(raw.tokens).toEqual([t])
     expect(typeof raw.token_set_at).toBe("string")
   })
   test("writeGatewayConfig 非法 plan 抛异常且锁释放、文件不变", () => {
@@ -860,7 +865,7 @@ describe("网关配置路由（/api/gateway/plans + /api/gateway/config）", () 
     expect(JSON.parse(readFileSync(GW_CONFIG_FILE, "utf8")).plan).toBe("go")
   })
   test("POST {token} 明文落盘 + GET 掩码返回（绝不返回明文）", async () => {
-    const plain = mod.genToken()
+    const plain = mod.genGatewayToken()
     const p = new Request("http://127.0.0.1:8899/api/gateway/config", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -868,11 +873,14 @@ describe("网关配置路由（/api/gateway/plans + /api/gateway/config）", () 
     })
     const pr = await mod.handleWeb(p)
     expect((await pr.json()).needsRestart).toBe(true)
-    expect(JSON.parse(readFileSync(GW_CONFIG_FILE, "utf8")).token).toBe(plain)
+    const raw = JSON.parse(readFileSync(GW_CONFIG_FILE, "utf8"))
+    expect(raw.token).toBe(plain)
+    expect(raw.tokens).toEqual([plain])
     const g = await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/config"))
     const gj = await g.json()
     expect(gj.token).not.toContain(plain)
-    expect(gj.token).toMatch(/^[0-9a-f]{4}\.\.\.[0-9a-f]{4}$/)
+    expect(gj.token).toMatch(/^.{4}\.\.\..{4}$/) // 掩码（前 4…后 4，不要求 hex 前缀匹配）
+    expect(gj.tokens.length).toBe(1)
     expect(gj.authEnabled).toBe(true)
     expect(typeof gj.tokenSetAt).toBe("string")
   })
@@ -907,6 +915,53 @@ describe("网关配置路由（/api/gateway/plans + /api/gateway/config）", () 
     expect(gj.token).toBeNull()
     expect(gj.authEnabled).toBe(false)
     expect(gj.needsRestart).toBe(false)
+  })
+  test("POST /api/gateway/token gen → sk- 前缀追加进 tokens[]；del 按下标删；clear 全清", async () => {
+    // gen：sk- 前缀 + 返回值含明文一次（后续 GET 仅掩码）
+    const gen = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/token", { method: "POST", body: JSON.stringify({ action: "gen" }) }),
+    )
+    const gj = await gen.json()
+    expect(gj.ok).toBe(true)
+    expect(gj.plain).toMatch(/^sk-[0-9a-f]{48}$/)
+    expect(gj.needsRestart).toBe(true)
+    const cfg1 = mod.readGatewayConfig()
+    expect(cfg1.tokens).toEqual([gj.plain])
+    // GET 绝不返回明文
+    const gcfg = await (await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/config"))).json()
+    expect(gcfg.tokens[0]).not.toContain(gj.plain)
+    expect(gcfg.token).toMatch(/^.{4}\.\.\..{4}$/)
+    // 再 gen 第 2 个 → 数组 2 项
+    const gen2 = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/token", { method: "POST", body: JSON.stringify({ action: "gen" }) }),
+    )
+    const gj2 = await gen2.json()
+    expect(mod.readGatewayConfig().tokens.length).toBe(2)
+    // del 下标 0 → 剩 1 项（为第 2 个 key）
+    const del = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/token", { method: "POST", body: JSON.stringify({ action: "del", index: 0 }) }),
+    )
+    expect((await del.json()).ok).toBe(true)
+    expect(mod.readGatewayConfig().tokens).toEqual([gj2.plain])
+    // 非法下标 → 400
+    const bad = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/token", { method: "POST", body: JSON.stringify({ action: "del", index: 9 }) }),
+    )
+    expect(bad.status).toBe(400)
+    // clear → 全清、鉴权关
+    const clr = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/token", { method: "POST", body: JSON.stringify({ action: "clear" }) }),
+    )
+    const cj = await clr.json()
+    expect(cj.ok).toBe(true)
+    expect(mod.readGatewayConfig().tokens.length).toBe(0)
+    const g2 = await (await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/config"))).json()
+    expect(g2.authEnabled).toBe(false)
+    // 未知 action → 400
+    const unk = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/token", { method: "POST", body: JSON.stringify({ action: "boom" }) }),
+    )
+    expect(unk.status).toBe(400)
   })
 })
 
@@ -946,25 +1001,30 @@ describe("WEB_HTML 网关管理区块（主导航 + 套餐卡 + Token 卡）", (
     expect(html).toContain("async function refreshPlans()")
     expect(html).toContain('api("/api/gateway/restart", {})') // 保存后显式重启
   })
-  test("Token 管理卡（gw-token-card + 5 操作函数 + 掩码/复制/清除）", () => {
+  test("Token 管理卡（gw-token-card + token-list 多 key UI + 操作函数）", () => {
     const html: string = (mod as any).WEB_HTML
     expect(html).toContain('id="gw-token-card"')
-    expect(html).toContain('id="token-input"')
     expect(html).toContain('id="token-badge"')
+    // 多 key 列表容器 + 三个按钮（生成/设置/清空）
+    expect(html).toContain('id="token-list"')
     expect(html).toContain('onclick="genGatewayToken()"')
     expect(html).toContain('onclick="setGatewayToken()"')
-    expect(html).toContain('onclick="copyToken()"')
-    expect(html).toContain('onclick="toggleTokenMask()"')
     expect(html).toContain('onclick="clearGatewayToken()"')
-    expect(html).toContain("async function refreshGatewayConfig()")
+    expect(html).toContain("function renderTokenList(")
     expect(html).toContain("async function genGatewayToken()")
     expect(html).toContain("async function setGatewayToken()")
     expect(html).toContain("async function clearGatewayToken()")
-    expect(html).toContain("async function copyToken()")
-    expect(html).toContain("function toggleTokenMask()")
-    expect(html).toContain('api("/api/gateway/config"')
-    expect(html).toContain("crypto.getRandomValues") // 浏览器端 64 hex 生成
+    expect(html).toContain("async function delGatewayToken(") // 每行删除
+    expect(html).toContain("async function copySessionPlain()") // 本次会话明文复制
+    // 操作走新多 key 后端 + 掩码列表 + 剪贴板
+    expect(html).toContain('api("/api/gateway/token", { action: "gen" })')
+    expect(html).toContain('api("/api/gateway/token", { action: "del", index:')
+    expect(html).toContain('api("/api/gateway/token", { action: "clear" })')
+    expect(html).toContain("renderTokenList(c.tokens || [])")
     expect(html).toContain("navigator.clipboard.writeText")
+    // 旧单 token 输入框与旧生成函数已移除（不再引用不存在的元素）
+    expect(html).not.toContain('id="token-input"')
+    expect(html).not.toContain("crypto.getRandomValues")
   })
 })
 
@@ -1013,10 +1073,12 @@ describe("WEB_HTML 重构（IA + 设计系统 + P1 修复，2026-08-17）", () =
     expect((mod as any).WEB_HTML).toContain("@media")
   })
 
-  test("copyToken 一步化（旧「先显示」分支移除）", async () => {
+  test("copySessionPlain 一步化（明文本会话持有即复制；旧「显示/隐藏」前置已移除）", async () => {
     const mod = await import("../go-rotate.ts")
     const html: string = (mod as any).WEB_HTML
-    expect(html).toContain("async function copyToken()")
+    expect(html).toContain("async function copySessionPlain()")
+    // 明文只在本会话「生成/设置」后持有、一键复制，无先显示再复制的切换分支
+    expect(html).not.toContain("async function copyToken()")
     expect(html).not.toContain("请先「显示/隐藏」查看明文后再复制")
   })
 
@@ -1661,5 +1723,44 @@ describe("loadConfig 迁移兜底 / updateKey 三域跟随", () => {
     mod.reconcileCurrent(cfg1)
     expect(cfg1.current).toBe("a")
     expect(cfg1.current_go).toBe("a")
+  })
+})
+
+
+describe("go + zen 双套餐模型动态查看（WEB_HTML 内嵌 + 路由降级）", () => {
+  test("WEB_HTML 含双套餐模型渲染：Go/Zen plans 两栏 + 刷新按钮 + refreshGwModels", () => {
+    const html: string = (mod as any).WEB_HTML
+    expect(html).toContain("模型清单（go 与 zen 全部模型动态查看）")
+    expect(html).toContain('onclick="refreshGwModels()"')
+    expect(html).toContain('id="gw-models-refresh"')
+    expect(html).toContain("function refreshGwModels()")
+    expect(html).toContain('api("/api/gateway/models/refresh", {})')
+    // 双套餐各自渲染分支（Go 订阅 / Zen 免费 + 当前套餐徽标）
+    expect(html).toContain("Go 订阅")
+    expect(html).toContain("Zen 免费")
+    expect(html).toContain("当前套餐")
+    expect(html).toContain("g.gwModels") // 渲染数据来自 gatewayStatus() 的 gwModels.plans
+  })
+  test("GET /api/gateway 不可达网关仍降级 running=false（gwModels/models 缺失）", async () => {
+    const res = await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway"))
+    const j = await res.json()
+    expect(j.running).toBe(false)
+    expect(j.gwModels).toBeUndefined() // 网关不可达 → /api/gateway/models 无 plans 结构
+  })
+  test("GET /api/gateway/models 网关不可达 → {ok:false, error}", async () => {
+    const res = await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/models"))
+    expect(res.status).toBe(200)
+    const j = await res.json()
+    expect(j.ok).toBe(false)
+    expect(typeof j.error).toBe("string")
+  })
+  test("POST /api/gateway/models/refresh 网关不可达 → {ok:false, error}（不抛异常）", async () => {
+    const res = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/models/refresh", { method: "POST", body: "{}" }),
+    )
+    expect(res.status).toBe(200)
+    const j = await res.json()
+    expect(j.ok).toBe(false)
+    expect(typeof j.error).toBe("string")
   })
 })

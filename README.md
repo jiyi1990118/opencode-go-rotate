@@ -24,6 +24,8 @@ opencode 的 opencode-go 多 key 自动轮换插件 + Web 管理界面。
 - ✅ **三域独立轮换**：zen（免费档）/ go（套餐档）/ 网关 三个域各自独立 current + 冷却 + 轮换，互不干扰；auth.json 仅由 zen 域维护
 - ✅ **双套餐健康检查**：每 key 分别探测 zen 与 go 端点（`check` 或 Web「检查」按钮），状态列展示两行健康 + 探测时间
 - ✅ Web **4 区块导航**：Key 管理（三域健康总览 + key 双套餐健康列）/ TUI（zen+go 子卡设置）/ 网关 / 统计
+- ✅ 网关卡片**双套餐模型动态查看**：go 与 zen 全部模型（上游实时获取 + 内置兜底），各行分折叠块展示动态/内置计数，「刷新模型」一键重拉；网关设 token 时 Web 自动带 Bearer 读取（不再 401）
+- 联动文档：`docs/网关双套餐模型查看-phase22.md`
 - ✅ 测试体系：插件单测（`bun test tests/`）、CLI 单测（`python3 tests/test-go-rotate-cli.py`）、gateway 单测（`ZEN_TEST=1 node zen-gateway/tests/run-tests.mjs`）
 
 ## 安装
@@ -36,6 +38,26 @@ curl -fsSL https://raw.githubusercontent.com/jiyi1990118/opencode-go-rotate/main
 # 仅插件 + CLI（不开网关）
 curl -fsSL https://raw.githubusercontent.com/jiyi1990118/opencode-go-rotate/main/install.sh | bash
 ```
+
+### 独立服务器安装（无 opencode，zen 免费网关）
+
+**不需要安装 opencode**，仅需 Node.js ≥ 18。一键安装 zen-gateway 并注册为常驻服务：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jiyi1990118/opencode-go-rotate/main/install.sh | bash -s -- zen-gateway
+```
+
+自动完成：拷贝 `gateway.mjs` → 创建默认 `go-keys.json` + `gateway-config.json` → 注册常驻服务（macOS launchd / Linux systemd --user）→ 开机自启 + 崩溃自动重启。安装后：
+
+```bash
+zen-gateway status          # 查看状态（running）
+go-rotate add mykey sk-xxx  # 填入你的 opencode 账号 API key
+go-rotate gateway plan zen  # 切 zen 免费档（默认 go 付费档；免费档自动轮换已禁用）
+zen-gateway restart         # 生效
+curl http://127.0.0.1:18888/v1/models   # 验证
+```
+
+> 完整手册（系统要求 / systemd unit / 客户端接入 / FAQ）：[`docs/部署指南-独立机器.md`](docs/部署指南-独立机器.md)。
 
 ### 手动安装
 
@@ -127,7 +149,7 @@ go-rotate status            # 查看状态
 | `go-rotate go next [分钟]` | **go 套餐域**轮换（原 go current 进 go 域冷却 + 选下一个未冷却写 `current_go`） |
 | `go-rotate go cooldown <name> [分钟\|clear]` | 写/清 **go 套餐域**冷却（写 `cooldown_until_go`，缺省窗口与字段级语义一致） |
 | `go-rotate stats` | 从日志统计每 key 轮换/冷却次数（近期） |
-| `go-rotate gateway {start\|stop\|restart\|status\|logs [n]}` | 管理 zen-gateway 服务（launchd 常驻，端口 18888） |
+| `go-rotate gateway {start\|stop\|restart\|status\|logs [n]}` | 管理 zen-gateway 服务（macOS launchd / Linux systemd --user，端口 18888） |
 | `go-rotate gateway plan [go\|zen]` | 查看/切换网关套餐（Go 订阅 / Zen 免费档，切换后需 restart） |
 | `go-rotate gateway token [gen\|clear\|set <v>]` | 管理网关访问 token（供其它 agent 连接鉴权，只显示掩码） |
 | `go-rotate gateway set <name>` | 网关域设为当前 key（不写 auth.json，不影响 TUI） |
@@ -174,6 +196,14 @@ opencode-go 没有公开的额度/余额查询 API，**无法主动查额度**�
 
 ## 相关项目
 
-- **zen-gateway（`zen-gateway/`）**：把 opencode zen（Go 档 / opencode-go 订阅 key）暴露成标准 OpenAI/Anthropic/Responses 兼容网关，供 claude code / codex / cursor 使用。与 go-rotate **共用 `go-keys.json`** 和自动轮换。见 [`zen-gateway/README.md`](zen-gateway/README.md)，架构设计见 [`docs/zen-gateway-architecture.md`](docs/zen-gateway-architecture.md)。含零依赖工具 `zen-gateway/usage-report.mjs`（用量趋势分析）与 `zen-gateway/tests/run-tests.mjs`（纯逻辑单测，`ZEN_TEST=1 node run-tests.mjs`）。
+- **zen-gateway（`zen-gateway/`）**：把 opencode zen（Go 档 / opencode-go 订阅 key）暴露成标准 OpenAI/Anthropic/Responses 兼容网关，供 claude code / codex / cursor 使用。与 go-rotate **共用 `go-keys.json`** 和自动轮换。见 [`zen-gateway/README.md`](zen-gateway/README.md)，架构设计见 [`docs/zen-gateway-architecture.md`](docs/zen-gateway-architecture.md)。含零依赖工具 `zen-gateway/usage-report.mjs`（用量趋势分析）与 `zen-gateway/tests/run-tests.mjs`（纯逻辑单测，`ZEN_TEST=1 node run-tests.mjs`）。macOS launchd / Linux systemd 服务模板分别在 `zen-gateway/launchd/`、`zen-gateway/systemd/`。
 - **渐进整合**：go-rotate 与 zen-gateway 已统一管理面——CLI `go-rotate gateway {start|stop|restart|status|logs}` 管理网关服务，`go-rotate status` 汇总网关状态，Web（8899）网关管理卡（启停/重启/模型/日志）直连 18888 只读端点。整合方案见 [`docs/整合设计方案-渐进整合.md`](docs/整合设计方案-渐进整合.md)。
-- **网关管理端**：Web（8899）已可视化管理网关——**go/zen 套餐切换**（Go 订阅 26 模型 / Zen 免费 7 模型）、**网关访问 token 定义**（供 claude code/codex/cursor 等其它 agent 连接鉴权）、启停重启/模型/日志/用量。配置独立存 `~/.local/share/zen-gateway/gateway-config.json`（0600）。设计见 [`docs/网关管理端设计方案.md`](docs/网关管理端设计方案.md)。
+- **网关管理端**：Web（8899）已可视化管理网关——**go/zen 套餐切换**（Go 订阅 26 模型 / Zen 免费 7 模型，双套餐模型动态查看）、**网关访问 token 多 key 管理**（生成 sk- 前缀 Key / 逐行删除 / 清空，供 claude code/codex/cursor 等其它 agent 连接鉴权，明文仅生成时回显一次并支持一键复制）、启停重启/模型/日志/用量。配置独立存 `~/.local/share/zen-gateway/gateway-config.json`（0600）。设计见 [`docs/网关管理端设计方案.md`](docs/网关管理端设计方案.md)。
+- **自适配优化**：网关 UA 自动探测（`opencode --version`）、FreeUsageLimitError 免费档限流不轮换、推理模型 `max_tokens` 截断自动放大重试（`ZEN_AUTO_MAX_TOKENS=0` 关闭）。见 [`docs/网关自适配优化-phase24.md`](docs/网关自适配优化-phase24.md)。
+- **独立部署**：无 opencode 机器上部署 zen 免费网关（Node ≥18 单文件 + systemd/launchd，UA 自动回退、plan=zen 免费档）。见 [`docs/部署指南-独立机器.md`](docs/部署指南-独立机器.md)。
+
+## License
+
+MIT License — 见 [LICENSE](LICENSE)。
+
+> 注意：本项目用于调用你自己的 opencode 订阅账号。[opencode 开发者条款](https://opencode.ai/terms) 限制将服务转售或供第三方收益；仅供个人/团队内部自用。

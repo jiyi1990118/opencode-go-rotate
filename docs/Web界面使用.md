@@ -240,7 +240,7 @@ JS: refresh() 5s 轮询 /api/status；refreshLog() 8s 轮询 /api/log
 **D. 隔离铁证**
 
 - 真实 `~/.config/opencode/go-keys.json` md5：**前后一致 `70aa1342709e6cfc4141dbfd5c374260`**（所有写操作走 `GOROTATE_CONFIG_FILE`）。
-- 真实 `~/.local/share/opencode/auth.json`：**内容语义零变化**（唯一真实 key `sk-epyPd50…` 与 JSON 结构始终一致）；md5 在测试期间被**并行进程**（zen-gateway launchd KeepAlive 反复重启 / opencode 活动）重写而漂移。**隔离有效性已实验证明**：隔离 env 下调用会触发 `syncAuth` 的 `/api/current`，临时 auth.json 被写入 act2 key，真实 auth.json md5 前后不变（`e4e9a727…`→`e4e9a727…`）。
+- 真实 `~/.local/share/opencode/auth.json`：**内容语义零变化**（唯一真实 key `sk-***` 与 JSON 结构始终一致）；md5 在测试期间被**并行进程**（zen-gateway launchd KeepAlive 反复重启 / opencode 活动）重写而漂移。**隔离有效性已实验证明**：隔离 env 下调用会触发 `syncAuth` 的 `/api/current`，临时 auth.json 被写入 act2 key，真实 auth.json md5 前后不变（`e4e9a727…`→`e4e9a727…`）。
 - 临时文件（`/tmp/gr-web-test/`、`/tmp/gr-web-test2/`、build 产物）测后已清理；**未触碰真实 8899**（全程未 bind，`startWeb` 因端口被真实实例占用自动跳过）。
 
 ### 8.4 测试环境变量（新增）

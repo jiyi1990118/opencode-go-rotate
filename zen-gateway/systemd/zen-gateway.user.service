@@ -1,0 +1,24 @@
+[Unit]
+Description=zen-gateway (opencode zen -> OpenAI/Anthropic/Responses gateway)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__GATEWAY_DIR__
+Environment=NODE_ENV=production
+Environment=ZEN_UPSTREAM_UA=opencode/1.18.18
+# —— 以下可选，按需取消注释（默认读取 ~/.config/opencode/go-keys.json 与
+#    ~/.local/share/zen-gateway/gateway-config.json，与 launchd 行为一致） ——
+# Environment=ZEN_GATEWAY_TOKEN=换成你自己的强随机token   # 内网/公网共享时必须设置
+# Environment=ZEN_PROBE_INTERVAL_MIN=15                  # 可选：配额主动探测轮换
+# Environment=ZEN_AUTO_MAX_TOKENS=0                      # 可选：关闭截断自动重试
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+ExecStart=__NODE_BIN__ __GATEWAY_MJS__
+
+[Install]
+WantedBy=default.target

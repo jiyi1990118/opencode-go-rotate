@@ -646,6 +646,18 @@ const GATEWAY_BASE = process.env.GOROTATE_GATEWAY_BASE ?? "http://127.0.0.1:1888
 const GATEWAY_CTL = process.env.GOROTATE_GATEWAY_CTL ?? path.join(homedir(), ".local", "bin", "zen-gateway")
 // 管理操作（start 含 15s 健康等待）与日志读取的超时
 const GATEWAY_CTL_TIMEOUT_MS = 20000
+
+/** 网关鉴权头：读 gateway-config.json 里的 token（若设置）→ fetch 18888 时附带 Bearer。
+ *  网关设了 token 时所有端点都要鉴权（实测无 Bearer 一律 401），不带则 Web 读不到模型/用量/日志。 */
+function gatewayAuthHeaders(): Record<string, string> {
+  try {
+    const cfg = readGatewayConfig()
+    const t = cfg.tokens.length > 0 ? cfg.tokens[0] : cfg.token
+    return t ? { authorization: `Bearer ${t}` } : {}
+  } catch {
+    return {}
+  }
+}
 // 网关运行时配置（套餐 + token）：独立文件，与 go-keys.json 职责分离（低频静态配置 + 敏感凭据隔离）。
 // 文件缺失回退默认（go / 无 token）；GOROTATE_GATEWAY_CONFIG 仅供测试隔离覆盖（生产不设行为不变）
 const GATEWAY_CONFIG_FILE =
@@ -700,7 +712,7 @@ function gatewayManage(action: "start" | "stop" | "restart"): { ok: boolean; out
  * 同时透传 lines/total 供前端逐行渲染；回退脚本路径 text 本身即纯文本。 */
 async function gatewayLog(): Promise<{ ok: boolean; text: string; source: string; lines?: string[]; total?: number }> {
   try {
-    const r = await fetch(GATEWAY_BASE + "/api/gateway/log", { signal: AbortSignal.timeout(2000) })
+    const r = await fetch(GATEWAY_BASE + "/api/gateway/log", { headers: gatewayAuthHeaders(), signal: AbortSignal.timeout(2000) })
     if (r.ok) {
       const j: any = await r.json().catch(() => null)
       if (j && Array.isArray(j.lines)) {
@@ -730,15 +742,18 @@ async function gatewayStatus(): Promise<{
   usage?: any
   models?: string[]
   modelCount?: number
+  gwModels?: any
   version?: string
   error?: string
 }> {
-  const [h, u, m, s] = await Promise.allSettled([
-    fetch(GATEWAY_BASE + "/healthz", { signal: AbortSignal.timeout(2000) }).then((r) => r.json()),
-    fetch(GATEWAY_BASE + "/api/usage", { signal: AbortSignal.timeout(2000) }).then((r) => r.json()),
-    fetch(GATEWAY_BASE + "/v1/models", { signal: AbortSignal.timeout(2000) }).then((r) => r.json()),
+  const [h, u, m, s, gm] = await Promise.allSettled([
+    fetch(GATEWAY_BASE + "/healthz", { headers: gatewayAuthHeaders(), signal: AbortSignal.timeout(2000) }).then((r) => r.json()),
+    fetch(GATEWAY_BASE + "/api/usage", { headers: gatewayAuthHeaders(), signal: AbortSignal.timeout(2000) }).then((r) => r.json()),
+    fetch(GATEWAY_BASE + "/v1/models", { headers: gatewayAuthHeaders(), signal: AbortSignal.timeout(2000) }).then((r) => r.json()),
     // 网关只读状态端点：透传 version（旧网关无此端点/字段时缺失，前端容错显示 '—'）
-    fetch(GATEWAY_BASE + "/api/gateway/status", { signal: AbortSignal.timeout(2000) }).then((r) => r.json()),
+    fetch(GATEWAY_BASE + "/api/gateway/status", { headers: gatewayAuthHeaders(), signal: AbortSignal.timeout(2000) }).then((r) => r.json()),
+    // go + zen 双套餐模型明细（动态 ∪ 内置），供 Web「动态查看全部模型」
+    fetch(GATEWAY_BASE + "/api/gateway/models", { headers: gatewayAuthHeaders(), signal: AbortSignal.timeout(2000) }).then((r) => r.json()),
   ])
   const out: any = { running: h.status === "fulfilled", ctlExists: gatewayCtlExists() }
   if (h.status === "fulfilled") out.healthz = h.value
@@ -747,9 +762,50 @@ async function gatewayStatus(): Promise<{
     out.models = m.value.data.map((x: any) => x?.id).filter(Boolean)
     out.modelCount = out.models.length
   }
+  if (gm.status === "fulfilled" && gm.value && typeof gm.value?.plans === "object") {
+    // 新网关双套餐结构：以 plans 为准（当前套餐合并清单 `models` 同步派生，旧渲染兼容）
+    out.gwModels = gm.value
+    const ap = gm.value.plans?.[gm.value.active]
+    if (ap && Array.isArray(ap.models)) {
+      out.models = ap.models
+      out.modelCount = ap.models.length
+    }
+  }
   if (s.status === "fulfilled" && typeof s.value?.version === "string") out.version = s.value.version
   if (h.status === "rejected") out.error = String(h.reason?.message ?? h.reason)
   return out
+}
+
+/** GET /api/gateway/models 透传：网关 go + zen 双套餐模型清单（各自动态 ∪ 内置）+ 别名。
+ *  网关不可达/失败 → {ok:false, error}，前端降级显示。 */
+async function gatewayModelsProxy(): Promise<any> {
+  try {
+    const r = await fetch(GATEWAY_BASE + "/api/gateway/models", {
+      headers: gatewayAuthHeaders(),
+      signal: AbortSignal.timeout(2000),
+    })
+    const j: any = await r.json().catch(() => null)
+    if (!r.ok || !j) return { ok: false, error: j?.error?.message ?? `网关无响应 HTTP ${r.status}` }
+    return { ok: true, ...j }
+  } catch (e: any) {
+    return { ok: false, error: String(e?.message ?? e) }
+  }
+}
+
+/** 触发网关重拉 go + zen 双套餐上游模型表（gateway /v1/models/refresh）。网关不可达/失败 → {ok:false, error}。 */
+async function gatewayModelsRefresh(): Promise<any> {
+  try {
+    const r = await fetch(GATEWAY_BASE + "/v1/models/refresh", {
+      method: "POST",
+      headers: gatewayAuthHeaders(),
+      signal: AbortSignal.timeout(6000),
+    })
+    const j: any = await r.json().catch(() => null)
+    if (!r.ok) return { ok: false, error: j?.error?.message ?? `网关刷新失败 HTTP ${r.status}` }
+    return { ok: true, ...(j && typeof j === "object" ? j : {}) }
+  } catch (e: any) {
+    return { ok: false, error: String(e?.message ?? e) }
+  }
 }
 
 /* ---------------- 网关配置（gateway-config.json：套餐 + token） ----------------
@@ -757,20 +813,31 @@ async function gatewayStatus(): Promise<{
  * + atomicWrite（tmp+rename）+ 0600；只落盘不重启（重启由前端显式调 /api/gateway/restart，
  * 职责分离：用户可先改多个配置项再一次性重启）。
  */
-type GatewayConfig = { plan: string; token: string | null; token_set_at: string | null }
+type GatewayConfig = {
+  plan: string
+  token: string | null
+  token_set_at: string | null
+  tokens: string[]
+}
 
 function defaultGatewayConfig(): GatewayConfig {
-  return { plan: "go", token: null, token_set_at: null }
+  return { plan: "go", token: null, token_set_at: null, tokens: [] }
 }
 
 function readGatewayConfig(): GatewayConfig {
   try {
     if (!existsSync(GATEWAY_CONFIG_FILE)) return defaultGatewayConfig()
     const raw = JSON.parse(readFileSync(GATEWAY_CONFIG_FILE, "utf8"))
+    const tokens = Array.isArray(raw.tokens)
+      ? raw.tokens.filter((t: unknown): t is string => typeof t === "string" && t.length > 0)
+      : typeof raw.token === "string" && raw.token
+        ? [raw.token]
+        : []
     return {
       plan: raw.plan === "zen" ? "zen" : "go",
-      token: typeof raw.token === "string" && raw.token ? raw.token : null,
+      token: tokens.length > 0 ? tokens[0] : null,
       token_set_at: typeof raw.token_set_at === "string" ? raw.token_set_at : null,
+      tokens,
     }
   } catch (e) {
     log(`readGatewayConfig error: ${(e as Error).message}`)
@@ -778,8 +845,9 @@ function readGatewayConfig(): GatewayConfig {
   }
 }
 
-/** 写网关配置（plan / token 至少给一个；token:null = 清除关鉴权）。返回写后配置。 */
-function writeGatewayConfig(patch: { plan?: string; token?: string | null }): GatewayConfig {
+/** 写网关配置（plan / tokens 至少给一个；tokens:null = 清空关鉴权）。token 单值写兼容 → tokens=[v]。
+ *  旧字段 token 始终同步为 tokens[0]（旧版网关只读 token 也能用第一个 key）。返回写后配置。 */
+function writeGatewayConfig(patch: { plan?: string; token?: string | null; tokens?: string[] | null }): GatewayConfig {
   return withLockSync<GatewayConfig>(() => {
     const cfg = readGatewayConfig()
     if (patch.plan !== undefined) {
@@ -787,11 +855,22 @@ function writeGatewayConfig(patch: { plan?: string; token?: string | null }): Ga
         throw new Error(`plan 必须是 "go" 或 "zen"，收到: ${patch.plan}`)
       cfg.plan = patch.plan
     }
-    if (patch.token !== undefined) {
+    if (patch.tokens !== undefined) {
+      if (patch.tokens !== null && !Array.isArray(patch.tokens))
+        throw new Error("tokens 必须是字符串数组或 null（清空）")
+      cfg.tokens =
+        patch.tokens === null
+          ? []
+          : patch.tokens.filter((t) => typeof t === "string" && t.length > 0)
+      if (cfg.tokens.some((t) => t === "")) throw new Error("tokens 不能包含空字符串")
+      cfg.token = cfg.tokens.length > 0 ? cfg.tokens[0] : null
+      cfg.token_set_at = new Date().toISOString()
+    } else if (patch.token !== undefined) {
       if (patch.token !== null && typeof patch.token !== "string")
         throw new Error("token 必须是字符串或 null（清除）")
-      cfg.token = patch.token === null ? null : patch.token
-      if (cfg.token === "") throw new Error("token 不能为空字符串（清除请传 null）")
+      cfg.tokens = patch.token === null ? [] : [patch.token]
+      if (cfg.tokens.some((t) => t === "")) throw new Error("token 不能为空字符串（清除请传 null）")
+      cfg.token = cfg.tokens.length > 0 ? cfg.tokens[0] : null
       cfg.token_set_at = new Date().toISOString()
     }
     mkdirSync(path.dirname(GATEWAY_CONFIG_FILE), { recursive: true })
@@ -807,9 +886,9 @@ function maskGatewayToken(t: string): string {
   return `${t.slice(0, 4)}...${t.slice(-4)}`
 }
 
-/** 生成网关访问 token：crypto.randomBytes(32).toString("hex") = 64 hex */
-function genToken(): string {
-  return randomBytes(32).toString("hex")
+/** 生成网关访问 key：sk- + 24 字节 hex（48 hex，共 51 字符），满足 sk- 前缀约定 */
+function genGatewayToken(): string {
+  return "sk-" + randomBytes(24).toString("hex")
 }
 
 /** GET /api/gateway/config 载荷：token 一律掩码返回，绝不返回明文 */
@@ -817,8 +896,10 @@ function gatewayConfigPayload() {
   const cfg = readGatewayConfig()
   return {
     plan: cfg.plan,
-    token: cfg.token ? maskGatewayToken(cfg.token) : null,
-    authEnabled: !!cfg.token,
+    token: cfg.tokens.length > 0 ? maskGatewayToken(cfg.tokens[0]) : null,
+    tokens: cfg.tokens.map((t) => maskGatewayToken(t)),
+    tokenCount: cfg.tokens.length,
+    authEnabled: cfg.tokens.length > 0,
     tokenSetAt: cfg.token_set_at,
     needsRestart: false, // GET 只读；needsRestart:true 仅由 POST 写操作返回
   }
@@ -922,6 +1003,7 @@ async function handleWeb(req: any): Promise<Response> {
   }
   if (method === "GET" && route === "/api/gateway") return json(await gatewayStatus())
   if (method === "GET" && route === "/api/gateway/log") return json(await gatewayLog())
+  if (method === "GET" && route === "/api/gateway/models") return json(await gatewayModelsProxy())
   if (method === "GET" && route === "/api/gateway/plans") return json(gatewayPlansPayload())
   if (method === "GET" && route === "/api/gateway/config") return json(gatewayConfigPayload())
   // key 健康探测：仅 POST（GET 会意外触发真实探测消耗配额，防呆 404/405）。
@@ -948,6 +1030,10 @@ async function handleWeb(req: any): Promise<Response> {
     const wasRunning = webStarted
     if (!webStarted) await startWeb()
     return json({ ok: true, auto_web: true, restarted: !wasRunning && webStarted })
+  }
+  // 手动刷新 go + zen 双套餐模型清单（异步调网关 /v1/models/refresh，先于通用 POST 块处理）
+  if (method === "POST" && route === "/api/gateway/models/refresh") {
+    return json(await gatewayModelsRefresh())
   }
   if (method === "POST") {
     try {
@@ -985,16 +1071,45 @@ async function handleWeb(req: any): Promise<Response> {
         if (route === "/api/gateway/start") return gatewayManage("start")
         if (route === "/api/gateway/stop") return gatewayManage("stop")
         if (route === "/api/gateway/restart") return gatewayManage("restart")
-        // 网关配置（套餐/token）：只写 gateway-config.json 不重启（重启由前端显式调 restart）
-        if (route === "/api/gateway/config") {
-          if (body.plan === undefined && body.token === undefined)
-            throw new Error("至少提供 plan 或 token 之一")
-          writeGatewayConfig({
-            plan: body.plan === undefined ? undefined : String(body.plan),
-            token: body.token === undefined ? undefined : body.token,
-          })
-          return { ok: true, needsRestart: true }
-        }
+// 网关配置（套餐/token）：只写 gateway-config.json 不重启（重启由前端显式调 restart）
+         if (route === "/api/gateway/config") {
+           if (body.plan === undefined && body.token === undefined && body.tokens === undefined)
+             throw new Error("至少提供 plan / token / tokens 之一")
+           writeGatewayConfig({
+             plan: body.plan === undefined ? undefined : String(body.plan),
+             token: body.token === undefined ? undefined : body.token,
+             tokens: body.tokens === undefined ? undefined : body.tokens,
+           })
+           return { ok: true, needsRestart: true }
+         }
+         // 网关访问 key 管理：生成/删除/清空（token 明文仅生成时返回一次，落盘后掩码）
+         if (route === "/api/gateway/token") {
+           const action = String(body.action || "")
+           if (action === "gen") {
+             const key = genGatewayToken()
+             writeGatewayConfig({ tokens: [...readGatewayConfig().tokens, key] })
+             return {
+               ok: true,
+               plain: key,
+               masked: maskGatewayToken(key),
+               tokenCount: readGatewayConfig().tokens.length,
+               needsRestart: true,
+             }
+           }
+           if (action === "del") {
+             const idx = Number(body.index)
+             const cfg = readGatewayConfig()
+             if (!Number.isInteger(idx) || idx < 0 || idx >= cfg.tokens.length)
+               throw new Error(`index 越界（当前 ${cfg.tokens.length} 个 key）`)
+             writeGatewayConfig({ tokens: cfg.tokens.filter((_, i) => i !== idx) })
+             return { ok: true, needsRestart: true }
+           }
+           if (action === "clear") {
+             writeGatewayConfig({ tokens: null })
+             return { ok: true, needsRestart: true }
+           }
+           throw new Error(`未知 action: ${action || "(空)"}（支持 gen/del/clear）`)
+         }
         return null
       }
       const res = run()
@@ -1625,7 +1740,7 @@ try {
       <div class="stat"><div class="v" id="gw-avail">-</div><div class="l">可用 / key 数</div></div>
       <div class="stat"><div class="v" id="gw-rot">-</div><div class="l">轮换数</div></div>
       <div class="stat"><div class="v" id="gw-req">-</div><div class="l">总请求</div></div>
-      <div class="stat"><div class="v" id="gw-mcount">-</div><div class="l">模型数</div></div>
+      <div class="stat"><div class="v" id="gw-mcount">-</div><div class="l">模型数 go+zen</div></div>
     </div>
     <div class="row" style="margin-bottom:10px">
       <span class="muted" style="flex:1">管理操作（启停 launchd 服务，走跨进程锁）：</span>
@@ -1651,16 +1766,14 @@ try {
   </div>
 
   <div class="card" id="gw-token-card">
-    <b>网关访问 Token <span id="token-badge"></span></b>
+    <b>网关访问 Key <span id="token-badge"></span></b>
     <div class="row" style="margin-top:10px">
-      <input id="token-input" readonly placeholder="未设置（鉴权关闭）" class="mono">
-      <button onclick="genGatewayToken()">生成</button>
-      <button onclick="setGatewayToken()">编辑</button>
-      <button onclick="copyToken()">复制</button>
-      <button onclick="toggleTokenMask()">显示/隐藏</button>
-      <button class="danger" onclick="clearGatewayToken()">清除</button>
+      <button class="primary" onclick="genGatewayToken()">＋ 生成新 Key</button>
+      <button onclick="setGatewayToken()">设置单个</button>
+      <button class="danger" onclick="clearGatewayToken()">清空全部</button>
     </div>
-    <div class="muted" style="margin-top:6px">其它 agent 连网关时用此 token（curl -H "Authorization: Bearer &lt;token&gt;"）。生成/编辑后可直接「复制」。</div>
+    <div id="token-list" class="muted" style="margin-top:10px">加载中…</div>
+    <div class="muted" style="margin-top:6px">生成/设置后需「重启网关」生效。其它 agent 连网关时用任一 key（curl -H "Authorization: Bearer &lt;key&gt;"）。</div>
     <div id="token-msg" class="msg" style="margin-top:6px"></div>
   </div>
   </div>
@@ -2082,13 +2195,42 @@ async function refreshGateway() {
       })
       html += '</tbody></table>'
     }
-    // 模型列表：小字显示数量 + 前几个，details 展开看全部（模型名非用户直接可控，防御性转义）
-    const models = g.models || []
-    if (models.length) {
-      const preview = models.slice(0, 4).map(esc).join(", ") + (models.length > 4 ? " …" : "")
-      html += '<details class="small" style="margin-top:6px"><summary class="muted" style="cursor:pointer">' +
-        '模型（' + models.length + '）：' + preview + '</summary>' +
-        '<div class="model-list" style="margin-top:4px">' + models.map(esc).join("<br>") + '</div></details>'
+    // 模型清单：go + zen 双套餐动态查看（动态 = 上游实时 /v1/models，内置 = 兜底表）。
+    // gwModels 来自网关 /api/gateway/models（go-rotate 服务端带 Bearer 读鉴权网关）。
+    const gm = g.gwModels
+    const plans = gm && gm.plans && typeof gm.plans === "object" ? gm.plans : null
+    if (plans) {
+      const planMeta = { go: "Go 订阅", zen: "Zen 免费" }
+      const uniq = new Set()
+      let ph = ""
+      ;["go", "zen"].forEach(pid => {
+        const p = plans[pid]
+        if (!p || !Array.isArray(p.models)) return
+        p.models.forEach(x => { if (typeof x === "string") uniq.add(x) })
+        const all = p.models
+        const preview = all.slice(0, 4).map(esc).join(", ") + (all.length > 4 ? " …" : "")
+        const dyn = Array.isArray(p.dynamic) ? p.dynamic.length : 0
+        const builtin = Array.isArray(p.builtin) ? p.builtin.length : 0
+        const curTag = gm.active === pid ? ' <span class="badge b-running">当前套餐</span>' : ""
+        const src = dyn > 0 ? "动态 " + dyn + " 个 · 内置兜底 " + builtin + " 个" : "内置 " + builtin + " 个（上游动态拉取不可用）"
+        ph += '<details class="small" style="margin-top:6px"><summary class="muted" style="cursor:pointer">' +
+          esc(planMeta[pid] || pid) + '（' + all.length + '）' + curTag + ' · ' + src +
+          '：' + preview + '</summary>' +
+          '<div class="model-list" style="margin-top:4px">' + all.map(esc).join("<br>") + '</div></details>'
+      })
+      document.getElementById("gw-mcount").textContent = String(uniq.size)
+      html += '<div style="margin-top:8px;display:flex;align-items:center;gap:8px">' +
+        '<span class="muted" style="flex:1">模型清单（go 与 zen 全部模型动态查看）</span>' +
+        '<button id="gw-models-refresh" onclick="refreshGwModels()">刷新模型</button></div>' + ph
+    } else {
+      // 旧网关/降级：只有单套餐合并清单时，沿用原「模型（N）」折叠展示
+      const models = g.models || []
+      if (models.length) {
+        const preview = models.slice(0, 4).map(esc).join(", ") + (models.length > 4 ? " …" : "")
+        html += '<details class="small" style="margin-top:6px"><summary class="muted" style="cursor:pointer">' +
+          '模型（' + models.length + '）：' + preview + '</summary>' +
+          '<div class="model-list" style="margin-top:4px">' + models.map(esc).join("<br>") + '</div></details>'
+      }
     }
     document.getElementById("gw-body").innerHTML = html
   } catch (e) {
@@ -2099,6 +2241,23 @@ async function refreshGateway() {
     setBtns(false, false)
     document.getElementById("gw-body").innerHTML = '<span class="muted">获取失败：' + esc(e.message) + '</span>'
   }
+}
+/* 手动刷新 go + zen 双套餐动态模型表（调网关 /v1/models/refresh 重拉上游），成功后刷新状态卡 */
+async function refreshGwModels() {
+  const btn = document.getElementById("gw-models-refresh")
+  if (btn) btn.disabled = true
+  try {
+    const r = await api("/api/gateway/models/refresh", {})
+    if (r.ok) {
+      showMsg("模型清单已刷新：go 动态 " + (r.go ?? "-") + " 个 / zen 动态 " + (r.zen ?? "-") + " 个")
+    } else {
+      showErr("模型刷新失败：" + (r.error || "网关无响应"))
+    }
+  } catch (e) {
+    showErr("模型刷新失败：" + e.message)
+  }
+  if (btn) setTimeout(() => { btn.disabled = false }, 800)
+  refreshGateway()
 }
 /* 管理操作：start/stop/restart（真实启停）。成功后 800ms 刷新状态（launchd 拉起有延迟）。 */
 async function gwManage(action) {
@@ -2156,7 +2315,27 @@ function switchNav(block) {
 }
 
 /* ---- 网关套餐 / Token（/api/gateway/plans + /api/gateway/config，写后显式调 restart 生效） ---- */
-var gwToken = { masked: "", plain: "", showPlain: false }
+var gwToken = { plain: "" } // 本会话「生成/设置」过的明文（GET 只回掩码，明文不进 token-list）
+/* token 列表多 key 渲染：每行掩码 + 删除按钮；本会话明文存在时前置「复制明文」行。
+ * 掩码列表来自 /api/gateway/config（服务端只回掩码，零明文泄漏）；esc 防御性转义。 */
+function renderTokenList(tokens) {
+  const el = document.getElementById("token-list")
+  if (!Array.isArray(tokens) || !tokens.length) {
+    el.textContent = "\u672a\u8bbe\u7f6e\uff08\u9274\u6743\u5173\u95ed\uff09"
+    return
+  }
+  let html = ""
+  if (gwToken.plain) {
+    html += '<div style="display:flex;align-items:center;gap:8px;padding:3px 0;border-bottom:1px solid var(--bd-2)">' +
+      '<span class="muted" style="flex:1">本会话明文（仅本次可复制）</span>' +
+      '<button class="small" onclick="copySessionPlain()">\u590d\u5236\u660e\u6587</button></div>'
+  }
+  html += tokens.map((t, i) =>
+    '<div style="display:flex;align-items:center;gap:8px;padding:3px 0">' +
+      '<code style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(t) + '</code>' +
+      '<button class="small" onclick="delGatewayToken(' + i + ')">\u5220\u9664</button></div>').join("")
+  el.innerHTML = html
+}
 function tokenBadge(on) {
   document.getElementById("token-badge").innerHTML =
     on ? '<span class="badge b-running">鉴权开启</span>' : '<span class="badge b-stopped">鉴权关闭</span>'
@@ -2175,10 +2354,7 @@ async function refreshGatewayConfig() {
     document.getElementById("plan-go").checked = c.plan === "go"
     document.getElementById("plan-zen").checked = c.plan === "zen"
     tokenBadge(!!c.authEnabled)
-    gwToken.masked = c.token || ""
-    gwToken.plain = ""   // GET 只返回掩码；明文仅在本次会话生成/编辑后持有
-    gwToken.showPlain = false
-    document.getElementById("token-input").value = c.token ? c.token : "未设置（鉴权关闭）"
+    renderTokenList(c.tokens || []) // 多 key 掩码列表（明文仅本会话生成/编辑后持有，GET 永不明文）
   } catch (e) { showTokenMsg("配置读取失败：" + e.message, true) }
 }
 function showTokenMsg(m, isErr) {
@@ -2205,68 +2381,58 @@ async function saveGatewayPlan() {
   } catch (e) { msg.className = "msg err"; msg.textContent = e.message }
 }
 async function genGatewayToken() {
-  // 浏览器端生成 64 hex（与后端 genToken() 同格式：crypto.randomBytes(32) 等价，hex 全集 0-9a-f）
-  const b = new Uint8Array(32)
-  crypto.getRandomValues(b)
-  const token = Array.from(b, x => x.toString(16).padStart(2, "0")).join("")
   try {
-    const r = await api("/api/gateway/config", { token })
-    gwToken.plain = token
-    gwToken.masked = token.slice(0, 4) + "..." + token.slice(-4)
-    gwToken.showPlain = false
-    document.getElementById("token-input").value = gwToken.masked
+    // 后端生成（sk- + 24 字节 hex），只在 gen 响应中回一次明文；追加进 tokens[] 多 key 列表
+    const r = await api("/api/gateway/token", { action: "gen" })
+    gwToken.plain = r.plain || ""
     tokenBadge(true)
-    showTokenMsg(r.needsRestart ? "Token 已生成并保存（重启网关后生效）" : "Token 已生成")
+    showTokenMsg(
+      (r.needsRestart ? "已生成新 Key 并保存（重启网关后生效）" : "已生成新 Key") +
+        (r.plain ? "，明文仅本次会话可复制（列表显示掩码）。" : "。"),
+    )
+    refreshGatewayConfig()
   } catch (e) { showTokenMsg(e.message, true) }
 }
 async function setGatewayToken() {
-  const v = prompt("输入新的网关访问 token（64 位 hex；留空取消）", "")
+  const v = prompt("输入自定义网关访问 token（建议以 sk- 开头；留空取消）", "")
   if (v === null) return
   const token = v.trim()
   if (!token) return showTokenMsg("已取消（token 为空）", true)
   try {
     const r = await api("/api/gateway/config", { token })
     gwToken.plain = token
-    gwToken.masked = token.slice(0, 4) + "..." + token.slice(-4)
-    gwToken.showPlain = false
-    document.getElementById("token-input").value = gwToken.masked
     tokenBadge(true)
-    showTokenMsg(r.needsRestart ? "Token 已更新（重启网关后生效）" : "Token 已更新")
+    showTokenMsg(r.needsRestart ? "已设置单个 token（重启网关后生效）" : "已设置成功")
+    refreshGatewayConfig()
   } catch (e) { showTokenMsg(e.message, true) }
 }
 async function clearGatewayToken() {
-  if (!confirm("确定清除网关访问 token（关闭鉴权）？清除后任何本机进程都可直连网关。")) return
+  if (!confirm("确定清除网关全部访问 token（关闭鉴权）？清除后任何本机进程都可直连网关。")) return
   try {
-    const r = await api("/api/gateway/config", { token: null })
-    gwToken = { masked: "", plain: "", showPlain: false }
-    document.getElementById("token-input").value = "未设置（鉴权关闭）"
+    const r = await api("/api/gateway/token", { action: "clear" })
+    gwToken.plain = ""
     tokenBadge(false)
-    showTokenMsg(r.needsRestart ? "Token 已清除（重启网关后生效）" : "Token 已清除")
+    showTokenMsg(r.needsRestart ? "Token 已全部清除（重启网关后生效）" : "Token 已清除")
+    refreshGatewayConfig()
   } catch (e) { showTokenMsg(e.message, true) }
 }
-/* IA B4：生成/编辑后明文在本会话持有，直接复制明文，去掉「先显示/隐藏」前置步骤 */
-async function copyToken() {
+/* 删除指定下标的访问 key（后端 /api/gateway/token action=del） */
+async function delGatewayToken(i) {
+  if (!confirm("删除第 " + (Number(i) + 1) + " 个网关访问 key？")) return
+  try {
+    const r = await api("/api/gateway/token", { action: "del", index: Number(i) })
+    showTokenMsg(r.needsRestart ? "已删除（重启网关后生效）" : "已删除")
+    refreshGatewayConfig()
+  } catch (e) { showTokenMsg(e.message, true) }
+}
+/* 一次「生成/设置」后明文在本会话持有，一键复制（去「先显示/隐藏」前置步骤） */
+async function copySessionPlain() {
   const val = gwToken.plain
-  if (!val) return showTokenMsg("当前会话未持有明文（token 由外部设置），请先「生成」或「编辑」后再复制", true)
+  if (!val) return showTokenMsg("当前会话未持有明文（token 由外部设置，服务端只回掩码），请先「生成新 Key」再复制", true)
   try {
     await navigator.clipboard.writeText(val)
     showTokenMsg("已复制到剪贴板")
   } catch (e) { showTokenMsg("复制失败（浏览器剪贴板权限被拒），请手动复制", true) }
-}
-function toggleTokenMask() {
-  const input = document.getElementById("token-input")
-  if (!gwToken.masked && !gwToken.plain) return showTokenMsg("当前未设置 token", true)
-  gwToken.showPlain = !gwToken.showPlain
-  if (gwToken.showPlain) {
-    if (!gwToken.plain) {
-      // GET 只返回掩码：明文仅在本次会话生成/编辑后可用（设计 §6.2）
-      gwToken.showPlain = false
-      return showTokenMsg("明文不可见（token 由外部设置，当前会话未持有），请重新「生成」或「编辑」后查看", true)
-    }
-    input.value = gwToken.plain
-  } else {
-    input.value = gwToken.masked
-  }
 }
 
 /* ---- 使用方式卡：示例配置常量 + 一键复制（XSS 安全：纯静态常量 + textContent 填充，无用户可控数据） ---- */
@@ -2384,7 +2550,7 @@ export {
   gatewayManage,
   gatewayLog,
   gatewayCtlExists,
-  genToken,
+  genGatewayToken,
   readGatewayConfig,
   writeGatewayConfig,
   maskGatewayToken,

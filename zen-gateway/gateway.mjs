@@ -39,7 +39,7 @@
 import http from "node:http"
 import os from "node:os"
 import path from "node:path"
-import { execFile } from "node:child_process"
+import { execFile, execFileSync } from "node:child_process"
 import {
   readFileSync,
   writeFileSync,
@@ -78,6 +78,21 @@ const PROBE_TIMEOUT_MS = 15000
 const UPSTREAM_TIMEOUT_MS = 300000 // 流式可能持续较久，放宽到 5 分钟
 const MAX_BODY_BYTES = 8 * 1024 * 1024 // 请求体上限 8MB（防内存 DoS）
 const LOG_RING_MAX = 200 // 内存环形日志上限（/api/gateway/log 只读端点用）
+// 上游 UA 自适配：优先 env ZEN_UPSTREAM_UA；否则探测本机 opencode 版本 → "opencode/<ver>"（官方白名单 UA，
+// 实测非官方 UA 会被 opencode.ai 限流 429）；探测失败回退稳定默认。opencode 升级后无需手工改。
+const UPSTREAM_UA_FALLBACK = "opencode/1.18.18"
+function resolveUpstreamUA(execSyncImpl = execFileSync, env = process.env) {
+  if (env.ZEN_UPSTREAM_UA) return env.ZEN_UPSTREAM_UA
+  try {
+    const out = String(execSyncImpl("opencode", ["--version"], { encoding: "utf8", timeout: 3000 }))
+    const m = out.match(/(\d+\.\d+\.\d+[-\w.]*)/)
+    if (m) return `opencode/${m[1]}`
+  } catch {
+    /* opencode 未安装 / 超时 → 回退稳定默认 */
+  }
+  return UPSTREAM_UA_FALLBACK
+}
+const UPSTREAM_UA = resolveUpstreamUA()
 // 网关版本号：/api/gateway/status 只读端点的 version 字段（契约 docs/整合设计方案-渐进整合.md §5.3 承诺 "1.1.0"）
 const GATEWAY_VERSION = "1.1.0"
 
@@ -379,6 +394,14 @@ function isQuotaError(status, body) {
   return /quota|insufficient|balance|rate.?limit|usage limit|exceeded|配额|余额|限流|超出/i.test(msg)
 }
 
+/** 是否触发轮换（自适配）：zen 免费档限流 FreeUsageLimitError 不轮换——同一账户组轮换无用，
+ *  且会误冷却健康 key 300 分钟 + last_status=limited 污染展示；直接透传 429 让客户端自决。
+ *  其余配额/鉴权类（401 key 失效 / 402/429 套餐配额耗尽）照旧触发轮换（刻意设计）。 */
+function shouldRotateForError(status, body) {
+  if (body?.error?.type === "FreeUsageLimitError") return false
+  return isQuotaError(status, body)
+}
+
 /** 把上游错误分类为健康状态 —— 与 go-rotate 的 classifyGoError 契约逐条一致：
  *  返回枚举 ok | invalid | nobalance | limited | error（go-rotate Web / CLI 按此渲染徽章） */
 function classifyGoError(msg, statusCode) {
@@ -405,6 +428,12 @@ function pickNext(cfg) {
 
 /** 轮换（异步锁内执行）：失败的 key 进冷却，切到下一个可用 key，返回新配置 */
 async function rotate(errBody, status, failedKeyName) {
+  // zen 免费档自动轮换禁用（2026-08-18 用户实测：同设备 UA/频率限流与账号无关，切换 key 无效反而误伤冷却）。
+  // go 付费档保留（配额耗尽轮换有效）。手动轮换走 CLI/Web（写 current_gateway），不经 rotate，不受影响。
+  if (ACTIVE_PLAN.id === "zen") {
+    log(`🚫  zen 免费档自动轮换已禁用（同设备 UA/频率限流与账号无关），跳过 rotate（status=${status}，key="${failedKeyName ?? "current"}"）`)
+    return loadConfig()
+  }
   return withLockAsync(() => {
     const cfg = loadConfig()
     const cur = failedKeyName
@@ -494,6 +523,9 @@ function readGatewayConfig() {
       plan: cfg.plan,
       token: typeof cfg.token === "string" && cfg.token ? cfg.token : null,
       token_set_at: typeof cfg.token_set_at === "string" ? cfg.token_set_at : null,
+      tokens: Array.isArray(cfg.tokens)
+        ? cfg.tokens.filter((t) => typeof t === "string" && t.length > 0)
+        : [],
     }
   } catch (e) {
     log(`⚠️  readGatewayConfig 失败（${GATEWAY_CONFIG}），回退默认: ${e.message}`)
@@ -526,10 +558,22 @@ function resolveToken(config, env) {
   return typeof fileToken === "string" && fileToken ? fileToken : null
 }
 
-// 模块加载时固化当前套餐与 token（变更走重启生效，不做热切换）
+/** 解析网关访问 token 列表 → string[]（支持多 key 鉴权）。env ZEN_GATEWAY_TOKEN 优先（单值向后兼容）；
+ *  其次文件 tokens 数组；再回退单 token；全部缺省 → []（鉴权关闭）。 */
+function resolveTokens(config, env) {
+  env = env || process.env
+  const envToken = env.ZEN_GATEWAY_TOKEN
+  if (envToken !== undefined && envToken !== null && envToken !== "") return [envToken]
+  if (config && Array.isArray(config.tokens) && config.tokens.length > 0) return config.tokens
+  const fileToken = config && config.token
+  return typeof fileToken === "string" && fileToken ? [fileToken] : []
+}
+
+// 模块加载时固化当前套餐与 token 列表（变更走重启生效，不做热切换）
 const _GW_CFG = readGatewayConfig()
 const ACTIVE_PLAN = resolvePlan(_GW_CFG, process.env)
-const ACTIVE_TOKEN = resolveToken(_GW_CFG, process.env)
+const ACTIVE_TOKENS = resolveTokens(_GW_CFG, process.env)
+const ACTIVE_TOKEN = ACTIVE_TOKENS.length > 0 ? ACTIVE_TOKENS[0] : null
 
 // 由 ACTIVE_PLAN 派生既有常量（保持下游引用不变：upstreamOnce / refreshDynamicModels / mapModel / status 等）
 const UPSTREAM_BASE = ACTIVE_PLAN.upstreamBase
@@ -563,19 +607,21 @@ const MODEL_ALIAASES = {
   "gemini-2.5-pro": DEFAULT_MODEL,
 }
 
-// 别名表之上：运行时动态模型表（M3：启动/手动 refresh 从上游 /v1/models 拉取，合并进 mapModel 判定）
-let ZEN_MODELS_DYNAMIC = []
+// 别名表之上：运行时动态模型表（M3：启动/手动 refresh 从上游 /v1/models 拉取，合并进 mapModel 判定）。
+// go / zen 双套餐各自一张动态表——同一 opencode key 双端点通用（research §2.1），一次拉齐两档，
+// 供 Web「动态查看 go + zen 全部模型」（或任一档拉取失败只影响该档，其余不受影响）。
+// 请求路由判定用「当前套餐」的动态表（语义与旧单一表逐字节等价）。
+let DYNAMIC_GO = []
+let DYNAMIC_ZEN = []
+const dynamicFor = (planId) => (planId === "zen" ? DYNAMIC_ZEN : DYNAMIC_GO)
 
-/** 拉取上游模型清单并入动态表（失败/超时静默降级，不阻塞启动）。返回新增数量。 */
-async function refreshDynamicModels() {
+/** 拉取单套餐上游模型清单（失败/超时静默降级返回 null，该档动态表保持上次结果，不影响另一档）。 */
+async function fetchPlanModels(planId, key) {
   try {
-    const cfg = loadConfig()
-    const key = currentKey(cfg)
-    if (!key) return 0
     const ac = new AbortController()
     const timer = setTimeout(() => ac.abort(), 3000)
-    const r = await fetch(MODELS_API, {
-      headers: { authorization: `Bearer ${key.key}` },
+    const r = await fetch(`${PLANS[planId].upstreamBase}/models`, {
+      headers: { authorization: `Bearer ${key}`, "user-agent": UPSTREAM_UA },
       signal: ac.signal,
     })
     clearTimeout(timer)
@@ -583,25 +629,46 @@ async function refreshDynamicModels() {
     const j = await r.json()
     const list = Array.isArray(j?.data) ? j.data.map((m) => m?.id).filter(Boolean) : []
     if (list.length === 0) throw new Error("empty model list")
-    ZEN_MODELS_DYNAMIC = list
-    log(`✅  动态模型表更新：上游 ${list.length} 个模型（套餐=${ACTIVE_PLAN.id}，内置 ${ACTIVE_PLAN.builtinModels.length} 个兜底）`)
-    return list.length
+    return list
   } catch (e) {
-    log(`⚠️  模型表拉取失败，回退内置 ${ACTIVE_PLAN.builtinModels.length} 个（套餐=${ACTIVE_PLAN.id}）: ${e.message}`)
-    return 0
+    log(`⚠️  [${planId}] 模型表拉取失败（保留既有动态表/内置兜底）: ${e.message}`)
+    return null
   }
+}
+
+/** 拉取 go + zen 双套餐上游模型清单并入各自动态表。返回当前套餐动态表数量（与旧行为兼容）。 */
+async function refreshDynamicModels() {
+  const cfg = loadConfig()
+  const key = currentKey(cfg)
+  if (!key) return 0
+  const [goList, zenList] = await Promise.all([
+    fetchPlanModels("go", key.key),
+    fetchPlanModels("zen", key.key),
+  ])
+  if (goList) DYNAMIC_GO = goList
+  if (zenList) DYNAMIC_ZEN = zenList
+  log(
+    `✅  模型表更新：go 动态 ${DYNAMIC_GO.length} 个 / zen 动态 ${DYNAMIC_ZEN.length} 个` +
+      `（套餐=${ACTIVE_PLAN.id}，内置 go ${PLANS.go.builtinModels.length} / zen ${PLANS.zen.builtinModels.length} 兜底）`,
+  )
+  return dynamicFor(ACTIVE_PLAN.id).length
 }
 
 function mapModel(requested) {
   if (!requested) return ACTIVE_PLAN.defaultModel
   const r = String(requested).toLowerCase()
-  if (ZEN_MODELS_DYNAMIC.includes(r)) return r               // 动态表（上游最新）
+  if (dynamicFor(ACTIVE_PLAN.id).includes(r)) return r        // 动态表（当前套餐上游最新）
   if (ACTIVE_PLAN.builtinModels.includes(r)) return r        // 内置真实模型（当前套餐）
   const alias = MODEL_ALIAASES[r]
   if (alias) {
     // 别名目标必须属于当前套餐内置表；否则（如 zen 免费档命中付费别名）回退套餐默认
     if (ACTIVE_PLAN.builtinModels.includes(alias)) return alias
     return ACTIVE_PLAN.defaultModel
+  }
+  // 未知名 → 默认；若该模型存在于另一档动态表，提示（自适配排查：帮助理解"为什么模型被回退"）
+  const otherPlan = ACTIVE_PLAN.id === "zen" ? "go" : "zen"
+  if (dynamicFor(otherPlan).includes(r)) {
+    log(`⚠️  模型 "${requested}" 属于 ${otherPlan} 档，当前套餐 ${ACTIVE_PLAN.id} 不支持，已回退默认 ${ACTIVE_PLAN.defaultModel}`)
   }
   return ACTIVE_PLAN.defaultModel                             // 未知名 → 默认
 }
@@ -915,7 +982,7 @@ async function handleMessages(req, res) {
     const err = parseErrorBody(out.bodyText)
     return sendAnthropicError(res, upstream.status, (err.error && err.error.message) || err.message || "upstream error")
   }
-  const text = await upstream.text()
+  const text = out.bodyText || (await upstream.text())
   let openaiRes
   try { openaiRes = JSON.parse(text) } catch { return sendAnthropicError(res, 502, "bad upstream response") }
   return sendJson(res, 200, openAIToAnthropic(openaiRes, model))
@@ -950,7 +1017,7 @@ async function upstreamOnce(key, bodyStr, isStream, timeoutMs, clientSignal) {
     headers: {
       "content-type": "application/json",
       authorization: `Bearer ${key}`,
-      "user-agent": "zen-gateway",
+      "user-agent": UPSTREAM_UA,
     },
     body: bodyStr,
     signal: combineSignals(AbortSignal.timeout(timeoutMs), clientSignal),
@@ -1010,6 +1077,46 @@ async function safeSend(bodyObj, isStream, clientSignal, endpoint = "chat") {
   }
 }
 
+/**
+ * 推理模型截断判定（纯函数）：上游成功但 content 为空 + finish_reason=max_tokens（reasoning 占满预算，
+ * 如 hy3-free 配小 max_tokens）→ 返回放大后的 max_tokens；不满足返回 null。
+ * 放大策略 max(原×2, 4096)，上限 131072。
+ */
+function truncationRetryPlan(bodyText, bodyObj) {
+  if (process.env.ZEN_AUTO_MAX_TOKENS === "0") return null
+  let j = null
+  try {
+    j = JSON.parse(bodyText)
+  } catch {
+    return null
+  }
+  const c = j?.choices?.[0]
+  if (!c || c.finish_reason !== "max_tokens") return null
+  const content = c.message?.content
+  if (typeof content === "string" && content.length > 0) return null
+  const orig = Number(bodyObj.max_tokens)
+  const next = Math.min(Math.max(orig > 0 ? orig * 2 : 4096, 4096), 131072)
+  if (next === orig) return null
+  return next
+}
+
+/** 推理模型截断自适配（非流式）：判定成立时放大 max_tokens 重发一次，返回新 bodyText；失败返回 null。 */
+async function retryTruncatedContent(bodyText, bodyObj, mappedModel, key, timeoutMs, clientSignal) {
+  const next = truncationRetryPlan(bodyText, bodyObj)
+  if (next == null) return null
+  log(`⚠️  推理模型 content 截断（finish=max_tokens），自动放大至 ${next} 重试一次`)
+  const retry = await upstreamOnce(
+    key,
+    JSON.stringify({ ...bodyObj, model: mappedModel, max_tokens: next }),
+    false,
+    timeoutMs,
+    clientSignal,
+  )
+  if (retry.res.ok) return await retry.res.text()
+  log(`⚠️  截断重试仍失败（status=${retry.res.status}），透传原始响应`)
+  return null
+}
+
 async function sendWithRotation(bodyObj, isStream, clientSignal, endpoint = "chat") {
   usageStats.totalRequests++
   const key = currentKey(loadConfig())
@@ -1023,13 +1130,32 @@ async function sendWithRotation(bodyObj, isStream, clientSignal, endpoint = "cha
 
   // 第 1 次
   let { res, bodyText } = await upstreamOnce(key.key, bodyStr, isStream, timeoutMs, clientSignal)
-  if (res.ok || !isQuotaError(res.status, parseErrorBody(bodyText))) {
-    if (res.ok) usageInc(key.name, "success")
+  if (res.ok || !shouldRotateForError(res.status, parseErrorBody(bodyText))) {
+    if (res.ok) {
+      usageInc(key.name, "success")
+      if (!isStream) {
+        // 非流式：读取上游 body（供截断判定 + handler 透传；upstreamOnce 成功时 bodyText=""）
+        const full = await res.text()
+        const auto = await retryTruncatedContent(full, bodyObj, mappedModel, key.key, timeoutMs, clientSignal)
+        if (auto) {
+          log(`✅  截断重试成功（放大 max_tokens 后返回完整内容）`)
+          appendUsage({ key: key.name, ok: true, model: mappedModel, rotated: false, endpoint })
+          return { res: new Response(null, { status: 200 }), bodyText: auto, upstreamBody: auto, mappedModel }
+        }
+        if (full) bodyText = full
+      }
+    }
     appendUsage({ key: key.name, ok: res.ok, model: mappedModel, rotated: false, endpoint })
     return { res, bodyText, upstreamBody: bodyText, mappedModel }
   }
   // 配额错误 → 轮换 + 重试一次（冷却实际失败的 key，避免并发 401 误伤刚切过去的好 key）
   const errBody = parseErrorBody(bodyText)
+  if (ACTIVE_PLAN.id === "zen") {
+    // zen 免费档：同设备限流与账号无关，轮换无意义 → 不轮换不计数直接透传（rotate 内部同样有守卫，双保险）
+    log(`🚫  zen 免费档自动轮换已禁用（同设备 UA/频率限流与账号无关），透传上游错误 status=${res.status}（key="${key.name}"）`)
+    appendUsage({ key: key.name, ok: false, model: mappedModel, rotated: false, endpoint })
+    return { res, bodyText, upstreamBody: bodyText, mappedModel }
+  }
   log(`🔁  检测到配额/鉴权错误（status=${res.status}），触发轮换并重试一次`)
   usageStats.rotations++
   usageInc(key.name, "rotated")
@@ -1037,7 +1163,7 @@ async function sendWithRotation(bodyObj, isStream, clientSignal, endpoint = "cha
   const newKey = currentKey(cfg)
   if (newKey && newKey.name !== key.name) {
     const retry = await upstreamOnce(newKey.key, bodyStr, isStream, timeoutMs, clientSignal)
-    if (retry.res.ok || !isQuotaError(retry.res.status, parseErrorBody(retry.bodyText))) {
+    if (retry.res.ok || !shouldRotateForError(retry.res.status, parseErrorBody(retry.bodyText))) {
       if (retry.res.ok) usageInc(newKey.name, "success")
       appendUsage({ key: newKey.name, ok: retry.res.ok, model: mappedModel, rotated: true, endpoint })
       return { ...retry, mappedModel }
@@ -1054,12 +1180,16 @@ async function sendWithRotation(bodyObj, isStream, clientSignal, endpoint = "cha
 /* ---------------- HTTP 服务 ---------------- */
 
 function gatewayAuth(req) {
-  const token = ACTIVE_TOKEN
-  if (!token) return true
+  const tokens = ACTIVE_TOKENS
+  if (!tokens || tokens.length === 0) return true
   const h = req.headers.authorization || ""
-  if (h === `Bearer ${token}`) return true
-  // claude code 会发 x-api-key（ANTHROPIC_API_KEY）。设 token 时接受 x-api-key 等于 token。
-  return req.headers["x-api-key"] === token
+  if (h.startsWith("Bearer ")) {
+    const bearer = h.slice(7)
+    if (tokens.includes(bearer)) return true
+  }
+  // claude code 会发 x-api-key（ANTHROPIC_API_KEY）。设 token 时接受 x-api-key 等于任一 token。
+  const xk = req.headers["x-api-key"]
+  return typeof xk === "string" && tokens.includes(xk)
 }
 
 /** 掩码 token 用于日志/启动输出（绝不打印明文） */
@@ -1153,13 +1283,13 @@ async function handleChatCompletions(req, res) {
     // 上游非 2xx（重试后仍失败）：返回错误 JSON
     return sendJson(res, upstream.status, parseErrorBody(out.bodyText))
   }
-  // 非流式：透传上游 JSON（含 usage / choices）
+  // 非流式：透传上游 JSON（含 usage / choices）；body 已由 sendWithRotation 读取（截断自适配），优先用 out.bodyText
   // 错误路径：body 已被 upstreamOnce 消费，直接返回错误（不能再 .text()）
   if (!upstream.ok) {
     const err = parseErrorBody(out.bodyText)
     return sendJson(res, upstream.status, err.error && err.error.message ? err : { error: { message: String(out.bodyText).slice(0, 300) } })
   }
-  const text = await upstream.text()
+  const text = out.bodyText || (await upstream.text())
   let bodyText = text
   try {
     const parsed = JSON.parse(text)
@@ -1603,7 +1733,7 @@ async function handleResponsesBody(res, bodyObj) {
     const err = parseErrorBody(out.bodyText)
     return sendResponsesError(res, upstream.status, err, (err.error && err.error.message) || err.message || "upstream error")
   }
-  const text = await upstream.text()
+  const text = out.bodyText || (await upstream.text())
   let openaiRes
   try { openaiRes = JSON.parse(text) } catch { return sendResponsesError(res, 502, null, "bad upstream response") }
   return sendJson(res, 200, openAIToResponse(openaiRes, mappedModel, requestedModel))
@@ -1618,7 +1748,7 @@ async function handleResponses(req, res) {
 }
 
 const allModelIds = () =>
-  [...new Set([...ZEN_MODELS_DYNAMIC, ...ACTIVE_PLAN.builtinModels])].sort()
+  [...new Set([...dynamicFor(ACTIVE_PLAN.id), ...ACTIVE_PLAN.builtinModels])].sort()
 
 const handleModels = (res) =>
   sendJson(res, 200, {
@@ -1633,7 +1763,14 @@ const handleModels = (res) =>
 
 const handleModelsRefresh = async (res) => {
   const n = await refreshDynamicModels()
-  return sendJson(res, 200, { ok: true, dynamic: ZEN_MODELS_DYNAMIC.length, builtin: ACTIVE_PLAN.builtinModels.length, added: n })
+  return sendJson(res, 200, {
+    ok: true,
+    dynamic: dynamicFor(ACTIVE_PLAN.id).length,
+    builtin: ACTIVE_PLAN.builtinModels.length,
+    added: n,
+    go: DYNAMIC_GO.length,
+    zen: DYNAMIC_ZEN.length,
+  })
 }
 
 const handleUsage = (res) => {
@@ -1851,7 +1988,8 @@ function gatewayStatusSummary(cfg, opts = {}) {
     port: opts.port ?? PORT,
     plan: ACTIVE_PLAN.id,
     defaultModel: ACTIVE_PLAN.defaultModel,
-    authEnabled: !!ACTIVE_TOKEN,
+    authEnabled: ACTIVE_TOKENS.length > 0,
+    tokenCount: ACTIVE_TOKENS.length,
     modelCount: ACTIVE_PLAN.builtinModels.length,
     keys: Array.isArray(cfg?.keys) ? cfg.keys.length : 0,
     current: cfg?.current_gateway ?? cfg?.current ?? "",
@@ -1861,9 +1999,25 @@ function gatewayStatusSummary(cfg, opts = {}) {
   }
 }
 
-/** GET /api/gateway/models 响应组装：内置模型（当前套餐）+ 别名映射（拷贝引用，防调用方污染模块常量）。 */
+/** 模型 ID 排序去重合并（动态 ∪ 内置）。 */
+function sortedModelUnion(dyn, built) {
+  return [
+    ...new Set([...(Array.isArray(dyn) ? dyn : []), ...(Array.isArray(built) ? built : [])]),
+  ].sort()
+}
+
+/** GET /api/gateway/models 响应组装：go + zen 双套餐模型（各自动态 ∪ 内置）+ 别名映射（拷贝，防污染模块常量）。
+ *  models 字段保持向后兼容 = 当前套餐合并清单（旧客户端不破坏）；plans 为新增双套餐明细（Web 动态查看用）。 */
 function gatewayModelsSummary() {
-  return { models: [...ACTIVE_PLAN.builtinModels], aliases: { ...MODEL_ALIAASES } }
+  return {
+    active: ACTIVE_PLAN.id,
+    models: sortedModelUnion(dynamicFor(ACTIVE_PLAN.id), ACTIVE_PLAN.builtinModels),
+    aliases: { ...MODEL_ALIAASES },
+    plans: {
+      go: { id: "go", dynamic: [...DYNAMIC_GO], builtin: [...ZEN_MODELS], models: sortedModelUnion(DYNAMIC_GO, ZEN_MODELS) },
+      zen: { id: "zen", dynamic: [...DYNAMIC_ZEN], builtin: [...ZEN_MODELS_ZEN], models: sortedModelUnion(DYNAMIC_ZEN, ZEN_MODELS_ZEN) },
+    },
+  }
 }
 
 /** GET /api/gateway/config 响应组装：只读配置摘要。keys 仅含 name/cooldown_until_gateway（网关域冷却，与 current 域一致；绝不含 key 明文）。
@@ -1964,21 +2118,37 @@ function readUsageFile(filePath) {
   }
 }
 
-// 测试钩子：重置运行时动态模型表（mapModel 依赖的模块顶层 let，仅测试用）
-const __setDynamicModels = (list) => {
-  ZEN_MODELS_DYNAMIC = Array.isArray(list) ? list : []
+// 测试钩子：重置运行时动态模型表（mapModel / allModelIds 依赖的模块顶层 let，仅测试用）。
+// planId 缺省 = 同时设置两套餐（沿用旧语义）；指定 "go"/"zen" 只设置该套餐（测双档差异化）。
+const __setDynamicModels = (list, planId = null) => {
+  const l = Array.isArray(list) ? list : []
+  if (planId === "go") {
+    DYNAMIC_GO = l
+    return
+  }
+  if (planId === "zen") {
+    DYNAMIC_ZEN = l
+    return
+  }
+  DYNAMIC_GO = l
+  DYNAMIC_ZEN = l
 }
 
 export {
   parseResetTime,
   isQuotaStatus,
   isQuotaError,
+  shouldRotateForError,
+  resolveUpstreamUA,
+  truncationRetryPlan,
   classifyGoError,
   mapModel,
   pickNext,
   currentKey,
   cooldownUntilDefault,
   maskToken,
+  resolveTokens,
+  gatewayAuth,
   parseErrorBody,
   combineSignals,
   anthropicToOpenAI,
@@ -2000,6 +2170,10 @@ export {
   gatewayStatusSummary,
   gatewayConfigSummary,
   gatewayModelsSummary,
+  sortedModelUnion,
+  dynamicFor,
+  DYNAMIC_GO,
+  DYNAMIC_ZEN,
   loadConfig,
   readRawConfig,
   readGatewayConfig,

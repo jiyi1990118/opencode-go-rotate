@@ -10,3 +10,8 @@ Thumbs.db
 # python
 __pycache__/
 *.pyc
+
+# tooling / local
+.codegraph/
+.tapd-images/
+*.log
