@@ -26,6 +26,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import time
@@ -34,13 +35,32 @@ from datetime import datetime, timedelta, timezone
 DATA_DIR = os.path.join(os.path.expanduser("~"), ".config", "opencode")
 CONFIG_FILE = os.path.join(DATA_DIR, "go-keys.json")
 AUTH_FILE = os.path.join(os.path.expanduser("~"), ".local", "share", "opencode", "auth.json")
-LOG_FILE = "/tmp/opencode-go-rotate.log"
+LOG_FILE = os.environ.get("GOROTATE_LOG_FILE") or os.path.join(
+    (os.environ.get("TEMP") if os.name == "nt" else "/tmp"), "opencode-go-rotate.log")
 DEFAULT_COOLDOWN_MIN = 300
 
-# zen-gateway 服务（launchd LaunchAgent）路径与端口（与 zen-gateway 管理脚本语义一致）
+# zen-gateway 服务（跨平台）路径与端口（与 zen-gateway 管理脚本语义一致）：
+#   macOS → launchd LaunchAgent（~/Library/LaunchAgents）
+#   Linux → systemd --user unit（~/.config/systemd/user/zen-gateway.service）
+#   Windows → 计划任务 schtasks（任务名 = GATEWAY_LABEL，执行 zen-gateway.cmd 包装脚本）
 GATEWAY_LABEL = "com.go-rotate.zen-gateway"
-GATEWAY_PLIST = os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents", GATEWAY_LABEL + ".plist")
-GATEWAY_LOG = os.path.join(os.path.expanduser("~"), "Library", "Logs", "zen-gateway.log")
+IS_WINDOWS = os.name == "nt"
+GATEWAY_DIR = os.path.join(os.path.expanduser("~"), ".local", "share", "zen-gateway")
+if sys.platform == "darwin":
+    GATEWAY_PLIST = os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents", GATEWAY_LABEL + ".plist")
+    GATEWAY_UNIT = None
+    GATEWAY_LOG = os.path.join(os.path.expanduser("~"), "Library", "Logs", "zen-gateway.log")
+    GATEWAY_WRAPPER = None
+elif IS_WINDOWS:
+    GATEWAY_PLIST = None
+    GATEWAY_UNIT = None
+    GATEWAY_LOG = os.path.join(GATEWAY_DIR, "logs", "gateway.log")
+    GATEWAY_WRAPPER = os.path.join(GATEWAY_DIR, "zen-gateway.cmd")
+else:  # Linux 及其它
+    GATEWAY_PLIST = None
+    GATEWAY_UNIT = os.path.join(os.path.expanduser("~"), ".config", "systemd", "user", "zen-gateway.service")
+    GATEWAY_LOG = os.path.join(GATEWAY_DIR, "logs", "gateway.log")
+    GATEWAY_WRAPPER = None
 try:
     GATEWAY_PORT = int(os.environ.get("ZEN_GATEWAY_PORT") or "18888")
 except ValueError:
@@ -634,6 +654,28 @@ def _launchctl(args):
         return -1, "", str(e)
 
 
+def _systemctl_user(args):
+    """执行 systemctl --user 命令，返回 (returncode, stdout, stderr)。异常容错。"""
+    try:
+        p = subprocess.run(["systemctl", "--user"] + list(args), capture_output=True, text=True, timeout=10)
+        return p.returncode, p.stdout, p.stderr
+    except FileNotFoundError:
+        return -1, "", "systemctl not found"
+    except Exception as e:
+        return -1, "", str(e)
+
+
+def _schtasks(args):
+    """执行 Windows schtasks 命令，返回 (returncode, stdout, stderr)。异常容错。"""
+    try:
+        p = subprocess.run(["schtasks"] + list(args), capture_output=True, text=True, timeout=10)
+        return p.returncode, p.stdout, p.stderr
+    except FileNotFoundError:
+        return -1, "", "schtasks not found"
+    except Exception as e:
+        return -1, "", str(e)
+
+
 def _gateway_healthz():
     """探测网关 /healthz（2s 超时），返回 (ok, info)。网关没装/没跑不报错。"""
     import urllib.request
@@ -647,29 +689,74 @@ def _gateway_healthz():
         return False, {}
 
 
+# ---- 平台探测：默认按系统判断；测试可覆写 GATEWAY_PLATFORM_OVERRIDE（"windows"|"darwin"|"linux"）----
+GATEWAY_PLATFORM_OVERRIDE = None  # 仅供测试（跨平台分发用例），生产不设置
+
+
+def _gw_platform():
+    if GATEWAY_PLATFORM_OVERRIDE:
+        return GATEWAY_PLATFORM_OVERRIDE
+    if os.name == "nt":
+        return "windows"
+    if sys.platform == "darwin":
+        return "darwin"
+    return "linux"
+
+
 def _gateway_loaded():
-    """launchctl print 成功 = LaunchAgent 已加载（返回非 0 = 未加载）。"""
-    rc, _, _ = _launchctl(["print", f"gui/{os.getuid()}/{GATEWAY_LABEL}"])
-    return rc == 0
+    """服务是否已注册/加载（按平台分发）。launchctl print → 系统已加载；systemd --user 查 unit；Windows schtasks /Query 查任务。"""
+    p = _gw_platform()
+    if p == "windows":
+        rc, _, _ = _schtasks(["/Query", "/TN", GATEWAY_LABEL])
+        return rc == 0
+    if p == "darwin":
+        rc, _, _ = _launchctl(["print", f"gui/{os.getuid()}/{GATEWAY_LABEL}"])
+        return rc == 0
+    # Linux：unit 文件存在即视为已注册（systemd --user 未必可用首查文件）
+    return os.path.exists(GATEWAY_UNIT)
 
 
 def _gateway_boot():
-    """加载 LaunchAgent：优先新版 bootstrap，回退旧版 load（幂等）。"""
-    rc, _, _ = _launchctl(["bootstrap", f"gui/{os.getuid()}", GATEWAY_PLIST])
-    if rc == 0:
+    """注册并启动服务（按平台分发，幂等）。"""
+    p = _gw_platform()
+    if p == "windows":
+        if not _gateway_loaded():
+            # 计划任务：登录时自启 + 立即运行；执行 zen-gateway.cmd 包装脚本（install.ps1 生成，设置 env 后启动 node gateway.mjs）
+            _schtasks([
+                "/Create", "/F", "/TN", GATEWAY_LABEL,
+                "/TR", f'"{GATEWAY_WRAPPER}"',
+                "/SC", "ONLOGON", "/RU", os.environ.get("USERNAME", ""),
+            ])
+            rc, _, _ = _schtasks(["/Run", "/TN", GATEWAY_LABEL])
+            return rc == 0
         return True
-    rc, _, _ = _launchctl(["load", GATEWAY_PLIST])
+    if p == "darwin":
+        rc, _, _ = _launchctl(["bootstrap", f"gui/{os.getuid()}", GATEWAY_PLIST])
+        if rc == 0:
+            return True
+        rc, _, _ = _launchctl(["load", GATEWAY_PLIST])
+        return rc == 0
+    _systemctl_user(["daemon-reload"])
+    rc, _, _ = _systemctl_user(["enable", "--now", "zen-gateway.service"])
     return rc == 0
 
 
 def _gateway_bootout():
-    """卸载 LaunchAgent：优先 bootout label，回退 bootout plist / unload（幂等）。"""
-    rc, _, _ = _launchctl(["bootout", f"gui/{os.getuid()}/{GATEWAY_LABEL}"])
-    if rc == 0:
-        return True
-    _launchctl(["bootout", f"gui/{os.getuid()}", GATEWAY_PLIST])
-    _launchctl(["unload", GATEWAY_PLIST])
-    return False
+    """停止并注销服务（按平台分发，幂等）。"""
+    p = _gw_platform()
+    if p == "windows":
+        _schtasks(["/End", "/TN", GATEWAY_LABEL])
+        rc, _, _ = _schtasks(["/Delete", "/F", "/TN", GATEWAY_LABEL])
+        return rc == 0
+    if p == "darwin":
+        rc, _, _ = _launchctl(["bootout", f"gui/{os.getuid()}/{GATEWAY_LABEL}"])
+        if rc == 0:
+            return True
+        _launchctl(["bootout", f"gui/{os.getuid()}", GATEWAY_PLIST])
+        _launchctl(["unload", GATEWAY_PLIST])
+        return False
+    _systemctl_user(["disable", "--now", "zen-gateway.service"])
+    return True
 
 
 def _gateway_key_count():
@@ -691,10 +778,20 @@ def _gateway_wait_health(timeout_sec=15):
     return False
 
 
+def _gateway_marker():
+    """平台服务注册标记：macOS plist 文件 / Linux unit 文件 / Windows zen-gateway.cmd 包装脚本。"""
+    if _gw_platform() == "windows":
+        return GATEWAY_WRAPPER
+    if _gw_platform() == "darwin":
+        return GATEWAY_PLIST
+    return GATEWAY_UNIT
+
+
 def _gateway_start():
-    """幂等启动：plist 不存在报错；已加载则跳过（健康失败给警告）；否则 bootstrap + 健康等待。"""
-    if not os.path.exists(GATEWAY_PLIST):
-        sys.exit(f"未安装服务（找不到 {GATEWAY_PLIST} ）。\n请先: bash install.sh zen-gateway")
+    """幂等启动：服务未安装报错；已加载则跳过（健康失败给警告）；否则注册 + 健康等待。"""
+    marker = _gateway_marker()
+    if marker is None or not os.path.exists(marker):
+        sys.exit(f"未安装服务（找不到 {marker} ）。\n请先运行安装（macOS/Linux: bash install.sh zen-gateway；Windows: 见 docs/部署指南-独立机器.md）")
     if _gateway_loaded():
         if _gateway_healthz()[0]:
             print(f"✅ 已在运行（{GATEWAY_LABEL}，端口 {GATEWAY_PORT}）")

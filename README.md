@@ -41,13 +41,16 @@ curl -fsSL https://raw.githubusercontent.com/jiyi1990118/opencode-go-rotate/main
 
 ### 独立服务器安装（无 opencode，zen 免费网关）
 
-**不需要安装 opencode**，仅需 Node.js ≥ 18。一键安装 zen-gateway 并注册为常驻服务：
+**不需要安装 opencode**，仅需 Node.js ≥ 18。一键安装 zen-gateway 并注册为常驻服务。跨平台：Linux（systemd --user）/ macOS（launchd）/ Windows（计划任务 schtasks）。
 
 ```bash
+# macOS / Linux
 curl -fsSL https://raw.githubusercontent.com/jiyi1990118/opencode-go-rotate/main/install.sh | bash -s -- zen-gateway
+# Windows（PowerShell）—— 仅网关：加 -GatewayOnly 跳过 opencode 插件/CLI
+powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-自动完成：拷贝 `gateway.mjs` → 创建默认 `go-keys.json` + `gateway-config.json` → 注册常驻服务（macOS launchd / Linux systemd --user）→ 开机自启 + 崩溃自动重启。安装后：
+自动完成：拷贝 `gateway.mjs` → 创建默认 `go-keys.json` + `gateway-config.json` → 注册常驻服务 → 开机自启 + 崩溃自动重启。安装后：
 
 ```bash
 zen-gateway status          # 查看状态（running）
@@ -57,7 +60,9 @@ zen-gateway restart         # 生效
 curl http://127.0.0.1:18888/v1/models   # 验证
 ```
 
-> 完整手册（系统要求 / systemd unit / 客户端接入 / FAQ）：[`docs/部署指南-独立机器.md`](docs/部署指南-独立机器.md)。
+Windows 用 `go-rotate gateway start/stop/restart/status/logs` 装好后管理（等价 `zen-gateway` 命令）；`zen-gateway` 命令由 install.ps1 通过计划任务管理。
+
+> 完整手册（systemd / launchd / **Windows 计划任务** / 客户端接入 / FAQ）：[`docs/部署指南-独立机器.md`](docs/部署指南-独立机器.md)。
 
 ### 手动安装
 
@@ -149,7 +154,7 @@ go-rotate status            # 查看状态
 | `go-rotate go next [分钟]` | **go 套餐域**轮换（原 go current 进 go 域冷却 + 选下一个未冷却写 `current_go`） |
 | `go-rotate go cooldown <name> [分钟\|clear]` | 写/清 **go 套餐域**冷却（写 `cooldown_until_go`，缺省窗口与字段级语义一致） |
 | `go-rotate stats` | 从日志统计每 key 轮换/冷却次数（近期） |
-| `go-rotate gateway {start\|stop\|restart\|status\|logs [n]}` | 管理 zen-gateway 服务（macOS launchd / Linux systemd --user，端口 18888） |
+| `go-rotate gateway {start\|stop\|restart\|status\|logs [n]}` | 管理 zen-gateway 服务（macOS launchd / Linux systemd --user / Windows 计划任务，端口 18888） |
 | `go-rotate gateway plan [go\|zen]` | 查看/切换网关套餐（Go 订阅 / Zen 免费档，切换后需 restart） |
 | `go-rotate gateway token [gen\|clear\|set <v>]` | 管理网关访问 token（供其它 agent 连接鉴权，只显示掩码） |
 | `go-rotate gateway set <name>` | 网关域设为当前 key（不写 auth.json，不影响 TUI） |

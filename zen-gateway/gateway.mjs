@@ -62,7 +62,9 @@ const CONFIG_FILE = process.env.ZEN_CONFIG || path.join(DATA_DIR, "go-keys.json"
 const AUTH_FILE =
   process.env.ZEN_AUTH_FILE || path.join(os.homedir(), ".local", "share", "opencode", "auth.json")
 const LOCK_FILE = CONFIG_FILE + ".lock"
-const LOG_FILE = process.env.ZEN_LOG_FILE || "/tmp/opencode-go-rotate.log"
+const LOG_FILE =
+  process.env.ZEN_LOG_FILE ||
+  path.join(process.platform === "win32" ? os.tmpdir() : "/tmp", "opencode-go-rotate.log")
 // 网关配置（套餐 + token）：默认 ~/.local/share/zen-gateway/gateway-config.json，ZEN_GATEWAY_CONFIG env 覆盖。
 // 与 USAGE_FILE 同族（.local 数据目录）；优先级 env(ZEN_*) > 文件(plan/token) > 内置默认(go)。见下方 resolvePlan/resolveToken。
 const GATEWAY_CONFIG =

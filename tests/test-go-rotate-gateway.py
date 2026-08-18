@@ -97,7 +97,8 @@ class _InProc:
     """进程内加载 go-rotate 模块（用于 monkeypatch 用例）。"""
     g = None
     originals = None
-    MONKEYPATCHED = ("_launchctl", "_gateway_healthz", "_gateway_wait_health", "GATEWAY_PORT")
+    MONKEYPATCHED = ("_launchctl", "_gateway_healthz", "_gateway_wait_health", "GATEWAY_PORT",
+                     "_schtasks", "_systemctl_user")
 
     @classmethod
     def load(cls):
@@ -131,6 +132,11 @@ def inproc(home):
     g.AUTH_FILE = os.path.join(home, ".local", "share", "opencode", "auth.json")
     g.GATEWAY_PLIST = os.path.join(home, "Library", "LaunchAgents", g.GATEWAY_LABEL + ".plist")
     g.GATEWAY_LOG = os.path.join(home, "Library", "Logs", "zen-gateway.log")
+    # 平台分发/路径全局复位为 darwin（宿主）语义，防跨平台用例 pollution 污染其它类（unittest 按类名字母序执行）
+    g.IS_WINDOWS = os.name == "nt"
+    g.GATEWAY_PLATFORM_OVERRIDE = None
+    g.GATEWAY_UNIT = None
+    g.GATEWAY_WRAPPER = None
     g.GATEWAY_PORT = 18888
     return g
 
@@ -511,6 +517,123 @@ class TestGatewayStatusLine(GwCase):
         self.assertIn('if sub in ("start", "stop", "restart", "set", "next", "cooldown"):', src)
         self.assertIn("_with_lock(lambda: do_gateway(sub, args[2:]))", src)
         self.assertIn("do_gateway(sub, args[2:])", src)
+
+
+# ---------- 4. 跨平台服务后端分发（Windows schtasks / Linux systemd --user，monkeypatch 假命令） ----------
+
+class TestGatewayCrossPlatform(GwCase):
+    """monkeypatch _schtasks/_systemctl_user + GATEWAY_PLATFORM_OVERRIDE，
+    验证 loaded/boot/bootout 在 Windows 与 Linux 的分发路径（macOS 分支由既有用例覆盖）。"""
+
+    def setUp(self):
+        super().setUp()
+        self.g = inproc(self.home)
+        # inproc 复位后置空 override；此处按用例设置
+        self.g.GATEWAY_PLATFORM_OVERRIDE = None
+
+    def fake_schtasks(self, ops, query_found=True, op_rc=0):
+        """假 schtasks：记录调用；/Query 返回 query_found 决定 is-loaded；其余按 op_rc。"""
+        state = {"found": query_found}
+        def f(args):
+            ops.append(args)
+            if "/Query" in args:
+                return (0 if state["found"] else 1), "", ""
+            if "/Create" in args:
+                state["found"] = True
+            if "/Delete" in args:
+                state["found"] = False
+            return op_rc, "", ""
+        self.g._schtasks = f
+        self.g.GATEWAY_PLATFORM_OVERRIDE = "windows"
+        return state
+
+    def fake_systemctl(self, ops, enable_rc=0):
+        def f(args):
+            ops.append(args)
+            if args[0] == "enable":
+                return enable_rc, "", ""
+            return 0, "", ""
+        self.g._systemctl_user = f
+        self.g.GATEWAY_PLATFORM_OVERRIDE = "linux"
+        return ops
+
+    # ---- Windows ----
+    def test_windows_loaded_未注册(self):
+        make_gateway_log(self.home, 3)
+        ops = []
+        self.fake_schtasks(ops, query_found=False)
+        self.assertFalse(self.g._gateway_loaded())
+        self.assertTrue(any("/Query" in o for o in ops))
+
+    def test_windows_loaded_已注册(self):
+        ops = []
+        self.fake_schtasks(ops, query_found=True)
+        self.assertTrue(self.g._gateway_loaded())
+
+    def test_windows_boot_创建计划任务并运行(self):
+        """未注册 → /Create (ONLOGON) + /Run；已注册 → 直接 True 不重复创建"""
+        ops = []
+        self.fake_schtasks(ops, query_found=False)
+        self.g.GATEWAY_WRAPPER = os.path.join(self.home, "zen-gateway.cmd")
+        self.assertTrue(self.g._gateway_boot())
+        creates = [o for o in ops if "/Create" in o]
+        self.assertEqual(len(creates), 1)
+        self.assertIn("ONLOGON", creates[0])
+        self.assertTrue(any("/Run" in o for o in ops))
+        # 已注册直接 True 且不重复 Create
+        before = len([o for o in ops if "/Create" in o])
+        self.assertTrue(self.g._gateway_boot())
+        self.assertEqual(len([o for o in ops if "/Create" in o]), before)
+
+    def test_windows_bootout_end并删除任务(self):
+        ops = []
+        self.fake_schtasks(ops, query_found=True)
+        self.g._gateway_bootout()
+        self.assertTrue(any("/End" in o for o in ops))
+        self.assertTrue(any("/Delete" in o for o in ops))
+
+    def test_windows_marker_指向zen_gateway_cmd(self):
+        self.fake_schtasks([], query_found=True)
+        self.g.GATEWAY_WRAPPER = os.path.join(self.home, "zen-gateway.cmd")
+        self.assertEqual(self.g._gateway_marker(), self.g.GATEWAY_WRAPPER)
+
+    def test_windows_start_未安装包装脚本报错(self):
+        """Windows 无 zen-gateway.cmd → start 报「未安装服务」"""
+        self.fake_schtasks([], query_found=False)
+        with self.assertRaises(SystemExit) as cm:
+            self.g._gateway_start()
+        self.assertIn("未安装服务", str(cm.exception))
+
+    # ---- Linux ----
+    def test_linux_loaded_unit文件不存在为未注册(self):
+        make_gateway_log(self.home, 3)
+        ops = []
+        self.fake_systemctl(ops)
+        self.g.GATEWAY_UNIT = os.path.join(self.home, "zen-gateway.service")
+        self.assertFalse(self.g._gateway_loaded())  # 文件不存在 → False
+
+    def test_linux_loaded_unit存在于已注册(self):
+        unit = os.path.join(self.home, "zen-gateway.service")
+        self.g.GATEWAY_UNIT = unit
+        open(unit, "w").close()  # 或写入 unit；空文件仅表示存在
+        self.fake_systemctl([])
+        self.assertTrue(self.g._gateway_loaded())
+
+    def test_linux_boot_enable现在(self):
+        make_gateway_log(self.home, 3)
+        ops = []
+        self.fake_systemctl(ops)
+        unit = os.path.join(self.home, "zen-gateway.service")
+        open(unit, "w").close()
+        self.assertTrue(self.g._gateway_boot())
+        self.assertIn(["enable", "--now", "zen-gateway.service"], [o for o in ops])
+
+    def test_linux_bootout_disable现在(self):
+        make_gateway_log(self.home, 3)
+        ops = []
+        self.fake_systemctl(ops)
+        self.g._gateway_bootout()
+        self.assertIn(["disable", "--now", "zen-gateway.service"], ops)
 
 
 if __name__ == "__main__":
