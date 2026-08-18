@@ -1104,6 +1104,23 @@ describe("网关配置路由（/api/gateway/plans + /api/gateway/config）", () 
     const g3 = await (await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/config"))).json()
     expect(g3.ipRotation).toBe(true)
     expect(g3.egressEnabled).toBe(true) // 开关开 + ≥2 → 启用
+    // bulk-add：批量加入 + 去重（合法/已存在/非法混入）
+    const ba = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", {
+        method: "POST",
+        body: JSON.stringify({
+          action: "bulk-add",
+          urls: ["socks5://1.1.1.1:1080", "socks5://2.2.2.2:1080", "socks5://1.1.1.1:1080", "http://bad:80", "socks5://3.3.3.3:443"],
+        }),
+      }),
+    )
+    const baj = await ba.json()
+    expect(baj.ok).toBe(true)
+    expect(baj.added).toEqual(["socks5://1.1.1.1:1080", "socks5://2.2.2.2:1080", "socks5://3.3.3.3:443"]) // 重复已去掉
+    expect(baj.skipped.map((s: any) => s.reason)).toContain("已在 IP 池") // 池中已存在标记（1.1.1.1 上轮已加）
+    expect(baj.skipped.map((s: any) => s.reason)).toContain("格式非法") // http://bad 拒绝
+    expect(mod.readGatewayConfig().egress).toContain("socks5://2.2.2.2:1080")
+    expect(mod.readGatewayConfig().egress.filter((u) => u === "socks5://1.1.1.1:1080").length).toBe(1) // 无重复
     // 未知 action → 400
     const unk = await mod.handleWeb(
       new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "boom" }) }),
@@ -1219,10 +1236,20 @@ describe("WEB_HTML 网关管理区块（主导航 + 套餐卡 + Token 卡）", (
     expect(html).toContain('onclick="fetchFreeProxies()"')
     expect(html).toContain("async function fetchFreeProxies()")
     expect(html).toContain("function renderProxyList(")
-    expect(html).toContain("async function addProxyToPool(")
+    expect(html).toContain("async function addSelectedProxies(")
+    expect(html).toContain("function toggleProxyAll(")
+    expect(html).toContain("function clearProxySel(")
     expect(html).toContain('api("/api/gateway/proxies/fetch", { limit:')
-    expect(html).toContain('api("/api/gateway/egress", { action: "add", url: c.url })')
+    expect(html).toContain('api("/api/gateway/egress", { action: "bulk-add", urls')
+    expect(html).toContain('id="proxy-selcount"')
+    expect(html).toContain('id="proxy-toolbar"')
+    expect(html).toContain('class="proxy-grid')
+    expect(html).toContain('class="proxy-item')
     expect(html).toContain("加入 IP 池")
+    expect(html).toContain("添加选中")
+    expect(html).toContain("全选有效")
+    expect(html).toContain("池中") // 去重标记
+    expect(html).toContain("自动勾选可添加项")
     // 空态提示
     expect(html).toContain("未拉取。点「拉取免费代理」")
     // 连通 ≠ 可用的引导提示

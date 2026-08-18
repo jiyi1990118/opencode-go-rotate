@@ -1441,7 +1441,26 @@ if (action === "clear") {
               writeGatewayConfig({ ip_rotation: !on })
               return { ok: true, ipRotation: !on, egress: list(), needsRestart: false }
             }
-            throw new Error(`未知 action: ${action || "(空)"}（支持 add/del/clear/set/toggle）`)
+            if (action === "bulk-add") {
+              // 批量加入 + 去重：一次写锁加入多个出口，已存在/非法项跳过并报告。
+              // 淘源卡「添加选中」走这里（避免 N 次单条写锁）。
+              const raw = Array.isArray(body.urls) ? body.urls.map((x: unknown) => String(x)) : []
+              if (raw.length === 0) throw new Error("urls 不能为空")
+              const cfg = readGatewayConfig()
+              const add = []
+              const skipped: { url: string; reason: string }[] = []
+              const seen = new Set(cfg.egress)
+              for (const u of raw) {
+                const e = validateEgressItem(u)
+                if (!e) { skipped.push({ url: u, reason: "格式非法" }); continue }
+                if (seen.has(e)) { skipped.push({ url: e, reason: "已在 IP 池" }); continue }
+                seen.add(e)
+                add.push(e)
+              }
+              if (add.length > 0) writeGatewayConfig({ egress: [...cfg.egress, ...add] })
+              return { ok: true, added: add, skipped, egress: list(), needsRestart: true }
+            }
+            throw new Error(`未知 action: ${action || "(空)"}（支持 add/del/clear/set/toggle/bulk-add）`)
           }
          return null
       }
@@ -1744,6 +1763,26 @@ try {
   .log-row > .card, .gw-config-grid > .card { min-width: 0; }
   .log-row pre { max-width: 100%; }
   .gr-tip { cursor: help; border-bottom: 1px dotted var(--tx-3); }
+
+  /* 免费代理淘源：多列网格紧凑布局 + 勾选项 */
+  .proxy-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .proxy-toolbar .hint { flex: 1; min-width: 140px; }
+  .proxy-grid { margin-top: 10px; display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 6px; }
+  .proxy-item {
+    display: flex; align-items: center; gap: 7px; padding: 5px 8px;
+    border: 1px solid var(--bd-2); border-radius: var(--r-sm); background: var(--bg-1);
+    min-width: 0;
+  }
+  .proxy-item:hover { border-color: var(--primary); }
+  .proxy-item input[type="checkbox"] { flex: none; accent-color: var(--primary); }
+  .proxy-item .pm-proto { flex: none; font-size: 10px; color: var(--tx-3); }
+  .proxy-item code { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .proxy-item .pm-ms { flex: none; font-size: 11px; color: var(--tx-3); }
+  .proxy-item .pm-err { flex: 1; min-width: 0; font-size: 10px; color: var(--tx-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .proxy-item.off { opacity: 0.55; }
+  .proxy-item.off input[type="checkbox"] { pointer-events: none; }
+  .proxy-item.inpool { opacity: 0.45; }
+  .proxy-item.inpool input[type="checkbox"] { pointer-events: none; }
 
   /* 页头：标题区 + 右上角主题切换（参考常见站点右上角白天/黑夜切换） */
   .page-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
@@ -2138,10 +2177,16 @@ try {
     <b>免费代理（批量淘源） <span id="proxy-badge"></span></b>
     <div class="row" style="margin-top:10px">
       <button class="primary" id="proxy-fetch-btn" onclick="fetchFreeProxies()">拉取免费代理</button>
-      <span class="muted" style="margin-left:8px;flex:1">拉取后逐个做 SOCKS5 连通验证（opencode.ai:443），可直接选出加入 IP 池。</span>
+      <span class="muted" style="margin-left:8px;flex:1">拉取后逐个做 SOCKS5 连通验证（opencode.ai:443），勾选有效项后一键加入 IP 池。</span>
     </div>
-    <div id="proxy-list" class="muted" style="margin-top:10px">未拉取。点「拉取免费代理」联网淘一批可用 SOCKS5 出口。</div>
-    <div class="muted" style="margin-top:6px">提示：连通 ≠ 可绕过限流——免费数据中心 IP 大多被 opencode.ai 限（429，分时段）。选几个加入池后点「检查出口」看真实状态。</div>
+    <div class="proxy-toolbar" id="proxy-toolbar" style="display:none">
+      <button class="small" id="proxy-toggleall-btn" onclick="toggleProxyAll()">全选有效</button>
+      <button class="small" onclick="clearProxySel()">清空</button>
+      <button class="small primary" id="proxy-addsel-btn" onclick="addSelectedProxies()">＋ 添加选中（<span id="proxy-selcount">0</span>）</button>
+      <span class="muted hint" id="proxy-toolbar-hint"></span>
+    </div>
+    <div id="proxy-list" class="proxy-grid muted" style="margin-top:10px">未拉取。点「拉取免费代理」联网淘一批可用 SOCKS5 出口。</div>
+    <div class="muted" style="margin-top:6px">提示：连通 ≠ 可绕过限流——免费数据中心 IP 大多被 opencode.ai 限（429，分时段）。已在 IP 池中的项自动灰置不可重复添加。</div>
     <div id="proxy-msg" class="msg" style="margin-top:6px"></div>
   </div>
   </div>
@@ -2826,7 +2871,8 @@ async function toggleIpRotation() {
     btn.textContent = old
   }
 }
-var proxyCandidates = [] // 免费代理候选缓存：{url, source, ok, ms, err}
+var proxyCandidates = [] // 免费代理候选缓存：{url, source, ok, ms, err, inPool}
+var proxySel = {} // 勾选状态：{ index: true }
 async function fetchFreeProxies() {
   const btn = document.getElementById("proxy-fetch-btn")
   const msg = document.getElementById("proxy-msg")
@@ -2835,11 +2881,17 @@ async function fetchFreeProxies() {
   try {
     const r = await api("/api/gateway/proxies/fetch", { limit: 200, timeout: 5000 })
     if (!r.ok) throw new Error(r.error || "拉取失败")
-    proxyCandidates = r.candidates || []
+    // 拉当前池用于标记已存在项（去重灰置）
+    let inPool = new Set()
+    try { inPool = new Set((await api("/api/gateway/config")).egress || []) } catch {}
+    proxyCandidates = (r.candidates || []).map((c) => Object.assign({}, c, { inPool: inPool.has(c.url) }))
+    // 默认自动勾选所有「有效且不在池中」的项
+    proxySel = {}
+    proxyCandidates.forEach((c, i) => { if (c.ok && !c.inPool) proxySel[i] = true })
     renderProxyList()
     const good = proxyCandidates.filter((c) => c.ok).length
     msg.className = "msg"
-    msg.textContent = "共 " + r.total + " 候选，验证 " + r.checked + " 个，可用 " + good + " 个（连通性）"
+    msg.textContent = "共 " + r.total + " 候选，验证 " + r.checked + " 个，可用 " + good + " 个（已自动勾选可添加项）"
   } catch (e) {
     msg.className = "msg err"; msg.textContent = "拉取失败：" + e.message
   }
@@ -2849,37 +2901,73 @@ function renderProxyList() {
   const el = document.getElementById("proxy-list")
   const badge = document.getElementById("proxy-badge")
   const good = proxyCandidates.filter((c) => c.ok).length
+  const addable = proxyCandidates.filter((c) => c.ok && !c.inPool).length
   badge.innerHTML = proxyCandidates.length
     ? '<span class="badge b-' + (good ? "available" : "stopped") + '">' + good + "/" + proxyCandidates.length + " 可用</span>"
     : ""
+  const toolbar = document.getElementById("proxy-toolbar")
+  if (toolbar) toolbar.style.display = proxyCandidates.length ? "flex" : "none"
   if (!proxyCandidates.length) { el.textContent = "未拉取。点「拉取免费代理」联网淘一批可用 SOCKS5 出口。"; return }
-  el.innerHTML = proxyCandidates.map((c, i) =>
-    '<div style="display:flex;align-items:center;gap:8px;padding:3px 0;border-bottom:1px solid var(--bd-2)">' +
-      '<span class="badge ' + (c.ok ? "b-available" : "b-invalid") + '">' + (c.ok ? "可用" : "不可用") + '</span>' +
-      '<code style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(c.url) + '">' + esc(c.url) + '</code>' +
-      '<span class="muted" style="width:52px">' + (c.ms != null ? c.ms + "ms" : "-") + '</span>' +
+  el.innerHTML = proxyCandidates.map((c, i) => {
+    const isSel = !!proxySel[i]
+    const disable = !c.ok || c.inPool
+    const cls = (c.inPool ? "inpool" : "") + (c.ok ? "" : " off")
+    return '<label class="proxy-item ' + cls + '">' +
+      '<input type="checkbox" ' + (isSel ? "checked" : "") + (disable ? " disabled" : "") +
+        ' onchange="proxySel[' + i + ']=this.checked;updateProxySelCount()">' +
+      '<code title="' + esc(c.url) + '">' + esc(c.url.indexOf("//") >= 0 ? c.url.slice(c.url.indexOf("//") + 2) : c.url) + '</code>' +
       (c.ok
-        ? '<button class="small" onclick="addProxyToPool(' + i + ')">加入 IP 池</button>'
-        : '<span class="muted" style="font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis" title="' + esc(c.err || "") + '">' + esc(c.err || "") + '</span>')).join("")
+        ? '<span class="pm-ms">' + (c.ms != null ? c.ms + "ms" : "-") + '</span>'
+        : '<span class="pm-err" title="' + esc(c.err || "") + '">' + esc(c.err || "") + '</span>') +
+      (c.inPool ? '<span class="badge b-stopped">池中</span>' : (c.ok ? '<span class="badge b-available">可用</span>' : "")) +
+      '</label>'
+  }).join("")
+  updateProxySelCount()
+  refreshEgressBadgeAfterToolbar()
 }
-async function addProxyToPool(i) {
-  const c = proxyCandidates[i]
-  if (!c) return
+function updateProxySelCount() {
+  const el = document.getElementById("proxy-selcount")
+  if (el) el.textContent = Object.keys(proxySel).filter((k) => proxySel[k]).length
+}
+function toggleProxyAll() {
+  const allOn = Object.keys(proxySel).some((k) => proxySel[k])
+  proxyCandidates.forEach((c, i) => { proxySel[i] = (!allOn && c.ok && !c.inPool) ? true : false })
+  renderProxyList()
+}
+function clearProxySel() {
+  proxySel = {}
+  renderProxyList()
+}
+function refreshEgressBadgeAfterToolbar() {
+  const hint = document.getElementById("proxy-toolbar-hint")
+  if (!hint) return
+  const pool = proxyCandidates.filter((c) => c.inPool).length
+  hint.textContent = pool > 0 ? "已在池中 " + pool + " 项已灰置（去重）" : ""
+}
+async function addSelectedProxies() {
   const msg = document.getElementById("proxy-msg")
+  const urls = proxyCandidates.filter((c, i) => proxySel[i]).map((c) => c.url)
+  if (!urls.length) { msg.className = "msg err"; msg.textContent = "未勾选任何出口"; return }
+  const btn = document.getElementById("proxy-addsel-btn")
+  const old = btn.textContent
+  btn.disabled = true
   try {
-    const r = await api("/api/gateway/egress", { action: "add", url: c.url })
+    const r = await api("/api/gateway/egress", { action: "bulk-add", urls })
+    if (!r.ok) throw new Error(r.error || "批量添加失败")
     msg.className = "msg"
-    msg.textContent = "已加入 IP 池：" + c.url + "（重启网关后生效）"
-    // 刷新 IP 池卡列表以包含新出口
+    msg.textContent = "已加入 " + (r.added || []).length + " 个出口（" +
+      (r.added || []).join(", ") + "）；重复/非法 " + (r.skipped || []).length + " 个已跳过。重启网关后生效。"
+    // 刷新 IP 池卡
     const cfg = await api("/api/gateway/config")
     renderEgressList(cfg.egress || [], !!cfg.egressEnabled, !!cfg.ipRotation)
-    // 标记已加入（从候选移除）
-    proxyCandidates.splice(i, 1)
+    // 候选标记已入池并清空勾选
+    const addedSet = new Set(r.added || [])
+    proxyCandidates.forEach((c, i) => { if (addedSet.has(c.url)) { c.inPool = true; proxySel[i] = false } })
     renderProxyList()
   } catch (e) {
-    msg.className = "msg err"
-    msg.textContent = (String(e.message).includes("已存在") ? "已在 IP 池中：" : "加入失败：") + c.url
+    msg.className = "msg err"; msg.textContent = "添加失败：" + e.message
   }
+  btn.disabled = false; btn.textContent = old
 }
 async function refreshPlans() {
   try {
