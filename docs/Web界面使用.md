@@ -73,7 +73,7 @@
 | POST | `/api/keys/delete` | `{name}` | `{ok,status}` | 删除 key |
 | POST | `/api/current` | `{name}` | `{ok,status}` | 设为当前 |
 | POST | `/api/cooldown` | `{name, minutes:number\|null}` | `{ok,status}` | 设置冷却（null/0=清除） |
-| POST | `/api/rotate` | `{}` | `{ok,status}` | 手动轮换 |
+| POST | `/api/rotate` | `{}` 或 `{domain:"go"\|"gateway"}` | `{ok,status}` | 手动轮换当前域（缺省 zen）。**domain=gateway**（2026-08-19）走网关域 `current_gateway` + `cooldown_until_gateway`，不写 auth.json（与 TUI/go 域独立）；Web「手动操作」区已加「网关轮换」按钮 |
 | POST | `/api/web/off` | `{}` | `{ok,shutting_down,auto_web:false}` | `auto_web=false` + 300ms 后停 server |
 | POST | `/api/web/on` | `{}` | `{ok,auto_web:true,restarted}` | 开自动启动 + **立即重启**（server 未运行时拉起；`restarted` 表示本次是否真的拉起） |
 | POST | `/api/log/clear` | `{}` | `{ok,status}` | 清空日志 + 删归档 |
@@ -84,6 +84,7 @@
 | POST | `/api/gateway/egress`（梯子池动作） | `{action, ...}` | 动作对应列表 | **梯子专用出口池（第四池 ladder.egress）管理**：`add-ladder {url}` / `set-ladder {list}` / `move-to-ladder {urls}`（主池∪限流池∪不可用池并集抽取→梯子池） / `ladder-to-egress {urls}`（梯子池→主池） / `ladder-to-limited {urls}` / `ladder-to-dead {urls}`。均 `needsRestart:false`（梯子每连接动态读配置即时生效）。 |
 | POST | `/api/gateway/egress`（轮换子集） | `{action:"activate", urls:[]}` / `{action:"deactivate"}` | `{ok, egressActive, egress, ipRotation, enabled, needsRestart:false}` | **多选轮换子集（2026-08-19）**：`activate` 把勾选的 1~N 个 IP 池成员设为当前轮换子集（校验 ∈ 池，选中项前置到 `egress` 头部）+ 打开 `ip_rotation`，立即生效无需重启；`deactivate` 清空子集恢复全池。前端勾选三态：显式勾选优先、未操作按「是否在子集」保持勾选 + 「轮换中」徽标。 |
 | POST | `/api/gateway/proxies/webshare` | `{mode:"token"\|"link", value, limit?, timeout?}` | `{ok, total, checked, candidates:[{url, ok, ms, err}]}` | **Webshare 代理导入（2026-08-19）**：`mode=token`（API Token Key）走 `/api/v2/proxy/list/?mode=direct`；`mode=link` 直接 GET 面板下载链接。拉取后逐个做 SOCKS5 连通验证（opencode.ai:443）。DNS 污染绕过：固定 8.8.8.8/1.1.1.1 解析 + SNI 保持真实域名。 |
+| POST | `/api/gateway/config` | `{...}` | `{ok, needsRestart:true}` | **多字段写（2026-08-19 扩展）**：除 `plan`/`token`/`tokens` 外新增 `auto_rotate_keys:boolean`——**网关 key 自动轮换开关**（写 gateway-config 的 `auto_rotate_keys`；zen 免费档默认关闭，go 档恒开启）。Web「上游套餐」卡内「网关 key 自动轮换」按钮切换，保存后自动重启网关生效。 |
 | 其它 | 任意未匹配 | - | 404 `{"error":"not found"}` | POST 处理抛错时 400 `{"error":msg}` |
 
 所有写操作带**跨进程文件锁**（`withLockSync`：O_EXCL + 陈旧锁检测 + 5s 超时降级）与**原子写**（.tmp + rename），与 CLI / zen-gateway 同一套并发安全机制。

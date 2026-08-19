@@ -1364,6 +1364,15 @@ t("syncAuth 容错：auth.json 损坏 → 静默失败不抛错、文件原样�
       const gwGo = await import("../gateway.mjs?go-norotate-regress=" + Date.now())
       const cfg3 = await gwGo.rotate({ error: { message: "Insufficient balance" } }, 402, "bad")
       assert.equal(cfg3.current_gateway, "good")
+      // ④ auto_rotate_keys:true 显式开启 → zen 档也轮换（用户可选，绕过默认禁用）
+      writeFileSync(cfgPath, JSON.stringify(
+        { current: "bad", current_gateway: "bad", keys: [{ name: "bad", key: "sk-fake-bad" }, { name: "good", key: "sk-fake-good" }] }, null, 2,
+      ))
+      writeFileSync(gwCfgPath, JSON.stringify({ plan: "zen", auto_rotate_keys: true }))
+      const gwZenOn = await import("../gateway.mjs?zen-autorotate-on=" + Date.now())
+      const cfg4 = await gwZenOn.rotate({ error: { message: "Insufficient balance" } }, 402, "bad")
+      assert.equal(cfg4.current_gateway, "good")
+      assert.equal(JSON.parse(readFileSync(cfgPath, "utf8")).current_gateway, "good")
     } finally {
       process.env.ZEN_CONFIG = savedCfg
       process.env.ZEN_GATEWAY_CONFIG = savedGwCfg
@@ -1375,7 +1384,7 @@ t("syncAuth 容错：auth.json 损坏 → 静默失败不抛错、文件原样�
     ok = false
     err = e
   }
-  const name4 = "zen 档自动轮换禁用：rotate() 跳过（current_gateway 不变/不冷却/不写状态），go 档回归仍轮换"
+  const name4 = "zen 档自动轮换禁用：rotate() 跳过（current_gateway 不变/不冷却/不写状态）；auto_rotate_keys=true 显式开启则轮换；go 档回归仍轮换"
   if (ok) {
     passed++
     groups[groups.length - 1].count++
@@ -2352,6 +2361,18 @@ t("egress_index 非法值（负数/非整数/字符串数字）→ readGatewayCo
 t("egress_index 合法整数 → 原样返回", () => {
   writeFileSync(_gwCfgPath, JSON.stringify({ plan: "zen", egress_index: 7 }))
   assert.equal(gw.readGatewayConfig().egress_index, 7)
+  try { rmSync(_gwCfgPath, { force: true }) } catch {}
+})
+
+t("auto_rotate_keys 缺省 false；true/false/非法 归一", () => {
+  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "zen" }))
+  assert.equal(gw.readGatewayConfig().auto_rotate_keys, false, "缺省 false")
+  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "zen", auto_rotate_keys: true }))
+  assert.equal(gw.readGatewayConfig().auto_rotate_keys, true)
+  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "zen", auto_rotate_keys: false }))
+  assert.equal(gw.readGatewayConfig().auto_rotate_keys, false)
+  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "zen", auto_rotate_keys: "yes" }))
+  assert.equal(gw.readGatewayConfig().auto_rotate_keys, false, "非布尔 → false")
   try { rmSync(_gwCfgPath, { force: true }) } catch {}
 })
 

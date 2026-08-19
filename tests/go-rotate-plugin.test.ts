@@ -1008,6 +1008,37 @@ describe("网关配置路由（/api/gateway/plans + /api/gateway/config）", () 
     expect(res.status).toBe(400)
     expect((await res.json()).error).toContain("至少提供")
   })
+  test("POST /api/gateway/config {auto_rotate_keys} 写文件 + GET 返回 autoRotateKeys（缺省 false）", async () => {
+    // 缺省 false（先直接落一份不含该字段的干净配置，绕过 writeGatewayConfig 保留现状的语义）
+    writeFileSync(GW_CONFIG_FILE, JSON.stringify({ plan: "go" }, null, 2))
+    let g = await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/config"))
+    let gj = await g.json()
+    expect(gj.autoRotateKeys).toBe(false)
+    expect(JSON.parse(readFileSync(GW_CONFIG_FILE, "utf8")).auto_rotate_keys).toBeUndefined()
+    // 开
+    const on = new Request("http://127.0.0.1:8899/api/gateway/config", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ auto_rotate_keys: true }),
+    })
+    const onRes = await mod.handleWeb(on)
+    expect((await onRes.json()).needsRestart).toBe(true)
+    expect(JSON.parse(readFileSync(GW_CONFIG_FILE, "utf8")).auto_rotate_keys).toBe(true)
+    g = await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/config"))
+    gj = await g.json()
+    expect(gj.autoRotateKeys).toBe(true)
+    // 关（显式 false）
+    const off = new Request("http://127.0.0.1:8899/api/gateway/config", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ auto_rotate_keys: false }),
+    })
+    await mod.handleWeb(off)
+    expect(JSON.parse(readFileSync(GW_CONFIG_FILE, "utf8")).auto_rotate_keys).toBe(false)
+    g = await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/config"))
+    gj = await g.json()
+    expect(gj.autoRotateKeys).toBe(false)
+  })
   test("GET /api/gateway/config 无 token → token null + authEnabled false + plan 正确", async () => {
     mod.writeGatewayConfig({ plan: "zen" })
     const g = await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/config"))
@@ -2255,6 +2286,12 @@ describe("双域独立轮换（current_gateway / cooldown_until_gateway 域分�
     // 手动轮换支持 domain（rotateDomain）：zen/go
     expect(html).toContain('onclick="rotateDomain(\'zen\')"')
     expect(html).toContain('onclick="rotateDomain(\'go\')"')
+    // 网关域手动轮换按钮 + 自动轮换开关（前端接线）
+    expect(html).toContain('onclick="rotateDomain(\'gateway\')">网关轮换</button>')
+    expect(html).toContain('id="auto-rotate-btn"')
+    expect(html).toContain('onclick="toggleAutoRotate()"')
+    expect(html).toContain("function toggleAutoRotate()")
+    expect(html).toContain('api("/api/gateway/config", { auto_rotate_keys: newOn })')
     expect(html).toContain('api("/api/rotate", { domain })')
     // 网关卡 gw-current 显示 statusPayload 网关域字段
     expect(html).toContain("(st && st.current_gateway)")
@@ -2356,6 +2393,35 @@ describe("rotate 按域（zen 轮换不动 current_go；go 域不写 auth.json m
     // zen 域：a 在 go 域冷却但 zen 域没冷却 -> 先看 b（zen 冷却）跳过，回绕到 a（zen 域可用）
     expect(mod.pickNext(cfg, "zen")?.name).toBe("a")
     // go 域：a 在 go 域冷却 -> 选 b（go 域可用）
+    expect(mod.pickNext(cfg, "go")?.name).toBe("b")
+  })
+  test("manualRotate 网关域：切 current_gateway 不写 auth；冷却走 cooldown_until_gateway", () => {
+    seed({ ...twoKeys("a"), current_gateway: "a" })
+    seedAuth({})
+    const authBefore = readFileSync(AUTH_FILE, "utf8")
+    mod.manualRotate("gateway")
+    let cfg = readCfg()
+    expect(cfg.current_gateway).toBe("b")
+    expect(cfg.current).toBe("a")
+    expect(readFileSync(AUTH_FILE, "utf8")).toBe(authBefore) // 网关域不写 auth
+    // 网关域冷却后 pickNext 跳过该 key
+    cfg = readCfg()
+    cfg.keys[0].cooldown_until_gateway = new Date(Date.now() + 60000).toISOString()
+    seed(cfg)
+    const nxt = mod.pickNext(readCfg(), "gateway")
+    expect(nxt?.name).toBe("b") // a 网关域冷却 -> 选 b
+  })
+  test("pickNext 网关域冷却字段独立（cooldown_until_gateway 不阻塞 zen/go 域）", () => {
+    const cfg = { current: "a", current_go: "a", current_gateway: "a", keys: [
+      // a：仅网关域冷却（未来）；b：仅 zen 域冷却（未来）；两者另一域全干净
+      { name: "a", key: "sk-aaa", cooldown_until_gateway: new Date(Date.now() + 60000).toISOString(), cooldown_until: null, cooldown_until_go: null },
+      { name: "b", key: "sk-bbb", cooldown_until: new Date(Date.now() + 60000).toISOString(), cooldown_until_gateway: null, cooldown_until_go: null },
+    ] } as any
+    // 网关域：a 网关冷却 -> 跳过，选 b（b 网关域干净）
+    expect(mod.pickNext(cfg, "gateway")?.name).toBe("b")
+    // zen 域：b zen 冷却 -> 跳过，回绕到 a（a zen 域干净，网关域冷却不影响 zen 选择）
+    expect(mod.pickNext(cfg, "zen")?.name).toBe("a")
+    // go 域：a/b go 域全干净 -> 从 a 的下一 key b 起（pickNext 语义：起点=当前，看下一个）
     expect(mod.pickNext(cfg, "go")?.name).toBe("b")
   })
 })
@@ -2483,6 +2549,15 @@ describe("Web API domain 矩阵（current/cooldown/rotate/check）", () => {
     cfg = readCfg()
     expect(cfg.current).toBe("b")
     expect(readAuth()["opencode-go"].key).toBe("sk-bbb")
+  })
+  test("/api/rotate domain=gateway 手动轮换网关域（不写 auth / 不动 current）", async () => {
+    seed({ ...twoKeys("a"), current_gateway: "a" }); seedAuth({})
+    const authBefore = readFileSync(AUTH_FILE, "utf8")
+    await post("/api/rotate", { domain: "gateway" })
+    const cfg = readCfg()
+    expect(cfg.current_gateway).toBe("b")
+    expect(cfg.current).toBe("a")
+    expect(readFileSync(AUTH_FILE, "utf8")).toBe(authBefore) // 网关域轮换不碰 auth
   })
 })
 

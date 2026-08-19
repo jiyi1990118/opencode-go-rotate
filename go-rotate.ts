@@ -314,16 +314,18 @@ function isZenProvider(pid: string): boolean {
   return String(pid).includes("opencode") && !isGoProvider(pid)
 }
 
-/** 该域游标（读侧兜底：go → current_go ?? current；zen → current） */
-function domainCurrent(cfg: Config, domain: "zen" | "go"): string {
-  return domain === "go" ? (cfg.current_go ?? cfg.current ?? "") : (cfg.current ?? "")
+/** 该域游标（读侧兜底：go → current_go ?? current；gateway → current_gateway ?? current；zen → current） */
+function domainCurrent(cfg: Config, domain: "zen" | "go" | "gateway" = "zen"): string {
+  if (domain === "go") return cfg.current_go ?? cfg.current ?? ""
+  if (domain === "gateway") return cfg.current_gateway ?? cfg.current ?? ""
+  return cfg.current ?? ""
 }
 
-function pickNext(cfg: Config, domain: "zen" | "go" = "zen"): KeyEntry | undefined {
+function pickNext(cfg: Config, domain: "zen" | "go" | "gateway" = "zen"): KeyEntry | undefined {
   const now = Date.now()
   const ordered = cfg.keys
   const startIdx = ordered.findIndex((k) => k.name === domainCurrent(cfg, domain))
-  const coolField = domain === "go" ? "cooldown_until_go" : "cooldown_until"
+  const coolField = domain === "go" ? "cooldown_until_go" : domain === "gateway" ? "cooldown_until_gateway" : "cooldown_until"
   for (let i = 1; i <= ordered.length; i++) {
     const k = ordered[(startIdx + i) % ordered.length]
     if (!k) continue
@@ -369,21 +371,20 @@ function rotate(errMsg: string, err?: any, domain: "zen" | "go" = "zen"): Config
   })
 }
 
-/** 手动轮换到下一个可用 key（web/CLI 用）。domain 缺省 zen；go 域不写 auth.json。 */
-function manualRotate(domain: "zen" | "go" = "zen"): Config {
+/** 手动轮换到下一个可用 key（web/CLI 用）。domain 缺省 zen；go/gateway 域不写 auth.json。 */
+function manualRotate(domain: "zen" | "go" | "gateway" = "zen"): Config {
   return mutateConfig((cfg) => {
-    const isGo = domain === "go"
-    const next = pickNext(cfg, domain)
+    const next = pickNext(cfg, domain === "go" ? "go" : domain === "gateway" ? "gateway" : "zen")
+    const label = domain === "go" ? "go 域" : domain === "gateway" ? "网关域" : "zen 域"
     if (!next) {
-      log(`❌  手动轮换（${isGo ? "go 域" : "zen 域"}）：没有可用 key，保持当前`)
+      log(`❌  手动轮换（${label}）：没有可用 key，保持当前`)
       return
     }
-    if (isGo) cfg.current_go = next.name
+    if (domain === "go") cfg.current_go = next.name
+    else if (domain === "gateway") cfg.current_gateway = next.name
     else cfg.current = next.name
-    if (!isGo) syncAuth(next.key)
-    log(isGo
-      ? `🔄  go 域手动轮换到 key "${next.name}"（不写 auth.json）`
-      : `🔄  手动轮换到 key "${next.name}"`)
+    if (domain === "zen") syncAuth(next.key) // 网关/go 域绝不写 auth.json（双域独立轮换红线）
+    log(`🔄  ${label}手动轮换到 key "${next.name}"${domain === "zen" ? "" : "（不写 auth.json）"}`)
   })
 }
 
@@ -1239,6 +1240,7 @@ type GatewayConfig = {
   limited: string[] // 已被上游限流（429）的出口，从主池移出单独管理（不参与轮换）
   dead: string[] // 已确认不可用的出口（探测失败/超时），从主池/限流池移出单独管理（不参与轮换）
   ip_rotation: boolean // IP 轮换总开关（默认 true；false = 即使有出口池也直接走本地直连）
+  auto_rotate_keys: boolean // 网关 key 自动轮换开关（默认 false；zen 免费档默认禁用，开启后配额耗尽也轮换 key）
   egress_index: number // 网关 HTTP 出口轮换游标（重启后续接；由网关 persistEgressIndex 写入，插件只读透传）
   ladder: {
     enabled: boolean
@@ -1250,7 +1252,7 @@ type GatewayConfig = {
 }
 
 function defaultGatewayConfig(): GatewayConfig {
-  return { plan: "go", token: null, token_set_at: null, tokens: [], egress: [], egress_active: [], limited: [], dead: [], ip_rotation: true, egress_index: 0, ladder: null }
+  return { plan: "go", token: null, token_set_at: null, tokens: [], egress: [], egress_active: [], limited: [], dead: [], ip_rotation: true, auto_rotate_keys: false, egress_index: 0, ladder: null }
 }
 
 function readGatewayConfig(): GatewayConfig {
@@ -1292,6 +1294,7 @@ function readGatewayConfig(): GatewayConfig {
             }
           : null,
       ip_rotation: raw.ip_rotation !== false, // 缺省开启；显式 false 关闭
+      auto_rotate_keys: raw.auto_rotate_keys === true, // 缺省关闭（zen 免费档默认禁用自动轮换；显式 true 开启）
       egress_index: Number.isInteger(raw.egress_index) && (raw.egress_index as number) >= 0 ? (raw.egress_index as number) : 0,
     }
   } catch (e) {
@@ -1318,6 +1321,7 @@ function writeGatewayConfig(patch: {
     fixed?: string | null
 } | null
   ip_rotation?: boolean
+  auto_rotate_keys?: boolean
   egress_index?: number
 }): GatewayConfig {
   return withLockSync<GatewayConfig>(() => {
@@ -1329,6 +1333,9 @@ function writeGatewayConfig(patch: {
     }
     if (patch.ip_rotation !== undefined) {
       cfg.ip_rotation = patch.ip_rotation === true // 严格布尔；非 true 视为关闭
+    }
+    if (patch.auto_rotate_keys !== undefined) {
+      cfg.auto_rotate_keys = patch.auto_rotate_keys === true // 严格布尔；非 true 视为关闭
     }
     if (patch.egress_index !== undefined) {
       if (!Number.isInteger(patch.egress_index) || (patch.egress_index as number) < 0)
@@ -1457,6 +1464,7 @@ function gatewayConfigPayload() {
     ladder: cfg.ladder,
     egressActive: cfg.egress_active,        // 手动选中的轮换子集（[]=全池轮换）
     ipRotation: cfg.ip_rotation,               // 总开关（false = 关闭，走本地直连）
+    autoRotateKeys: cfg.auto_rotate_keys,       // 网关 key 自动轮换开关（zen 免费档默认关闭）
     egressEnabled: cfg.ip_rotation && (cfg.egress_active.length ? cfg.egress_active.length >= 1 : cfg.egress.length >= 2), // 实际轮换启用（子集≥1 / 全池≥2）
     needsRestart: false, // GET 只读；needsRestart:true 仅由 POST 写操作返回
   }
@@ -1704,7 +1712,10 @@ try {
             body.minutes === null || body.minutes === "" ? null : Number(body.minutes),
           )
         if (route === "/api/settings") return setGlobalCooldown(Number(body.cooldown_minutes))
-        if (route === "/api/rotate") return manualRotate(body.domain === "go" ? "go" : "zen")
+        if (route === "/api/rotate") {
+          const d = body.domain === "go" ? "go" : body.domain === "gateway" ? "gateway" : "zen"
+          return manualRotate(d)
+        }
         if (route === "/api/log/clear") return clearLog()
         // 网关管理：start/stop/restart → {ok, output}，透传不套统一包装
         if (route === "/api/gateway/start") return gatewayManage("start")
@@ -1712,12 +1723,13 @@ try {
         if (route === "/api/gateway/restart") return gatewayManage("restart")
 // 网关配置（套餐/token）：只写 gateway-config.json 不重启（重启由前端显式调 restart）
          if (route === "/api/gateway/config") {
-           if (body.plan === undefined && body.token === undefined && body.tokens === undefined)
-             throw new Error("至少提供 plan / token / tokens 之一")
+           if (body.plan === undefined && body.token === undefined && body.tokens === undefined && body.auto_rotate_keys === undefined)
+             throw new Error("至少提供 plan / token / tokens / auto_rotate_keys 之一")
            writeGatewayConfig({
              plan: body.plan === undefined ? undefined : String(body.plan),
              token: body.token === undefined ? undefined : body.token,
              tokens: body.tokens === undefined ? undefined : body.tokens,
+             auto_rotate_keys: body.auto_rotate_keys === undefined ? undefined : body.auto_rotate_keys === true,
            })
            return { ok: true, needsRestart: true }
          }
@@ -2639,7 +2651,7 @@ try {
   <div class="card" id="keys-add-card">
     <div class="row" style="margin-bottom:10px"><input id="new-name" placeholder="名称，如 act2">&nbsp;<input id="new-key" placeholder="sk-xxxx 完整的 API key"><button class="primary" onclick="addKey()">新增 key</button></div>
     <div class="muted banner" id="keys-empty" style="display:none">还没有 key：粘贴第一个 opencode-go key，添加后自动探测健康。</div>
-    <div class="row" style="margin-bottom:10px"><span class="muted">手动操作：</span><button onclick="rotateDomain('zen')">Zen 轮换</button><button onclick="rotateDomain('go')">Go 轮换</button><button onclick="checkKeys()">检测所有 key</button><span class="muted" id="check-hint"></span></div>
+    <div class="row" style="margin-bottom:10px"><span class="muted">手动操作：</span><button onclick="rotateDomain('zen')">Zen 轮换</button><button onclick="rotateDomain('go')">Go 轮换</button><button onclick="rotateDomain('gateway')">网关轮换</button><button onclick="checkKeys()">检测所有 key</button><span class="muted" id="check-hint"></span></div>
   </div>
   <div class="card" id="keys-table-card">
     <div class="table-wrap">
@@ -2787,6 +2799,12 @@ try {
     </div>
     <div class="muted" id="plan-meta" style="margin-top:8px">加载中…</div>
     <div class="muted" style="margin-top:6px">提示：Zen 免费档数据可能被用于训练，敏感代码请勿使用（个人自用合规）。切换后需重启网关生效。</div>
+    <div class="row" style="margin-top:10px">
+      <span class="muted" style="display:flex;align-items:center;gap:8px;flex:1">网关 key 自动轮换：
+        <button id="auto-rotate-btn" class="" onclick="toggleAutoRotate()"></button>
+      </span>
+    </div>
+    <div class="muted" style="margin-top:4px">配额耗尽（401/402/429）时自动切到下一个可用 opencode key。Zen 免费档默认关闭（UA/频率限流与账号无关，轮换无效）；go 套餐恒开启。关闭时仍可手动「网关轮换」。切换后需重启网关生效。</div>
     <div id="plan-msg" class="msg" style="margin-top:6px"></div>
   </div>
 
@@ -3726,6 +3744,7 @@ function tokenBadge(on) {
 }
 var egressHealth = {} // 出口健康检查结果缓存：{ [url]: {ok,status,ms,error} }
 var ipRotationOn = true // IP 轮换总开关（false = 走本地直连）
+var autoRotateOn = false // 网关 key 自动轮换开关（zen 免费档默认关闭；go 恒开）
 var currentEgressList = [] // 当前渲染的 egress 列表（供 moveToLimited 按下标操作）
 var egressActiveList = [] // 手动选中的轮换子集（[]=全池轮换；来自 config.egressActive）
 var egressSel = {} // 主池勾选状态：{ index: true }
@@ -4274,6 +4293,34 @@ async function toggleIpRotation() {
     btn.textContent = old
   }
 }
+function renderAutoRotateBtn(on) {
+  autoRotateOn = on
+  const btn = document.getElementById("auto-rotate-btn")
+  if (!btn) return
+  btn.textContent = on ? "开启" : "关闭"
+  btn.className = on ? "primary" : ""
+}
+async function toggleAutoRotate() {
+  const msg = document.getElementById("plan-msg")
+  const btn = document.getElementById("auto-rotate-btn")
+  const newOn = !autoRotateOn // 翻转当前态
+  const oldText = btn.textContent
+  try {
+    const r = await api("/api/gateway/config", { auto_rotate_keys: newOn })
+    msg.className = "msg"
+    if (r.needsRestart) {
+      const rr = await api("/api/gateway/restart", {})
+      msg.textContent = rr.ok
+        ? "网关 key 自动轮换已" + (newOn ? "开启" : "关闭") + "，并已重启网关"
+        : "配置已保存，但重启失败：" + (rr.output || "")
+      msg.className = rr.ok ? "msg" : "msg err"
+    } else {
+      msg.textContent = "网关 key 自动轮换已" + (newOn ? "开启" : "关闭") + "（即时生效）"
+    }
+    renderAutoRotateBtn(newOn)
+    refreshGateway(); refreshGatewayConfig()
+  } catch (e) { btn.textContent = oldText; msg.className = "msg err"; msg.textContent = "切换失败：" + e.message }
+}
 var proxyCandidates = [] // Webshare 导入候选缓存：{url, ok, ms, err, inPool}
 var proxySel = {} // 勾选状态：{ index: true }
 async function fetchWebshareProxies() {
@@ -4746,6 +4793,7 @@ async function refreshGatewayConfig() {
     const c = await api("/api/gateway/config")
     document.getElementById("plan-go").checked = c.plan === "go"
     document.getElementById("plan-zen").checked = c.plan === "zen"
+    renderAutoRotateBtn(!!c.autoRotateKeys)
     tokenBadge(!!c.authEnabled)
     renderTokenList(c.tokens || []) // 多 key 掩码列表（明文仅本会话生成/编辑后持有，GET 永不明文）
     egressActiveList = c.egressActive || [] // 轮换子集（[]=全池）

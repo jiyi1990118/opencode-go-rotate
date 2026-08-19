@@ -433,10 +433,12 @@ function pickNext(cfg) {
 
 /** 轮换（异步锁内执行）：失败的 key 进冷却，切到下一个可用 key，返回新配置 */
 async function rotate(errBody, status, failedKeyName) {
-  // zen 免费档自动轮换禁用（2026-08-18 用户实测：同设备 UA/频率限流与账号无关，切换 key 无效反而误伤冷却）。
+  // zen 免费档自动轮换默认禁用（2026-08-18 用户实测：同设备 UA/频率限流与账号无关，切换 key 无效反而误伤冷却）。
   // go 付费档保留（配额耗尽轮换有效）。手动轮换走 CLI/Web（写 current_gateway），不经 rotate，不受影响。
-  if (ACTIVE_PLAN.id === "zen") {
-    log(`🚫  zen 免费档自动轮换已禁用（同设备 UA/频率限流与账号无关），跳过 rotate（status=${status}，key="${failedKeyName ?? "current"}"）`)
+  // 用户可经 gateway-config `auto_rotate_keys` 显式开启 zen 档自动轮换（Web「网关与设置 → 网关 key 自动轮换」）。
+  const _gw = readGatewayConfig()
+  if (ACTIVE_PLAN.id === "zen" && _gw.auto_rotate_keys !== true) {
+    log(`🚫  zen 免费档自动轮换已禁用（同设备 UA/频率限流与账号无关；可在 gateway-config 设 auto_rotate_keys=true 显式开启），跳过 rotate（status=${status}，key="${failedKeyName ?? "current"}"）`)
     return loadConfig()
   }
   return withLockAsync(() => {
@@ -548,6 +550,7 @@ function readGatewayConfig() {
       egress_active: Array.isArray(cfg.egress_active) ? cfg.egress_active.filter((e) => typeof e === "string" && e.length > 0) : [], // 手动选中的轮换子集（非空时只用它；空=全池）
       ip_rotation: cfg.ip_rotation !== false, // 缺省开启；显式 false 关闭
       egress_index: Number.isInteger(cfg.egress_index) && cfg.egress_index >= 0 ? cfg.egress_index : 0, // 出口轮换游标（重启续接，缺省 0）
+      auto_rotate_keys: cfg.auto_rotate_keys === true, // 网关 key 自动轮换开关（默认关；zen 免费档默认禁用自动轮换，开启后连 401/402/429 配额耗尽也轮换 key）
       ladder: normalizeLadderConfig(cfg.ladder),
     }
   } catch (e) {

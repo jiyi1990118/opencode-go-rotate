@@ -391,7 +391,7 @@ claude -p "hi"                                     # 或 claude -p --model claud
 
 - 复用 `~/.config/opencode/go-keys.json`（与 go-rotate 同一个文件，增删 key 用 `go-rotate` 或 Web 界面）。
 - 每次请求取**当前 key**；上游返回 401/402/429 或消息含 `quota/insufficient/balance/rate limit/exceeded` → 当前 key 进冷却（优先解析错误里的 `reset at <time>`，否则用 `cooldown_minutes`）→ 切下一个可用 key → **重试一次**。
-- **`plan=zen` 免费档自动轮换已禁用**（2026-08-18）：同设备 UA/频率限流与账号无关，轮换无效反而误伤冷却——401/402/CreditsError 等配额类错误一律**透传不轮换、不冷却**（`FreeUsageLimitError` 本就不轮换）。`plan=go` 付费档保留自动轮换；手动轮换（`gateway next` / Web）不受影响。
+- **`plan=zen` 免费档自动轮换默认禁用**（2026-08-18 用户实测：同设备 UA/频率限流与账号无关，轮换无效反而误伤冷却）——401/402/CreditsError 等配额类错误一律**透传不轮换、不冷却**（`FreeUsageLimitError` 本就不轮换）。**2026-08-19 起可显式开启**：`gateway-config.json` 设 `"auto_rotate_keys": true`（Web「上游套餐 → 网关 key 自动轮换」开关）即可让 zen 档配额耗尽也自动换 key；`plan=go` 付费档恒开启。手动轮换（`gateway next` / Web「网关轮换」按钮）不受影响。
 - 写配置与 go-rotate 用**同一把文件锁**（`go-keys.json.lock`）+ 原子写（tmp+rename），跨进程安全。
 - 轮换结果同步写 `~/.local/share/opencode/auth.json`，保证与 opencode 插件路径一致。
 
