@@ -516,7 +516,7 @@ const PLANS = {
   },
 }
 
-/** 归一化梯子配置（纯函数）：enabled→boolean、port→正整数(缺省10880)、mode→rotate|fixed、fixed→string|null。
+/** 归一化梯子配置（纯函数）：enabled→boolean、port→正整数(缺省10880)、mode→rotate|fixed、fixed→string|null、egress→string[]（缺省[]）。
  *  输入非法/缺失 → null（未启用）。供 readGatewayConfig 与测试共用；确保两处语义一致。 */
 function normalizeLadderConfig(raw) {
   if (!raw || typeof raw !== "object") return null
@@ -525,6 +525,7 @@ function normalizeLadderConfig(raw) {
     port: Number.isInteger(raw.port) && raw.port > 0 ? raw.port : 10880,
     mode: raw.mode === "fixed" ? "fixed" : "rotate",
     fixed: typeof raw.fixed === "string" && raw.fixed ? raw.fixed : null,
+    egress: Array.isArray(raw.egress) ? raw.egress.filter((e) => typeof e === "string" && e.length > 0) : [],
   }
 }
 
@@ -844,6 +845,7 @@ const MODELS_API = UPSTREAM_BASE + "/models"
 const EGRESS_LIST_INIT = parseEgressList(_GW_CFG && _GW_CFG.egress)
 let _egressIdx = 0
 let _egressOk = true // 当前出口是否健康（429 → false 触发切换）
+let _ladderIdx = 0 // 梯子专用池轮换计数器（独立于 _egressIdx：梯子流量不扰动网关 HTTP 轮换序列）
 
 /** 动态出口表：从当前 gateway-config 实时解析（增删/开关即时生效）。 */
 function egressList() {
@@ -973,13 +975,15 @@ return { checkedAt: new Date().toISOString(), egress: out }
       port: c.port || LADDER_DEFAULT_PORT,
       mode: c.mode === "fixed" ? "fixed" : "rotate",
       fixed: c.fixed || null,
+      egress: Array.isArray(c.egress) ? c.egress.filter((e) => typeof e === "string") : [],
     }
   }
 
-  /** @api 梯子当前状态（enabled/running/port/mode/fixed/conns/egressCount） */
+  /** @api 梯子当前状态（enabled/running/port/mode/fixed/conns/egressCount/egress） */
   function ladderStatus() {
     const c = ladderConfig()
-    const socks5Count = egressList().filter((e) => e.type === "socks5").length
+    const ladderSocks = parseEgressList(c.egress).filter((e) => e.type === "socks5")
+    const mainCount = egressList().filter((e) => e.type === "socks5").length
     return {
       enabled: c.enabled,
       running: !!ladderServer,
@@ -987,19 +991,23 @@ return { checkedAt: new Date().toISOString(), egress: out }
       mode: c.mode,
       fixed: c.fixed,
       conns: ladderConns,
-      egressCount: socks5Count,
+      egress: c.egress, // 梯子专用池（配置侧权威）
+      egressCount: ladderSocks.length > 0 ? ladderSocks.length : mainCount, // 梯子池非空数梯子池，否则回退主池
     }
   }
 
-  /** 梯子模式选出口：fixed → 固定出口；rotate → 按需从出口池轮换（每连接换一个，不依赖 zen 套餐开关）。
+  /** 梯子模式选出口：fixed → 固定出口；rotate → 优先梯子专用池（ladder.egress），池空回退主 egress 池。
+   *  独立 `_ladderIdx` 计数器（与网关 HTTP 轮换 `_egressIdx` 隔离，梯子流量不扰动主池轮换序列）。
    *  池无 socks5 出口 → null（本地直连兜底）。 */
   function ladderNextEgress() {
     const c = ladderConfig()
     if (c.mode === "fixed" && c.fixed) return parseSocks5Url(c.fixed)
-    const L = egressList().filter((e) => e.type === "socks5")
-    if (!L.length) return null
-    _egressIdx = (_egressIdx + 1) % L.length
-    return L[_egressIdx]
+    const ladder = parseEgressList(c.egress).filter((e) => e.type === "socks5")
+    const main = egressList().filter((e) => e.type === "socks5")
+    const pool = ladder.length > 0 ? ladder : main // 优先级：梯子池 → 主池
+    if (!pool.length) return null
+    _ladderIdx = (_ladderIdx + 1) % pool.length
+    return pool[_ladderIdx]
   }
 
   /** @api POST /api/gateway/ladder {action:apply|stop} 应用梯子配置（启用→启动服务；停用→停止）。
@@ -1179,9 +1187,12 @@ return { checkedAt: new Date().toISOString(), egress: out }
         return
       } catch (e) {
         lastErr = e
-        // rotate 模式且池 >1 → 顺延下一个出口重试（免费代理时好时坏，自动跳过坏出口）；fixed/单出口不重测
-        const pool = egressList().filter((x) => x.type === "socks5")
-        if (ladderConfig().mode === "rotate" && pool.length > 1 && attempt < 2) {
+        // rotate 模式且实际消费池 >1 → 顺延下一出口重试（免费代理时好时坏，自动跳过坏出口）；fixed/单出口不重测
+        const c = ladderConfig()
+        const ladderPool = parseEgressList(c.egress).filter((x) => x.type === "socks5")
+        const mainPool = egressList().filter((x) => x.type === "socks5")
+        const pool = ladderPool.length > 0 ? ladderPool : mainPool // 与 ladderNextEgress 同优先级链
+        if (c.mode === "rotate" && pool.length > 1 && attempt < 2) {
           log(`⚠️  梯子出口失败（${e.message}），顺延下一出口重试 #${attempt + 2}`)
           continue
         }

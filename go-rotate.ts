@@ -1137,6 +1137,7 @@ type GatewayConfig = {
     port: number
     mode: "rotate" | "fixed"
     fixed: string | null
+    egress: string[] // 梯子专用出口池（第四池）：rotate 模式优先走本池，池空回退主 egress 池
   } | null // 梯子（本地 SOCKS5 透明代理）：供其它应用科学上网使用；rotate=轮换出口池 / fixed=固定出口
 }
 
@@ -1174,6 +1175,9 @@ function readGatewayConfig(): GatewayConfig {
               port: Number.isInteger(raw.ladder.port) && (raw.ladder.port as number) > 0 ? (raw.ladder.port as number) : 10880,
               mode: raw.ladder.mode === "fixed" ? "fixed" : "rotate",
               fixed: typeof raw.ladder.fixed === "string" && raw.ladder.fixed ? raw.ladder.fixed : null,
+              egress: Array.isArray((raw.ladder as any).egress)
+                ? (raw.ladder as any).egress.filter((e: unknown): e is string => typeof e === "string" && e.length > 0)
+                : [],
             }
           : null,
       ip_rotation: raw.ip_rotation !== false, // 缺省开启；显式 false 关闭
@@ -1253,7 +1257,19 @@ function writeGatewayConfig(patch: {
         const fixed = typeof l.fixed === "string" && l.fixed ? l.fixed : null
         if (mode === "fixed" && !fixed) throw new Error("ladder.mode=fixed 时必须指定 ladder.fixed 出口")
         if (fixed && validateEgressItem(fixed) === null) throw new Error(`ladder.fixed 出口格式非法: ${fixed}`)
-        cfg.ladder = { enabled: l.enabled === true, port, mode, fixed }
+        // egress=梯子专用出口池（第四池）。undefined → 保留现值（Web 保存梯子设置时不能误清池）；
+        // null → 清池；数组 → 校验（复用 validateEgressItem，同 egress/limited/dead 语义）
+        let egress = (cfg.ladder?.egress ?? []).slice()
+        if (l.egress !== undefined) {
+          if (l.egress === null) egress = []
+          else if (!Array.isArray(l.egress)) throw new Error("ladder.egress 必须是字符串数组或 null（清空）")
+          else {
+            if (l.egress.some((e) => validateEgressItem(String(e)) === null))
+              throw new Error(`ladder.egress 只支持 "direct" 或 "socks5://host:port"（收到: ${l.egress.join(", ")}）`)
+            egress = l.egress.filter((e) => typeof e === "string" && e.length > 0)
+          }
+        }
+        cfg.ladder = { enabled: l.enabled === true, port, mode, fixed, egress }
       }
     }
     if (patch.tokens !== undefined) {
@@ -1760,7 +1776,119 @@ if (action === "clear") {
               writeGatewayConfig({ dead: valid as string[] })
               return { ok: true, dead: valid as string[], needsRestart: true }
             }
-            throw new Error(`未知 action: ${action || "(空)"}（支持 add/del/clear/set/toggle/bulk-add/move-to-limited/restore/set-limited/move-to-dead/restore-dead/set-dead）`)
+            // ---- 梯子专用出口池（第四池 ladder.egress）：与三池同语义，needsRestart:false（梯子每连接动态读配置即时生效） ----
+            const ladderList = () => readGatewayConfig().ladder?.egress ?? []
+            const ladderPatch = (egressArr: string[]) => {
+              const cur = readGatewayConfig().ladder ?? { enabled: false, port: 10880, mode: "rotate", fixed: null }
+              writeGatewayConfig({ ladder: { ...cur, egress: egressArr } }) // 保留 enabled/port/mode/fixed
+            }
+            if (action === "set-ladder") {
+              // 直接重设梯子池（删除单项/清空）
+              const arr = Array.isArray(body.list) ? body.list.map((x: unknown) => String(x)) : []
+              const valid = arr.map((x) => validateEgressItem(x))
+              if (valid.some((v) => v === null)) throw new Error("list 格式非法（只支持 direct / socks5://host:port）")
+              ladderPatch(valid as string[])
+              return { ok: true, egress: ladderList(), needsRestart: false }
+            }
+            if (action === "add-ladder") {
+              const e = validateEgressItem(String(body.url || ""))
+              if (!e) throw new Error("出口格式非法：仅支持 \"direct\" 或 \"socks5://[user:pass@]host:port\"")
+              const cur = ladderList()
+              if (cur.includes(e)) throw new Error(`出口已存在: ${e}`)
+              ladderPatch([...cur, e])
+              return { ok: true, egress: ladderList(), needsRestart: false }
+            }
+            if (action === "move-to-ladder") {
+              // 从主池/限流池/不可用池并集抽取 → 梯子池（跨三源，去重）
+              const raw = Array.isArray(body.urls) ? body.urls.map((x: unknown) => String(x)) : []
+              if (raw.length === 0) throw new Error("urls 不能为空")
+              const cfg = readGatewayConfig()
+              const moved: string[] = []
+              const egressSet = new Set(cfg.egress)
+              const limitedSet = new Set(cfg.limited)
+              const deadSet = new Set(cfg.dead)
+              const ladderSet = new Set(cfg.ladder?.egress ?? [])
+              for (const u of raw) {
+                const e = validateEgressItem(u)
+                if (!e) continue
+                const inSrc = egressSet.delete(e) || limitedSet.delete(e) || deadSet.delete(e)
+                if (!inSrc) continue
+                if (!ladderSet.has(e)) ladderSet.add(e)
+                if (!moved.includes(e)) moved.push(e)
+              }
+              writeGatewayConfig({ egress: [...egressSet], limited: [...limitedSet], dead: [...deadSet] })
+              ladderPatch([...ladderSet])
+              return {
+                ok: true,
+                moved,
+                egress: list(),
+                limited: [...limitedSet],
+                dead: [...deadSet],
+                ladderEgress: ladderList(),
+                needsRestart: false,
+              }
+            }
+            if (action === "ladder-to-egress") {
+              // 梯子池 → 主池（勾选移回）
+              const raw = Array.isArray(body.urls) ? body.urls.map((x: unknown) => String(x)) : []
+              if (raw.length === 0) throw new Error("urls 不能为空")
+              const cfg = readGatewayConfig()
+              const restored: string[] = []
+              const ladderSet = new Set(cfg.ladder?.egress ?? [])
+              const egressSet = new Set(cfg.egress)
+              for (const u of raw) {
+                const e = validateEgressItem(u)
+                if (!e) continue
+                if (ladderSet.delete(e)) {
+                  if (!egressSet.has(e)) egressSet.add(e)
+                  if (!restored.includes(e)) restored.push(e)
+                }
+              }
+              ladderPatch([...ladderSet])
+              writeGatewayConfig({ egress: [...egressSet] })
+              return { ok: true, restored, egress: list(), ladderEgress: ladderList(), needsRestart: false }
+            }
+            if (action === "ladder-to-limited") {
+              // 梯子池 → 限流池
+              const raw = Array.isArray(body.urls) ? body.urls.map((x: unknown) => String(x)) : []
+              if (raw.length === 0) throw new Error("urls 不能为空")
+              const cfg = readGatewayConfig()
+              const moved: string[] = []
+              const ladderSet = new Set(cfg.ladder?.egress ?? [])
+              const limitedSet = new Set(cfg.limited)
+              for (const u of raw) {
+                const e = validateEgressItem(u)
+                if (!e) continue
+                if (ladderSet.delete(e)) {
+                  if (!limitedSet.has(e)) limitedSet.add(e)
+                  if (!moved.includes(e)) moved.push(e)
+                }
+              }
+              ladderPatch([...ladderSet])
+              writeGatewayConfig({ limited: [...limitedSet] })
+              return { ok: true, moved, limited: [...limitedSet], ladderEgress: ladderList(), needsRestart: false }
+            }
+            if (action === "ladder-to-dead") {
+              // 梯子池 → 不可用池（surf 失败归类/手动）
+              const raw = Array.isArray(body.urls) ? body.urls.map((x: unknown) => String(x)) : []
+              if (raw.length === 0) throw new Error("urls 不能为空")
+              const cfg = readGatewayConfig()
+              const moved: string[] = []
+              const ladderSet = new Set(cfg.ladder?.egress ?? [])
+              const deadSet = new Set(cfg.dead)
+              for (const u of raw) {
+                const e = validateEgressItem(u)
+                if (!e) continue
+                if (ladderSet.delete(e)) {
+                  if (!deadSet.has(e)) deadSet.add(e)
+                  if (!moved.includes(e)) moved.push(e)
+                }
+              }
+              ladderPatch([...ladderSet])
+              writeGatewayConfig({ dead: [...deadSet] })
+              return { ok: true, moved, dead: [...deadSet], ladderEgress: ladderList(), needsRestart: false }
+            }
+            throw new Error(`未知 action: ${action || "(空)"}（支持 add/del/clear/set/toggle/bulk-add/move-to-limited/restore/set-limited/move-to-dead/restore-dead/set-dead/set-ladder/add-ladder/move-to-ladder/ladder-to-egress/ladder-to-limited/ladder-to-dead）`)
           }
          return null
       }
@@ -2584,6 +2712,24 @@ try {
       <button class="primary" onclick="ladderSave()">保存并应用</button>
       <span class="muted" style="margin-left:8px;flex:1">保存后网关即时启动/停止本地 SOCKS5（无需重启网关）。</span>
     </div>
+    <div id="ladder-pool" class="block" style="border-top:1px solid var(--bd-2);margin-top:12px;padding-top:10px">
+      <b>梯子 IP 池（专用出口） <span id="ladder-pool-badge"></span></b>
+      <div class="row" style="margin-top:10px">
+        <input id="ladder-pool-input" type="text" placeholder="socks5://user:pass@host:port" style="flex:1;min-width:0" />
+        <button id="ladder-pool-add-btn" onclick="addLadderEgress()">＋ 添加出口</button>
+        <button id="ladder-pool-check-btn" onclick="checkLadderPoolHealth()">健康检查</button>
+        <button id="ladder-pool-movedead-btn" onclick="moveAllLadderDead()">→ 转移不可用</button>
+        <button id="ladder-pool-restore-btn" onclick="restoreSelectedLadder()">移回主 IP 池</button>
+      </div>
+      <div id="ladder-pool-toolbar" class="proxy-toolbar" style="display:none">
+        <button class="small" onclick="ladderPoolSelAllToggle()">全选</button>
+        <button class="small" onclick="clearLadderPoolSel()">清空</button>
+        <span class="muted" style="margin-left:8px">已选 <span id="ladder-pool-selcount">0</span></span>
+      </div>
+      <div id="ladder-pool-list" class="proxy-grid muted" style="margin-top:10px">未配置梯子专用出口（梯子将回退主 IP 池或本地直连）。</div>
+      <div class="muted" style="margin-top:6px">「健康检查」对梯子池每个出口做真实最小探测（可用/限流 429/不可用）；梯子 rotate 优先走本池，池空自动回退主 IP 池。「→ 转移不可用」一键把检测失败项移入不可用池；勾选后「移回主 IP 池」。</div>
+      <div id="ladder-pool-msg" class="msg" style="margin-top:6px"></div>
+    </div>
     <div class="muted" style="margin-top:6px">
       提供 <code>socks5://127.0.0.1:<span id="ladder-port-hint">10880</span></code> 本地 SOCKS5 端口，任何应用（浏览器/curl/git/系统代理）指向它即可科学上网——每个连接经出口池智能换 IP（轮换模式）或固定出口转发。
     </div>
@@ -3251,6 +3397,7 @@ function renderEgressList(egress, enabled, ipRotation) {
     return '<div style="display:flex;align-items:center;gap:8px;padding:3px 0;border-bottom:1px solid var(--bd-2)">' +
       '<code style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(e) + '</code>' +
       h + limitedBtn + deadBtn +
+      '<button class="small" onclick="moveToLadderFromEgress(' + i + ')">→ 梯子池</button>' +
       (i === 0 ? '<span class="badge b-go">当前</span>' : "") +
       '<button class="small" onclick="delEgress(' + i + ')">删除</button></div>'
   }).join("")
@@ -3298,6 +3445,7 @@ function renderLimitedList(limited) {
       '<code title="' + esc(e) + '">' + esc(e.indexOf("//") >= 0 ? e.slice(e.indexOf("//") + 2) : e) + '</code>' +
       h +
       (st && !st.ok && st.status !== 429 ? '<button class="small" onclick="moveToDeadFromLimited(' + i + ')">→ 不可用池</button>' : "") +
+      '<button class="small" onclick="moveToLadderFromLimited(' + i + ')">→ 梯子池</button>' +
       '<button class="small" onclick="delLimited(' + i + ')">删除</button>' +
       '</label>'
   }).join("")
@@ -3418,6 +3566,7 @@ function renderDeadList(dead) {
         ' onchange="deadSel[' + i + ']=this.checked;updateDeadSelCount()">' +
       '<code title="' + esc(e) + '">' + esc(e.indexOf("//") >= 0 ? e.slice(e.indexOf("//") + 2) : e) + '</code>' +
       h +
+      '<button class="small" onclick="moveToLadderFromDead(' + i + ')">→ 梯子池</button>' +
       '<button class="small" onclick="delDead(' + i + ')">删除</button>' +
       '</label>'
   }).join("")
@@ -3707,7 +3856,10 @@ async function refreshPlans() {
     document.getElementById("plan-meta").textContent = meta || "暂无套餐数据"
   } catch (e) { document.getElementById("plan-meta").textContent = "套餐信息获取失败：" + e.message }
 }
-var ladderState = { enabled: false, port: 10880, mode: "rotate", fixed: null, running: false }
+var ladderState = { enabled: false, port: 10880, mode: "rotate", fixed: null, running: false, egress: [] }
+var ladderEgressHealth = {} // 梯子池健康检查结果缓存：{ [url]: {ok,status,ms,error} }
+var ladderEgressSel = {} // 梯子池勾选状态：{ index: true }
+var ladderEgressList = [] // 当前渲染的梯子池列表
 function renderLadderState() {
   const el = document.getElementById("ladder-state")
   if (!el) return
@@ -3735,7 +3887,7 @@ function renderLadderState() {
   if (fixedRow) fixedRow.style.display = ladderState.mode === "fixed" ? "flex" : "none"
   const fixedEl = document.getElementById("ladder-fixed")
   if (fixedEl && fixedEl.options.length === 0) {
-    const pools = currentEgressList.concat((deadList || []))
+    const pools = ladderEgressList.concat(currentEgressList, (deadList || []))
     ;(new Set(pools.concat([ladderState.fixed].filter(Boolean)))).forEach((u) => {
       if (u && u !== "direct") fixedEl.add(new Option(shortUrl(u), u, u === ladderState.fixed, u === ladderState.fixed))
     })
@@ -3777,9 +3929,11 @@ async function refreshLadder() {
     ladderState.port = (cfg.ladder && cfg.ladder.port) || 10880
     ladderState.mode = (cfg.ladder && cfg.ladder.mode) || "rotate"
     ladderState.fixed = (cfg.ladder && cfg.ladder.fixed) || null
+    ladderState.egress = (cfg.ladder && cfg.ladder.egress) || (cfg.ladderEgress) || []
     const st = await api("/api/gateway/ladder")
     if (st && st.ok !== false) { ladderState.running = !!st.running; if (st.egressCount != null) ladderState.egressCount = st.egressCount }
     renderLadderState()
+    renderLadderEgress()
   } catch (e) {
     const msg = document.getElementById("ladder-msg")
     if (msg) { msg.className = "msg err"; msg.textContent = "梯子状态读取失败：" + e.message }
@@ -3791,7 +3945,7 @@ function ladderCollectConfig() {
   const fixed = mode === "fixed" ? document.getElementById("ladder-fixed").value : null
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("端口非法（1-65535）")
   if (mode === "fixed" && !fixed) throw new Error("固定模式必须选择一个出口")
-  return { enabled: ladderState.enabled, port, mode, fixed }
+  return { enabled: ladderState.enabled, port, mode, fixed, egress: ladderEgressList }
 }
 async function ladderSave() {
   const msg = document.getElementById("ladder-msg")
@@ -3833,12 +3987,202 @@ async function ladderToggle() {
       : "梯子已停用"
   } catch (e) { msg.className = "msg err"; msg.textContent = "切换失败：" + e.message }
 }
+
+/* ================= 梯子专用出口池（ladder.egress · 第四池） ================= */
+function renderLadderEgress() {
+  const el = document.getElementById("ladder-pool-list")
+  const badge = document.getElementById("ladder-pool-badge")
+  if (!el || !badge) return
+  const list = ladderState.egress || []
+  ladderEgressList = list
+  badge.innerHTML = list.length
+    ? '<span class="badge b-available">' + list.length + " 个专用出口</span>"
+    : '<span class="badge b-stopped">0 个（回退主池/直连）</span>'
+  const toolbar = document.getElementById("ladder-pool-toolbar")
+  if (toolbar) toolbar.style.display = list.length ? "flex" : "none"
+  if (!list.length) { el.textContent = "未配置梯子专用出口（梯子将回退主 IP 池或本地直连）。"; return }
+  el.innerHTML = list.map((e, i) => {
+    const st = ladderEgressHealth[e]
+    const isSel = !!ladderEgressSel[i]
+    let h = ""
+    if (st) {
+      if (st.ok) h = '<span class="badge b-available" title="' + esc((st.ms || 0) + "ms") + '">健康 ' + (st.status || "") + '</span>'
+      else if (st.status === 429) h = '<span class="badge b-warn">限流 429</span>'
+      else h = '<span class="badge b-invalid">不可用</span>'
+    } else {
+      h = '<span class="badge b-stopped">未探测</span>'
+    }
+    return '<label class="proxy-item">' +
+      '<input type="checkbox" ' + (isSel ? "checked" : "") +
+        ' onchange="ladderEgressSel[' + i + ']=this.checked;updateLadderEgressSelCount()">' +
+      '<code title="' + esc(e) + '">' + esc(shortUrl(e)) + '</code>' +
+      h +
+      (st && st.status === 429 ? '<button class="small" onclick="moveLadderToLimited(' + i + ')">→ 限流池</button>' : "") +
+      (st && !st.ok && st.status !== 429 ? '<button class="small" onclick="moveLadderToDead(' + i + ')">→ 不可用池</button>' : "") +
+      '<button class="small" onclick="delLadderEgress(' + i + ')">删除</button>' +
+      '</label>'
+  }).join("")
+  updateLadderEgressSelCount()
+}
+function updateLadderEgressSelCount() {
+  const c = document.getElementById("ladder-pool-selcount")
+  if (c) c.textContent = Object.keys(ladderEgressSel).filter((k) => ladderEgressSel[k]).length
+}
+function ladderPoolSelAllToggle() {
+  const allOn = Object.keys(ladderEgressSel).some((k) => ladderEgressSel[k])
+  ladderEgressList.forEach((_, i) => { ladderEgressSel[i] = !allOn })
+  renderLadderEgress()
+}
+function clearLadderPoolSel() {
+  ladderEgressSel = {}
+  renderLadderEgress()
+}
+async function addLadderEgress() {
+  const input = document.getElementById("ladder-pool-input")
+  const url = (input.value || "").trim()
+  const msg = document.getElementById("ladder-pool-msg")
+  if (!url) { msg.className = "msg err"; msg.textContent = "请输入出口（socks5://host:port）"; return }
+  try {
+    const r = await api("/api/gateway/egress", { action: "add-ladder", url })
+    input.value = ""
+    ladderState.egress = r.egress || []
+    renderLadderEgress(); renderLadderState()
+    msg.className = "msg"; msg.textContent = "已添加梯子池出口（即时生效，无需重启）"
+  } catch (e) { msg.className = "msg err"; msg.textContent = "添加失败：" + e.message }
+}
+async function delLadderEgress(i) {
+  const url = ladderEgressList[i]
+  if (url === undefined) return
+  const msg = document.getElementById("ladder-pool-msg")
+  try {
+    const r = await api("/api/gateway/egress", { action: "set-ladder", list: ladderEgressList.filter((_, ix) => ix !== i) })
+    ladderState.egress = r.egress || []
+    if (ladderEgressHealth[url]) delete ladderEgressHealth[url]
+    renderLadderEgress(); renderLadderState()
+    msg.className = "msg"; msg.textContent = "已删除梯子池出口：" + url
+  } catch (e) { msg.className = "msg err"; msg.textContent = "删除失败：" + e.message }
+}
+async function checkLadderPoolHealth() {
+  const msg = document.getElementById("ladder-pool-msg")
+  const btn = document.getElementById("ladder-pool-check-btn")
+  if (btn) { btn.textContent = "检查中…"; btn.disabled = true }
+  try {
+    const list = ladderEgressList
+    if (!list.length) { msg.className = "msg"; msg.textContent = "梯子池为空（先添加出口）"; return }
+    ladderEgressHealth = {}
+    let done = 0
+    for (const url of list) {
+      const r = await api("/api/gateway/egress/health", { url })
+      const got = (r.egress || [])[0]
+      if (got) ladderEgressHealth[url] = { ok: got.ok, status: got.status, ms: got.ms, error: got.error }
+      done++
+    }
+    renderLadderEgress()
+    const okCount = Object.keys(ladderEgressHealth).filter((u) => ladderEgressHealth[u].ok).length
+    const limCount = Object.keys(ladderEgressHealth).filter((u) => ladderEgressHealth[u].status === 429).length
+    const deadCount = done - okCount - limCount
+    msg.className = "msg"
+    msg.textContent = "检查完成：" + done + " 项，" + okCount + " 个可用，" + limCount + " 个限流，" + deadCount + " 个不可用"
+  } catch (e) { msg.className = "msg err"; msg.textContent = "检查失败：" + e.message }
+  finally { if (btn) { btn.textContent = "健康检查"; btn.disabled = false } }
+}
+async function moveLadderToLimited(i) {
+  const url = ladderEgressList[i]
+  if (!url) return
+  const msg = document.getElementById("ladder-pool-msg")
+  try {
+    const r = await api("/api/gateway/egress", { action: "ladder-to-limited", urls: [url] })
+    ladderState.egress = r.ladderEgress || []
+    renderLadderEgress(); renderLadderState()
+    msg.className = "msg"; msg.textContent = "已移入限流池：" + url
+  } catch (e) { msg.className = "msg err"; msg.textContent = "移入失败：" + e.message }
+}
+async function moveLadderToDead(i) {
+  const url = ladderEgressList[i]
+  if (!url) return
+  const msg = document.getElementById("ladder-pool-msg")
+  try {
+    const r = await api("/api/gateway/egress", { action: "ladder-to-dead", urls: [url] })
+    ladderState.egress = r.ladderEgress || []
+    renderLadderEgress(); renderLadderState()
+    msg.className = "msg"; msg.textContent = "已移入不可用池：" + url
+  } catch (e) { msg.className = "msg err"; msg.textContent = "移入失败：" + e.message }
+}
+async function moveAllLadderDead() {
+  const msg = document.getElementById("ladder-pool-msg")
+  const urls = ladderEgressList.filter((u) => {
+    const st = ladderEgressHealth[u]
+    return st && !st.ok && st.status !== 429
+  })
+  if (!urls.length) { msg.className = "msg err"; msg.textContent = "没有探测为「不可用」的出口（先点「健康检查」，非 429 失败项才会被转移）"; return }
+  try {
+    const r = await api("/api/gateway/egress", { action: "ladder-to-dead", urls })
+    ladderState.egress = r.ladderEgress || []
+    renderLadderEgress(); renderLadderState()
+    msg.className = "msg"
+    msg.textContent = "已转移 " + (r.moved || []).length + " 个不可用出口到不可用池"
+  } catch (e) { msg.className = "msg err"; msg.textContent = "转移失败：" + e.message }
+}
+async function restoreSelectedLadder() {
+  const msg = document.getElementById("ladder-pool-msg")
+  const urls = ladderEgressList.filter((_, i) => ladderEgressSel[i])
+  if (!urls.length) { msg.className = "msg err"; msg.textContent = "未勾选任何出口"; return }
+  try {
+    const r = await api("/api/gateway/egress", { action: "ladder-to-egress", urls })
+    ladderEgressSel = {}
+    ladderEgressHealth = {}
+    ladderState.egress = r.ladderEgress || []
+    renderLadderEgress(); renderLadderState()
+    msg.className = "msg"
+    msg.textContent = "已移回主 IP 池：" + (r.restored || []).join(", ") + "（即时生效）"
+  } catch (e) { msg.className = "msg err"; msg.textContent = "移回失败：" + e.message }
+}
+async function moveToLadderFromEgress(i) {
+  const url = currentEgressList[i]
+  if (!url) return
+  const msg = document.getElementById("egress-msg")
+  try {
+    const r = await api("/api/gateway/egress", { action: "move-to-ladder", urls: [url] })
+    ladderState.egress = r.ladderEgress || []
+    if (r.egress) renderEgressList(r.egress, (r.egress || []).length >= 2, ipRotationOn)
+    renderLadderEgress(); renderLadderState()
+    msg.className = "msg"; msg.textContent = "已移入梯子池：" + url
+  } catch (e) { msg.className = "msg err"; msg.textContent = "移入失败：" + e.message }
+}
+async function moveToLadderFromLimited(i) {
+  const cfg = await api("/api/gateway/config")
+  const url = (cfg.limited || [])[i]
+  if (!url) return
+  const msg = document.getElementById("limited-msg")
+  try {
+    const r = await api("/api/gateway/egress", { action: "move-to-ladder", urls: [url] })
+    ladderState.egress = r.ladderEgress || []
+    if (r.limited) renderLimitedList(r.limited)
+    renderLadderEgress(); renderLadderState()
+    msg.className = "msg"; msg.textContent = "已移入梯子池：" + url
+  } catch (e) { msg.className = "msg err"; msg.textContent = "移入失败：" + e.message }
+}
+async function moveToLadderFromDead(i) {
+  const cfg = await api("/api/gateway/config")
+  const url = (cfg.dead || [])[i]
+  if (!url) return
+  const msg = document.getElementById("dead-msg")
+  try {
+    const r = await api("/api/gateway/egress", { action: "move-to-ladder", urls: [url] })
+    ladderState.egress = r.ladderEgress || []
+    if (r.dead) renderDeadList(r.dead)
+    renderLadderEgress(); renderLadderState()
+    msg.className = "msg"; msg.textContent = "已移入梯子池：" + url
+  } catch (e) { msg.className = "msg err"; msg.textContent = "移入失败：" + e.message }
+}
 async function ladderSurfCheck() {
   const resultEl = document.getElementById("ladder-surf-result")
   const msg = document.getElementById("ladder-msg")
   if (resultEl) resultEl.textContent = "科学上网筛选进行中（对每个 socks5 出口测 google/youtube 隧道 + 出口归属，请稍候）…"
   try {
-    const r = await api("/api/gateway/ladder/check", {})
+    // 梯子池非空则筛梯子池（反映梯子真实出口），否则筛主池
+    const urls = ladderEgressList.length ? { urls: ladderEgressList } : {}
+    const r = await api("/api/gateway/ladder/check", urls)
     if (r.ok === false) throw new Error(r.error || "筛选失败")
     msg.className = "msg"; msg.textContent = "筛选完成（" + new Date(r.checkedAt).toLocaleTimeString() + "）"
     if (!resultEl) return

@@ -198,15 +198,18 @@ Web 管理端（127.0.0.1:8899 → 网关 → IP 池下方「免费代理」卡�
     "enabled": true,
     "port": 10880,          // 本地 SOCKS5 监听端口（仅 127.0.0.1，安全基线）
     "mode": "rotate",       // "rotate"=每连接轮换出口池 | "fixed"=固定走指定出口
-    "fixed": "socks5://host1:1080"  // mode="fixed" 时使用的出口（可选）
+    "fixed": "socks5://host1:1080",  // mode="fixed" 时使用的出口（可选）
+    "egress": ["socks5://ladderA:1080", "socks5://ladderB:1081"]   // 梯子专用出口池（第四池，可选）
   }
 }
 ```
 
 - **服务仅绑定 127.0.0.1**：只供本机应用使用，不暴露内网（安全基线，同网关 HTTP）。
+- **rotate 模式出口优先级：梯子池 → 主 egress 池 → 本地直连**。`ladder.egress` 非空时梯子**只用梯子池**（主池被旁路，实现「专业代理专用梯子」隔离）；池空则自动回退主 egress 池（老用户只配主池行为不变）；两池都空 → 本地直连。梯子池轮换用**独立计数器**（`_ladderIdx`），不扰动网关 HTTP 出口轮换序列。
 - **rotate 模式**：每个新连接自动顺延一个出口（不依赖 zen 套餐开关），某出口连接失败会**自动顺延下一出口重试最多 3 次**（免费代理时好时坏也能大体稳定）。
-- **fixed 模式**：始终走 `fixed` 指定的出口（适合需要固定出口 IP 的场景）。
+- **fixed 模式**：始终走 `fixed` 指定的出口（适合需要固定出口 IP 的场景）；fixed 出口可来自任一池。
 - **即时生效**：改配置后用 Web 或 `POST /api/gateway/ladder?action=apply` 应用；网关启动时若 `enabled:true` 也会自动拉起。
+- **梯子池管理**（Web 梯子卡「梯子 IP 池」子区或 `POST /api/gateway/egress`）：`add-ladder` / `set-ladder` / `move-to-ladder`（主池∪限流池∪不可用池并集→梯子池）/ `ladder-to-egress` / `ladder-to-limited` / `ladder-to-dead`。所有池操作 `needsRestart:false`——梯子每连接动态读配置，**无需重启网关即时生效**；限流/不可用 sink 与主池共享（一个出口隧道挂了，对梯子与网关都不可用)。
 - 池为空或已停用时退化为**本地直连**（等价纯本地代理）。
 
 ### 梯子 API

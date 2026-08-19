@@ -1274,10 +1274,10 @@ describe("梯子（本地 SOCKS5 透明代理）Web 集成", () => {
     )
     const okj = await ok.json()
     expect(okj.ok).toBe(true) // 网关不可达时也返回 ok:true（配置已落盘；apply 失败在 error 字段）
-    expect(mod.readGatewayConfig().ladder).toEqual({ enabled: true, port: 10880, mode: "fixed", fixed: "socks5://123.58.219.171:10808" })
+    expect(mod.readGatewayConfig().ladder).toEqual({ enabled: true, port: 10880, mode: "fixed", fixed: "socks5://123.58.219.171:10808", egress: [] })
     // GET /api/gateway/config 透传 ladder
     const gc = await (await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/config"))).json()
-    expect(gc.ladder).toEqual({ enabled: true, port: 10880, mode: "fixed", fixed: "socks5://123.58.219.171:10808" })
+    expect(gc.ladder).toEqual({ enabled: true, port: 10880, mode: "fixed", fixed: "socks5://123.58.219.171:10808", egress: [] })
     // 非法端口 → 写失败（400）
     const bad = await mod.handleWeb(
       new Request("http://127.0.0.1:8899/api/gateway/ladder", {
@@ -1350,6 +1350,113 @@ describe("梯子（本地 SOCKS5 透明代理）Web 集成", () => {
     expect(html).toContain("git config --global http.proxy")
     expect(html).toContain("轮换模式")
     expect(html).toContain("固定模式")
+  })
+  test("梯子专用出口池：add-ladder/set-ladder/move-to-ladder/ladder-to-* 后端动作 + 持久化", async () => {
+    // 准备主池 + 梯子池 + 限流池 + 不可用池数据
+    mod.writeGatewayConfig({ egress: ["socks5://1.1.1.1:1080", "socks5://2.2.2.2:1080"], limited: ["socks5://3.3.3.3:1080"], dead: ["socks5://4.4.4.4:1080"] })
+    // add-ladder
+    const add = await (await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "add-ladder", url: "socks5://9.9.9.9:1080" }) }),
+    )).json()
+    expect(add.ok).toBe(true)
+    expect(add.egress).toEqual(["socks5://9.9.9.9:1080"])
+    expect(add.needsRestart).toBe(false) // 梯子池即时生效
+    // 重复 add-ladder → 400
+    const dup = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "add-ladder", url: "socks5://9.9.9.9:1080" }) }),
+    )
+    expect(dup.status).toBe(400)
+    // move-to-ladder：从主池+限流池+不可用池并集抽取
+    const mv = await (await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "move-to-ladder", urls: ["socks5://1.1.1.1:1080", "socks5://3.3.3.3:1080", "socks5://4.4.4.4:1080"] }) }),
+    )).json()
+    expect(mv.ok).toBe(true)
+    expect(mv.moved.length).toBe(3)
+    expect(mv.ladderEgress).toEqual(expect.arrayContaining(["socks5://1.1.1.1:1080", "socks5://3.3.3.3:1080", "socks5://4.4.4.4:1080", "socks5://9.9.9.9:1080"]))
+    const cfgAfter = mod.readGatewayConfig()
+    expect(cfgAfter.egress).toEqual(["socks5://2.2.2.2:1080"])
+    expect(cfgAfter.limited).toEqual([])
+    expect(cfgAfter.dead).toEqual([])
+    expect(cfgAfter.ladder!.egress).toEqual(expect.arrayContaining(["socks5://9.9.9.9:1080", "socks5://1.1.1.1:1080", "socks5://3.3.3.3:1080", "socks5://4.4.4.4:1080"]))
+    // ladder-to-egress：勾选移回主池
+    const re = await (await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "ladder-to-egress", urls: ["socks5://9.9.9.9:1080"] }) }),
+    )).json()
+    expect(re.ok).toBe(true)
+    expect(re.restored).toEqual(["socks5://9.9.9.9:1080"])
+    expect(mod.readGatewayConfig().egress).toContain("socks5://9.9.9.9:1080")
+    expect(mod.readGatewayConfig().ladder!.egress).not.toContain("socks5://9.9.9.9:1080")
+    // ladder-to-limited / ladder-to-dead
+    await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "ladder-to-limited", urls: ["socks5://1.1.1.1:1080"] }) }),
+    )
+    expect(mod.readGatewayConfig().limited).toContain("socks5://1.1.1.1:1080")
+    await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "ladder-to-dead", urls: ["socks5://3.3.3.3:1080"] }) }),
+    )
+    expect(mod.readGatewayConfig().dead).toContain("socks5://3.3.3.3:1080")
+    // set-ladder：重设（清空）
+    await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "set-ladder", list: [] }) }),
+    )
+    expect(mod.readGatewayConfig().ladder!.egress).toEqual([])
+    // 清场
+    mod.writeGatewayConfig({ egress: [], limited: [], dead: [] })
+  })
+  test("梯子池守卫：action=set 不带 egress 不清池（ladderSave 防洗库）", async () => {
+    mod.writeGatewayConfig({ ladder: { enabled: false, port: 10880, mode: "rotate", fixed: null, egress: ["socks5://5.5.5.5:1080"] } })
+    // 模拟 Web ladderSave：只发四字段
+    await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/ladder", { method: "POST", body: JSON.stringify({ action: "set", ladder: { enabled: true, port: 10880, mode: "rotate" } }) }),
+    )
+    expect(mod.readGatewayConfig().ladder!.egress).toEqual(["socks5://5.5.5.5:1080"]) // 梯子池保留
+    // 显式 egress 数组 → 覆盖
+    await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/ladder", { method: "POST", body: JSON.stringify({ action: "set", ladder: { enabled: true, port: 10880, mode: "rotate", egress: ["socks5://6.6.6.6:1080"] } }) }),
+    )
+    expect(mod.readGatewayConfig().ladder!.egress).toEqual(["socks5://6.6.6.6:1080"])
+    // 非法 egress 项 → 400
+    const bad = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/ladder", { method: "POST", body: JSON.stringify({ action: "set", ladder: { enabled: true, port: 10880, mode: "rotate", egress: ["http://bad:80"] } }) }),
+    )
+    expect(bad.status).toBe(400)
+    mod.writeGatewayConfig({ ladder: null })
+    expect(mod.readGatewayConfig().ladder).toBe(null)
+  })
+  test("WEB_HTML 梯子 IP 池：子区块容器/按钮/函数/action 串 + 防洗库回归", () => {
+    const html: string = (mod as any).WEB_HTML
+    expect(html).toContain('id="ladder-pool"')
+    expect(html).toContain('id="ladder-pool-badge"')
+    expect(html).toContain('id="ladder-pool-input"')
+    expect(html).toContain('id="ladder-pool-list"')
+    expect(html).toContain("梯子 IP 池")
+    expect(html).toContain('id="ladder-pool-add-btn"')
+    expect(html).toContain('onclick="addLadderEgress()"')
+    expect(html).toContain('id="ladder-pool-check-btn"')
+    expect(html).toContain('onclick="checkLadderPoolHealth()"')
+    expect(html).toContain('id="ladder-pool-movedead-btn"')
+    expect(html).toContain('onclick="moveAllLadderDead()"')
+    expect(html).toContain('id="ladder-pool-restore-btn"')
+    expect(html).toContain('onclick="restoreSelectedLadder()"')
+    expect(html).toContain("function renderLadderEgress(")
+    expect(html).toContain("async function checkLadderPoolHealth()")
+    expect(html).toContain("async function addLadderEgress()")
+    expect(html).toContain("async function delLadderEgress(")
+    expect(html).toContain("async function moveLadderToLimited(")
+    expect(html).toContain("async function moveLadderToDead(")
+    expect(html).toContain("async function moveAllLadderDead()")
+    expect(html).toContain("async function restoreSelectedLadder()")
+    expect(html).toContain("async function moveToLadderFromEgress(")
+    expect(html).toContain("async function moveToLadderFromLimited(")
+    expect(html).toContain("async function moveToLadderFromDead(")
+    expect(html).toContain("function ladderPoolSelAllToggle()")
+    expect(html).toContain("function updateLadderEgressSelCount()")
+    expect(html).toContain('api("/api/gateway/egress", { action: "add-ladder", url')
+    expect(html).toContain('api("/api/gateway/egress", { action: "move-to-ladder", urls')
+    expect(html).toContain('api("/api/gateway/egress", { action: "ladder-to-egress", urls')
+    expect(html).toContain('api("/api/gateway/egress", { action: "ladder-to-dead", urls')
+    expect(html).toContain("egress: ladderEgressList") // 防洗库回归：ladderCollectConfig 带梯子池
+    expect(html).toContain("未配置梯子专用出口")
   })
 })
 

@@ -2143,19 +2143,25 @@ t("egressHealthCheck 有 key → 每个出口返回 index/url/ok 契约（网络
 // 用 gw 已 import 的模块（其 GATEWAY_CONFIG=ZEN_GATEWAY_CONFIG 测试路径）直接写文件读取，避免 re-import 竞态。
 group("梯子（ladderConfig / ladderNextEgress / normalizeLadderConfig）")
 
-t("normalizeLadderConfig：纯函数归一（缺失→null / 完整→归一 / 非法容错）", () => {
+t("normalizeLadderConfig：纯函数归一（缺失→null / 完整→归一 / 非法容错 / egress 数组）", () => {
   assert.equal(gw.normalizeLadderConfig(null), null)
   assert.equal(gw.normalizeLadderConfig("x"), null)
   assert.deepEqual(gw.normalizeLadderConfig({ enabled: true, port: 10880, mode: "fixed", fixed: "socks5://1.2.3.4:1080" }), {
-    enabled: true, port: 10880, mode: "fixed", fixed: "socks5://1.2.3.4:1080",
+    enabled: true, port: 10880, mode: "fixed", fixed: "socks5://1.2.3.4:1080", egress: [],
   })
-  assert.deepEqual(gw.normalizeLadderConfig({ enabled: "yes", port: "abc", mode: "weird" }), { enabled: false, port: 10880, mode: "rotate", fixed: null })
-  assert.deepEqual(gw.normalizeLadderConfig({}), { enabled: false, port: 10880, mode: "rotate", fixed: null })
+  assert.deepEqual(gw.normalizeLadderConfig({ enabled: "yes", port: "abc", mode: "weird" }), { enabled: false, port: 10880, mode: "rotate", fixed: null, egress: [] })
+  assert.deepEqual(gw.normalizeLadderConfig({}), { enabled: false, port: 10880, mode: "rotate", fixed: null, egress: [] })
+  // egress 数组过滤非字符串/空串；缺失→[]
+  assert.deepEqual(gw.normalizeLadderConfig({ enabled: true, port: 10880, mode: "rotate", fixed: null, egress: ["socks5://1.1.1.1:1080", "", 123] }).egress, ["socks5://1.1.1.1:1080"])
+  assert.deepEqual(gw.normalizeLadderConfig({ enabled: true, port: 10880, mode: "rotate", fixed: null, egress: "nope" }).egress, [])
 })
 
-t("readGatewayConfig：ladder 字段读取归一（写文件 → gw 读取）+ 缺失 → null", () => {
-  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "zen", ladder: { enabled: true, port: 10880, mode: "fixed", fixed: "socks5://1.2.3.4:1080" } }))
-  assert.deepEqual(gw.readGatewayConfig().ladder, { enabled: true, port: 10880, mode: "fixed", fixed: "socks5://1.2.3.4:1080" })
+t("readGatewayConfig：ladder 字段读取归一（写文件 → gw 读取，含 egress）+ 缺失 → null", () => {
+  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "zen", ladder: { enabled: true, port: 10880, mode: "fixed", fixed: "socks5://1.2.3.4:1080", egress: ["socks5://9.9.9.9:1080"] } }))
+  assert.deepEqual(gw.readGatewayConfig().ladder, { enabled: true, port: 10880, mode: "fixed", fixed: "socks5://1.2.3.4:1080", egress: ["socks5://9.9.9.9:1080"] })
+  // 旧形态（无 egress）→ 零迁移 egress:[]
+  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "zen", ladder: { enabled: true, port: 10880, mode: "rotate" } }))
+  assert.deepEqual(gw.readGatewayConfig().ladder, { enabled: true, port: 10880, mode: "rotate", fixed: null, egress: [] })
   writeFileSync(_gwCfgPath, JSON.stringify({ plan: "zen" }))
   assert.equal(gw.readGatewayConfig().ladder, null)
   try { rmSync(_gwCfgPath, { force: true }) } catch {}
@@ -2176,7 +2182,7 @@ t("ladderConfig：读当前 gateway-config 归一（enabled/port/mode/fixed）",
   try { rmSync(_gwCfgPath, { force: true }) } catch {}
 })
 
-t("ladderNextEgress：fixed 模式返回固定出口；rotate 模式从池轮换（不依赖套餐开关）", () => {
+t("ladderNextEgress：fixed 优先 → 梯子池优先级锁死（主池在场也回梯子池）→ 梯子池空回退主池 → 全空 null", () => {
   writeFileSync(_gwCfgPath, JSON.stringify({
     plan: "zen",
     egress: ["socks5://1.1.1.1:1080", "socks5://2.2.2.2:1080"],
@@ -2185,16 +2191,34 @@ t("ladderNextEgress：fixed 模式返回固定出口；rotate 模式从池轮换
   const e = gw.ladderNextEgress()
   assert.ok(e && e.type === "socks5")
   assert.equal(e.host, "9.9.9.9")
-  // rotate 模式：go 档（egressEnabled=false）也应从池轮换返回出口（梯子不依赖套餐开关）
+  // 梯子池非空 + 主池在场 → 命中梯子池（隔离）
   writeFileSync(_gwCfgPath, JSON.stringify({
     plan: "go",
     egress: ["socks5://1.1.1.1:1080", "socks5://2.2.2.2:1080"],
-    ladder: { enabled: true, port: 10880, mode: "rotate" },
+    ladder: { enabled: true, port: 10880, mode: "rotate", egress: ["socks5://7.7.7.7:1080", "socks5://8.8.8.8:1080"] },
+  }))
+  const a = gw.ladderNextEgress()
+  const b = gw.ladderNextEgress()
+  assert.ok(a && a.type === "socks5" && b && b.type === "socks5")
+  assert.ok((a.host === "7.7.7.7" || a.host === "8.8.8.8"), "梯子池优先（host=" + a.host + "）")
+  assert.ok((b.host === "7.7.7.7" || b.host === "8.8.8.8"), "梯子池轮换（host=" + b.host + "）")
+  assert.ok(a.host !== b.host, "梯子池双项轮换交替")
+  // 梯子池空（含只 direct）→ 回退主池
+  writeFileSync(_gwCfgPath, JSON.stringify({
+    plan: "go",
+    egress: ["socks5://1.1.1.1:1080", "socks5://2.2.2.2:1080"],
+    ladder: { enabled: true, port: 10880, mode: "rotate", egress: ["direct"] },
   }))
   const e2 = gw.ladderNextEgress()
   assert.ok(e2 && e2.type === "socks5")
-  assert.ok(e2.host === "1.1.1.1" || e2.host === "2.2.2.2")
-  // 池无 socks5（仅 direct）→ null（本地直连兜底）
+  assert.ok(e2.host === "1.1.1.1" || e2.host === "2.2.2.2", "梯子池仅 direct → 回退主池（host=" + e2.host + "）")
+  // 空梯子池（显式 []）→ 回退主池
+  writeFileSync(_gwCfgPath, JSON.stringify({
+    plan: "go", egress: ["socks5://5.5.5.5:1080"], ladder: { enabled: true, port: 10880, mode: "rotate", egress: [] },
+  }))
+  const e3 = gw.ladderNextEgress()
+  assert.ok(e3 && e3.type === "socks5" && e3.host === "5.5.5.5")
+  // 主池+梯子池全无 socks5 → null（本地直连兜底）
   writeFileSync(_gwCfgPath, JSON.stringify({ plan: "go", egress: ["direct"], ladder: { enabled: true, port: 10880, mode: "rotate" } }))
   assert.equal(gw.ladderNextEgress(), null)
   try { rmSync(_gwCfgPath, { force: true }) } catch {}

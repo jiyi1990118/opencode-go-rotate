@@ -79,8 +79,9 @@
 | POST | `/api/log/clear` | `{}` | `{ok,status}` | 清空日志 + 删归档 |
 | POST | `/api/gateway/test` | `{}` | `{ok, status?, ms?, model?, detail}` | **网关功能测试**：经网关发一条最小 chat 请求，验证「网关进程 → 上游 opencode → 模型返回」全链路（healthz 只证明进程在，本端点证明真能出结果）。成功 `ok:true` + 延迟 + 响应片段；失败分类（429 FreeUsageLimit → 免费档限流「非 key 问题」/ 401·402 → 配额鉴权 / 不可达 → 网络错误）。消耗约 8 token/次 |
 | GET | `/api/gateway/ladder` | - | `{ok, enabled, port, mode, fixed, running, egressCount, conns}` | **梯子状态**：本地 SOCKS5 透明代理（供其它应用科学上网）运行态。`running` 需网关可达，不可达时 `ok:false` + 配置侧信息 |
-| POST | `/api/gateway/ladder` | `{action, ladder?}` | `{ok, written, running, applyError?}` | **梯子管理**：`action:"set"`+`ladder:{enabled,port,mode:"rotate"\|"fixed",fixed}` 写配置并通知网关即时启停；校验失败 400。`ladder:null` 清空。 |
-| POST | `/api/gateway/ladder/check` | `{urls?}` | `{ok, checkedAt, egress:[{url,ok,ms,google,youtube,exitIp,country,city,org,error}]}` | **科学上网筛选**：对每个 socks5 出口测「能否 CONNECT 被墙站点 google/youtube:443」+ 经出口查真实出口 IP 归属地（ip-api.com）。默认测全池，可 `urls` 指定。 |
+| POST | `/api/gateway/ladder` | `{action, ladder?}` | `{ok, written, running, applyError?}` | **梯子管理**：`action:"set"`+`ladder:{enabled,port,mode:"rotate"\|"fixed",fixed,egress?}` 写配置并通知网关即时启停；校验失败 400。`ladder:null` 清空。`egress`（梯子专用出口池）缺省传时保留现值（Web 保存梯子设置不清池）。 |
+| POST | `/api/gateway/ladder/check` | `{urls?}` | `{ok, checkedAt, egress:[{url,ok,ms,google,youtube,exitIp,country,city,org,error}]}` | **科学上网筛选**：对每个 socks5 出口测「能否 CONNECT 被墙站点 google/youtube:443」+ 经出口查真实出口 IP 归属地（ip-api.com）。默认测全池/梯子池，可 `urls` 指定。 |
+| POST | `/api/gateway/egress`（梯子池动作） | `{action, ...}` | 动作对应列表 | **梯子专用出口池（第四池 ladder.egress）管理**：`add-ladder {url}` / `set-ladder {list}` / `move-to-ladder {urls}`（主池∪限流池∪不可用池并集抽取→梯子池） / `ladder-to-egress {urls}`（梯子池→主池） / `ladder-to-limited {urls}` / `ladder-to-dead {urls}`。均 `needsRestart:false`（梯子每连接动态读配置即时生效）。 |
 | 其它 | 任意未匹配 | - | 404 `{"error":"not found"}` | POST 处理抛错时 400 `{"error":msg}` |
 
 所有写操作带**跨进程文件锁**（`withLockSync`：O_EXCL + 陈旧锁检测 + 5s 超时降级）与**原子写**（.tmp + rename），与 CLI / zen-gateway 同一套并发安全机制。
