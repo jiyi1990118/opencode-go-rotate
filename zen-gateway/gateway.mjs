@@ -545,6 +545,7 @@ function readGatewayConfig() {
         ? cfg.tokens.filter((t) => typeof t === "string" && t.length > 0)
         : [],
       egress: Array.isArray(cfg.egress) ? cfg.egress.filter((e) => typeof e === "string") : [],
+      egress_active: Array.isArray(cfg.egress_active) ? cfg.egress_active.filter((e) => typeof e === "string" && e.length > 0) : [], // 手动选中的轮换子集（非空时只用它；空=全池）
       ip_rotation: cfg.ip_rotation !== false, // 缺省开启；显式 false 关闭
       egress_index: Number.isInteger(cfg.egress_index) && cfg.egress_index >= 0 ? cfg.egress_index : 0, // 出口轮换游标（重启续接，缺省 0）
       ladder: normalizeLadderConfig(cfg.ladder),
@@ -849,17 +850,25 @@ let _egressIdx = Number.isInteger(_GW_CFG && _GW_CFG.egress_index) && _GW_CFG.eg
 let _egressOk = true // 当前出口是否健康（429 → false 触发切换）
 let _ladderIdx = 0 // 梯子专用池轮换计数器（独立于 _egressIdx：梯子流量不扰动网关 HTTP 轮换序列）
 
-/** 动态出口表：从当前 gateway-config 实时解析（增删/开关即时生效）。 */
+/** 动态出口表：从当前 gateway-config 实时解析（增删/开关即时生效）。
+ *  egress_active 手动选中子集可用时，只用子集轮换（其余出口保留在池中不参与）；为空=用全池。 */
 function egressList() {
-  return parseEgressList(readGatewayConfig().egress)
+  const cfg = readGatewayConfig()
+  const src = cfg.egress_active && cfg.egress_active.length ? cfg.egress_active : cfg.egress
+  return parseEgressList(src)
 }
 
-/** IP 轮换是否启用（动态）：zen 套餐 + egress≥2 + ip_rotation 未显式关闭。 */
+/** IP 轮换是否启用（动态）：zen 套餐 + ip_rotation 未显式关闭。
+ *  用「有效出口」（ecins_active 子集或全池）判定：手动选中子集 ≥1 即可用（单选=固定走该出口）；
+ *  未选子集（用全池）需 ≥2 才轮换（保持旧语义：1 个出口无轮换意义）。 */
 function egressEnabled() {
   if (ACTIVE_PLAN.id !== "zen") return false
   const cfg = readGatewayConfig()
   if (cfg.ip_rotation === false) return false
-  return parseEgressList(cfg.egress).length >= 2
+  const L = egressList()
+  if (!L.length) return false
+  if (cfg.egress_active && cfg.egress_active.length) return true // 手动选中子集：≥1 即启用
+  return L.length >= 2
 }
 
 /** 取当前出口；egressEnabled() 时才轮换（否则恒 direct=null）。 */
@@ -911,9 +920,11 @@ function egressSucceeded() {
 /** 当前出口健康状态（测试/状态端点用） */
  function egressSnapshot() {
    const L = egressList()
+   const cfg = readGatewayConfig()
    return {
      enabled: egressEnabled(),
      count: L.length,
+     active: cfg.egress_active && cfg.egress_active.length ? cfg.egress_active : null, // 手动选中子集（null=全池）
      index: _egressIdx,
      current: L[_egressIdx % Math.max(L.length, 1)] ? L[_egressIdx % L.length].raw : "direct",
      list: L.map((e) => e.raw),

@@ -1181,6 +1181,7 @@ type GatewayConfig = {
   token_set_at: string | null
   tokens: string[]
   egress: string[]
+  egress_active: string[] // 手动选中的轮换子集（非空时网关只用它轮换；空=全池；由「启用选中」写入）
   limited: string[] // 已被上游限流（429）的出口，从主池移出单独管理（不参与轮换）
   dead: string[] // 已确认不可用的出口（探测失败/超时），从主池/限流池移出单独管理（不参与轮换）
   ip_rotation: boolean // IP 轮换总开关（默认 true；false = 即使有出口池也直接走本地直连）
@@ -1195,7 +1196,7 @@ type GatewayConfig = {
 }
 
 function defaultGatewayConfig(): GatewayConfig {
-  return { plan: "go", token: null, token_set_at: null, tokens: [], egress: [], limited: [], dead: [], ip_rotation: true, egress_index: 0, ladder: null }
+  return { plan: "go", token: null, token_set_at: null, tokens: [], egress: [], egress_active: [], limited: [], dead: [], ip_rotation: true, egress_index: 0, ladder: null }
 }
 
 function readGatewayConfig(): GatewayConfig {
@@ -1214,6 +1215,9 @@ function readGatewayConfig(): GatewayConfig {
       tokens,
       egress: Array.isArray(raw.egress)
         ? raw.egress.filter((e: unknown): e is string => typeof e === "string" && e.length > 0)
+        : [],
+      egress_active: Array.isArray(raw.egress_active)
+        ? raw.egress_active.filter((e: unknown): e is string => typeof e === "string" && e.length > 0)
         : [],
       limited: Array.isArray(raw.limited)
         ? raw.limited.filter((e: unknown): e is string => typeof e === "string" && e.length > 0)
@@ -1250,6 +1254,7 @@ function writeGatewayConfig(patch: {
   token?: string | null
   tokens?: string[] | null
   egress?: string[] | null
+  egress_active?: string[] | null
   limited?: string[] | null
   dead?: string[] | null
   ladder?: {
@@ -1295,6 +1300,20 @@ function writeGatewayConfig(patch: {
           : patch.egress.filter((e) => typeof e === "string" && e.length > 0)
       if (cfg.egress.some((e) => e !== "direct" && !e.startsWith("socks5://")))
         throw new Error(`egress 只支持 "direct" 或 "socks5://host:port"（收到: ${cfg.egress.join(", ")}）`)
+      // 池被修改（增删/清空/转移）时，手动选中子集同步裁剪——已不在池中的选中项自动释放
+      cfg.egress_active = cfg.egress_active.filter((e) => cfg.egress.includes(e))
+    }
+    if (patch.egress_active !== undefined) {
+      // 手动选中的轮换子集：为空/null 清空（回退全池）；非空校验为 egress 池成员子集
+      if (patch.egress_active !== null && !Array.isArray(patch.egress_active))
+        throw new Error("egress_active 必须是字符串数组或 null（清空）")
+      cfg.egress_active =
+        patch.egress_active === null
+          ? []
+          : patch.egress_active.filter((e) => typeof e === "string" && e.length > 0)
+      const pool = new Set(cfg.egress)
+      if (cfg.egress_active.some((e) => !pool.has(e)))
+        throw new Error(`egress_active 只能从当前 IP 池（egress）中选取（收到: ${cfg.egress_active.join(", ")}）`)
     }
     if (patch.dead !== undefined) {
       if (patch.dead !== null && !Array.isArray(patch.dead))
@@ -1382,8 +1401,9 @@ function gatewayConfigPayload() {
     limited: cfg.limited,
     dead: cfg.dead,
     ladder: cfg.ladder,
+    egressActive: cfg.egress_active,        // 手动选中的轮换子集（[]=全池轮换）
     ipRotation: cfg.ip_rotation,               // 总开关（false = 关闭，走本地直连）
-    egressEnabled: cfg.ip_rotation && cfg.egress.length >= 2, // 实际轮换启用（开关开 && ≥2 出口）
+    egressEnabled: cfg.ip_rotation && (cfg.egress_active.length ? cfg.egress_active.length >= 1 : cfg.egress.length >= 2), // 实际轮换启用（子集≥1 / 全池≥2）
     needsRestart: false, // GET 只读；needsRestart:true 仅由 POST 写操作返回
   }
 }
@@ -1708,6 +1728,48 @@ if (action === "clear") {
               writeGatewayConfig({ egress: null })
               return { ok: true, egress: [], needsRestart: true }
             }
+            if (action === "activate") {
+              // 把选中的 IP 池成员设为当前轮换子集（非空）→ 网关只在这些出口间轮换；同时打开总开关「立马启动」。
+              // 未选中项保留在 egress 全池里（不删除，子集可随时「恢复全池」）。
+              // 选中项前置到池列表头部：前台刷新后「用得最多的」排在前面，看得见的列表顺序 = 实际使用顺序。
+              const selected = (Array.isArray(body.urls) ? body.urls.map((x: unknown) => String(x)) : []).filter(Boolean)
+              if (!selected.length) throw new Error("urls 不能为空（先勾选要启用的出口）")
+              const cfg0 = readGatewayConfig()
+              const poolSet = new Set(cfg0.egress)
+              if (selected.some((u) => !poolSet.has(u)))
+                throw new Error(`选中的出口不在当前 IP 池（请刷新后重试）: ${selected.filter((u) => !poolSet.has(u)).join(", ")}`)
+              const uniq: string[] = []
+              const seen = new Set<string>()
+              for (const u of selected) if (!seen.has(u)) { seen.add(u); uniq.push(u) }
+              const rest = cfg0.egress.filter((e) => !seen.has(e)) // 保留原有顺序的未选中项
+              writeGatewayConfig({ egress: [...uniq, ...rest], egress_active: uniq, ip_rotation: true }) // 启动轮换：无论之前开关状态，激活即开启
+              const cfg = readGatewayConfig()
+              return {
+                ok: true,
+                egressActive: cfg.egress_active,
+                egress: cfg.egress,
+                limited: cfg.limited,
+                dead: cfg.dead,
+                ipRotation: cfg.ip_rotation,
+                enabled: cfg.ip_rotation && cfg.egress_active.length >= 1,
+                needsRestart: false, // 网关 egressList()/egressEnabled() 动态读配置，无需重启
+              }
+            }
+            if (action === "deactivate") {
+              // 恢复全池轮换：清空手动选中子集 → 网关回退到整个 egress 池
+              writeGatewayConfig({ egress_active: null })
+              const cfg = readGatewayConfig()
+              return {
+                ok: true,
+                egressActive: [],
+                egress: cfg.egress,
+                limited: cfg.limited,
+                dead: cfg.dead,
+                ipRotation: cfg.ip_rotation,
+                enabled: cfg.ip_rotation && cfg.egress.length >= 2,
+                needsRestart: false,
+              }
+            }
             if (action === "set") {
               const arr = Array.isArray(body.list) ? body.list.map((x: unknown) => String(x)) : []
               if (arr.length === 0) throw new Error("list 不能为空")
@@ -1953,7 +2015,7 @@ if (action === "clear") {
               writeGatewayConfig({ dead: [...deadSet] })
               return { ok: true, moved, dead: [...deadSet], ladderEgress: ladderList(), needsRestart: false }
             }
-            throw new Error(`未知 action: ${action || "(空)"}（支持 add/del/clear/set/toggle/bulk-add/move-to-limited/restore/set-limited/move-to-dead/restore-dead/set-dead/set-ladder/add-ladder/move-to-ladder/ladder-to-egress/ladder-to-limited/ladder-to-dead）`)
+            throw new Error(`未知 action: ${action || "(空)"}（支持 add/del/clear/activate/deactivate/set/toggle/bulk-add/move-to-limited/restore/set-limited/move-to-dead/restore-dead/set-dead/set-ladder/add-ladder/move-to-ladder/ladder-to-egress/ladder-to-limited/ladder-to-dead）`)
           }
          return null
       }
@@ -2701,6 +2763,14 @@ try {
       <button id="egress-movedead-btn" onclick="moveAllDeadFromEgress()">→ 转移不可用</button>
       <button id="egress-prune-btn" class="primary" onclick="pruneEgress()">一键整理</button>
       <button class="danger" onclick="clearEgress()">清空全部</button>
+    </div>
+    <div id="egress-toolbar" class="proxy-toolbar" style="display:none">
+      <button class="small" onclick="egressSelAllToggle()">全选</button>
+      <button class="small" onclick="clearEgressSel()">清空</button>
+      <span class="muted" style="margin-left:8px">已选 <span id="egress-selcount">0</span></span>
+      <button id="egress-activate-btn" class="primary" onclick="activateEgressSel()">启用选中为轮换（立即启动）</button>
+      <button id="egress-deactivate-btn" class="small" onclick="deactivateEgressActive()">恢复全池轮换</button>
+      <span class="muted" style="margin-left:8px;flex:1">勾选 1~N 个出口作为轮换子集，点「启用选中」立即生效（其余保留在池中不参与轮换）。</span>
     </div>
     <div id="egress-list" class="muted" style="margin-top:10px">加载中…</div>
     <div class="muted" style="margin-top:6px">zen 免费档按 IP 限流（429 FreeUsageLimit）；配置 <b>≥2</b> 个出口后网关在被限时自动切到下一个出口。修改后需「重启网关」生效；「检查出口」逐项真实最小探测（每项消耗 ~1 token）。</div>
@@ -3599,6 +3669,8 @@ function tokenBadge(on) {
 var egressHealth = {} // 出口健康检查结果缓存：{ [url]: {ok,status,ms,error} }
 var ipRotationOn = true // IP 轮换总开关（false = 走本地直连）
 var currentEgressList = [] // 当前渲染的 egress 列表（供 moveToLimited 按下标操作）
+var egressActiveList = [] // 手动选中的轮换子集（[]=全池轮换；来自 config.egressActive）
+var egressSel = {} // 主池勾选状态：{ index: true }
 var limitedHealth = {} // 限流池健康检查结果缓存：{ [url]: {ok,status,ms,error} }
 var limitedSel = {} // 限流池勾选状态：{ index: true }
 var deadHealth = {} // 不可用池健康检查结果缓存：{ [url]: {ok,status,ms,error} }
@@ -3607,6 +3679,7 @@ var deadList = [] // 当前渲染的 dead 列表
 function renderEgressList(egress, enabled, ipRotation) {
   const el = document.getElementById("egress-list")
   const badge = document.getElementById("egress-badge")
+  const toolbar = document.getElementById("egress-toolbar")
   ipRotation = ipRotation === undefined ? ipRotationOn : ipRotation
   ipRotationOn = ipRotation
   const btn = document.getElementById("ip-rotation-btn")
@@ -3614,13 +3687,17 @@ function renderEgressList(egress, enabled, ipRotation) {
     btn.textContent = ipRotation ? "开启" : "关闭"
     btn.className = ipRotation ? "primary" : ""
   }
+  if (toolbar) toolbar.style.display = Array.isArray(egress) && egress.length ? "flex" : "none"
+  const activeN = (egressActiveList || []).length
   badge.innerHTML = !ipRotation
     ? '<span class="badge b-stopped">IP 轮换已关闭（直连）</span>'
-    : (enabled
-        ? '<span class="badge b-running">IP 轮换已启用</span>'
-        : '<span class="badge b-stopped">未启用（需 ≥2 个出口）</span>')
+    : (activeN > 0
+        ? '<span class="badge b-go">轮换子集 ' + activeN + "/" + (Array.isArray(egress) ? egress.length : 0) + '</span><span class="badge b-running">轮换已启用</span>'
+        : (enabled
+            ? '<span class="badge b-running">IP 轮换已启用</span>'
+            : '<span class="badge b-stopped">未启用（需 ≥2 个出口）</span>'))
   if (!Array.isArray(egress) || !egress.length) {
-    currentEgressList = []
+    currentEgressList = egressActiveList = []
     el.textContent = !ipRotation
       ? "IP 轮换已关闭，所有请求走本地直连。开启后可用下方出口池换 IP。"
       : "未配置出口（直连）。zen 免费档被限流时添加 SOCKS5 代理出口可换 IP。"
@@ -3643,28 +3720,108 @@ function renderEgressList(egress, enabled, ipRotation) {
         deadBtn = '<button class="small" onclick="moveToDead(' + i + ')">→ 不可用池</button>'
       }
     }
+    const inActive = activeN > 0 && (egressActiveList || []).includes(e)
+    // 勾选三态：显式勾选优先（egressSel[i] 已定义即用其值）；未显式操作时按「是否在轮换子集」展示勾选
+    const isChecked = egressSel[i] === undefined ? inActive : !!egressSel[i]
+    const curBadge = i === 0 && activeN === 0 ? '<span class="badge b-go">当前</span>' : "" // 用子集时列表头即轮换中子集，不再标「当前」
     return '<div style="display:flex;align-items:center;gap:8px;padding:3px 0;border-bottom:1px solid var(--bd-2)">' +
+      '<input type="checkbox" ' + (isChecked ? "checked" : "") +
+        ' onchange="egressSel[' + i + ']=this.checked;updateEgressSelCount()" title="勾选为轮换子集">' +
       '<code style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(e) + '</code>' +
+      (inActive ? '<span class="badge b-go">轮换中</span>' : "") +
       h + limitedBtn + deadBtn +
       '<button class="small" onclick="moveToLadderFromEgress(' + i + ')">→ 梯子池</button>' +
-      (i === 0 ? '<span class="badge b-go">当前</span>' : "") +
+      curBadge +
       '<button class="small" onclick="delEgress(' + i + ')">删除</button></div>'
   }).join("")
+  updateEgressSelCount()
 }
-async function checkEgressHealth() {
+function updateEgressSelCount() {
+  const c = document.getElementById("egress-selcount")
+  if (!c) return
+  // 勾选数 = 显式勾选（egressSel[i] 已定义）∪ 当前轮换子集（未显式操作过的，激活后保持勾选展示）
+  const n = currentEgressList.filter((e, i) => egressSel[i] === undefined ? (egressActiveList || []).includes(e) : !!egressSel[i]).length
+  c.textContent = n
+}
+function egressSelAllToggle() {
+  const allOn = currentEgressList.some((e, i) => egressSel[i] === undefined ? (egressActiveList || []).includes(e) : !!egressSel[i])
+  currentEgressList.forEach((_, i) => { egressSel[i] = !allOn })
+  renderEgressList(currentEgressList, ipRotationOn)
+}
+function clearEgressSel() {
+  egressSel = {}
+  renderEgressList(currentEgressList, ipRotationOn)
+}
+async function activateEgressSel() {
+  // 选中 N 个出口 → 设为轮换子集并立即启动（网关动态读配置，无需重启）
+  // 取勾选 = 显式勾选 ∪ 当前轮换子集（激活后复选框保持勾选；取消勾选某活跃项即表示想把它移出）
   const msg = document.getElementById("egress-msg")
-  const btn = msg.ownerDocument ? document.getElementById("egress-check-btn") : null
-  if (btn) { btn.textContent = "检查中…"; btn.disabled = true }
+  const urls = currentEgressList.filter((e, i) => egressSel[i] === undefined ? (egressActiveList || []).includes(e) : !!egressSel[i])
+  if (!urls.length) { msg.className = "msg err"; msg.textContent = "未勾选任何出口（先勾选要作为轮换子集的出口）"; return }
+  const btn = document.getElementById("egress-activate-btn")
+  if (btn) { btn.disabled = true; btn.textContent = "启动中…" }
   try {
-    const r = await api("/api/gateway/egress/health", {})
-    if (!r.ok) throw new Error(r.error || "网关无响应")
-    egressHealth = {}
-    ;(r.egress || []).forEach((x) => { egressHealth[x.url] = { ok: x.ok, status: x.status, ms: x.ms, error: x.error } })
-    const c = await api("/api/gateway/config")
-    renderEgressList(c.egress || [], !!c.egressEnabled, !!c.ipRotation)
-    const good = (r.egress || []).filter((x) => x.ok).length
+    const r = await api("/api/gateway/egress", { action: "activate", urls })
+    egressActiveList = r.egressActive || []
+    egressSel = {} // 手动勾选已消费；子集状态由 egressActiveList 驱动勾选展示
+    ipRotationOn = !!r.ipRotation
+    renderEgressList(r.egress || [], !!r.enabled, ipRotationOn)
     msg.className = "msg"
-    msg.textContent = "检查完成：" + good + "/" + (r.egress || []).length + " 个出口可用（" + r.checkedAt + "）"
+    msg.textContent = "已启用轮换子集（" + urls.length + " 个出口，立即生效，无需重启），已移到列表头部：" + urls.join(", ")
+  } catch (e) { msg.className = "msg err"; msg.textContent = "启用失败：" + e.message }
+  finally { if (btn) { btn.disabled = false; btn.textContent = "启用选中为轮换（立即启动）" } }
+}
+async function deactivateEgressActive() {
+  // 恢复全池轮换：清空手动选中子集 → 回到整个 egress 池
+  const msg = document.getElementById("egress-msg")
+  try {
+    const r = await api("/api/gateway/egress", { action: "deactivate" })
+    egressActiveList = []
+    egressSel = {}
+    ipRotationOn = !!r.ipRotation
+    renderEgressList(r.egress || [], !!r.enabled, ipRotationOn)
+    msg.className = "msg"
+    msg.textContent = "已恢复全池轮换（原" + (r.egress || []).length + " 个出口全部参与；立即生效，无需重启）"
+  } catch (e) { msg.className = "msg err"; msg.textContent = "恢复失败：" + e.message }
+}
+async function checkEgressHealth(progressMsg) {
+  // 逐个出口实时探测：侧边实时显示每个 IP 的状态（不是一次全部等完才出结果）。
+  // 限制并发（CHK_CONC=4）避免打爆网关；每完成一项立即更新该行徽标 + 进度文案。
+  const msg = progressMsg || document.getElementById("egress-msg")
+  const btn = document.getElementById("egress-check-btn")
+  if (btn) { btn.textContent = "检查中…"; btn.disabled = true }
+  const CHK_CONC = 4
+  try {
+    const c = await api("/api/gateway/config")
+    const list = c.egress || []
+    if (!list.length) { msg.className = "msg"; msg.textContent = "出口池为空"; return }
+    const alive = (u) => egressHealth[u] && egressHealth[u].ok
+    egressHealth = {}
+    renderEgressList(list, !!c.egressEnabled, !!c.ipRotation)
+    let done = 0
+    const total = list.length
+    const upd = () => { msg.className = "msg"; msg.textContent = "检查中 " + done + "/" + total + "…" }
+    // 并发滑窗：用完即补，4 条并行
+    let next = 0
+    const worker = async () => {
+      while (next < list.length) {
+        const url = list[next++]
+        try {
+          const r = await api("/api/gateway/egress/health", { url })
+          const got = (r.egress || [])[0]
+          if (got) egressHealth[url] = { ok: got.ok, status: got.status, ms: got.ms, error: got.error }
+        } catch (e) {
+          egressHealth[url] = { ok: false, error: e.message }
+        }
+        done++
+        upd()
+        renderEgressList(list, !!c.egressEnabled, !!c.ipRotation)
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(CHK_CONC, total) }, () => worker()))
+    const good = list.filter(alive).length
+    msg.className = "msg"
+    msg.textContent = "检查完成：" + good + "/" + total + " 个出口可用（" + new Date().toISOString() + "）"
   } catch (e) { msg.className = "msg err"; msg.textContent = "检查失败：" + e.message }
   if (btn) { btn.textContent = "检查出口"; btn.disabled = false }
 }
@@ -3731,15 +3888,15 @@ async function delLimited(i) {
     msg.className = "msg"; msg.textContent = "已删除限流出口：" + target
   } catch (e) { msg.className = "msg err"; msg.textContent = "删除失败：" + e.message }
 }
-async function checkLimitedHealth() {
-  const msg = document.getElementById("limited-msg")
+async function checkLimitedHealth(progressMsg) {
+  const msg = progressMsg || document.getElementById("limited-msg")
   const btn = document.getElementById("limited-check-btn")
   if (btn) { btn.textContent = "检查中…"; btn.disabled = true }
   try {
     const cfg = await api("/api/gateway/config")
     const limited = cfg.limited || []
     if (!limited.length) { msg.className = "msg"; msg.textContent = "限流池为空"; return }
-    // 逐个真实最小探测（网关 egress/health?url= 对指定出口探 429 是否解除）
+    // 逐个真实最小探测（网关 egress/health?url= 对指定出口探 429 是否解除），实时显示每项
     limitedHealth = {}
     let done = 0
     for (const url of limited) {
@@ -3747,24 +3904,31 @@ async function checkLimitedHealth() {
       const got = (r.egress || [])[0]
       if (got) limitedHealth[url] = { ok: got.ok, status: got.status, ms: got.ms, error: got.error }
       done++
+      msg.className = "msg"
+      msg.textContent = "限流池检查中 " + done + "/" + limited.length + "…"
+      renderLimitedList(limited)
     }
-    renderLimitedList(limited)
     const restored = Object.keys(limitedHealth).filter((u) => limitedHealth[u] && limitedHealth[u].ok).length
     msg.className = "msg"
-    msg.textContent = "检查完成：" + done + " 项，" + (limited.length - restored) + " 个仍限流，" + restored + " 个已解除（勾选可移回 IP 池）"
+    msg.textContent = "检查完成：限流池 " + done + " 项，" + (limited.length - restored) + " 个仍限流，" + restored + " 个已解除（勾选可移回 IP 池）"
   } catch (e) { msg.className = "msg err"; msg.textContent = "检查失败：" + e.message }
   finally { if (btn) { btn.textContent = "健康检查"; btn.disabled = false } }
 }
 async function checkAllHealth() {
-  // IP 池「检查所有 IP 健康度」：主池 egress + 限流池 limited + 不可用池 dead 全部出口一次性健康检查
+  // IP 池「检查所有 IP 健康度」：主池 egress + 限流池 limited + 不可用池 dead 全部出口健康检查。
+  // 整体进度统一显示在 egress-msg（主池按钮旁），每池内部逐项实时更新徽标。
   const btn = document.getElementById("egress-checkall-btn")
+  const msg = document.getElementById("egress-msg")
   if (btn) { btn.textContent = "检查中…"; btn.disabled = true }
+  if (msg) { msg.className = "msg"; msg.textContent = "正在检查主池 egress…" }
   try {
-    await checkEgressHealth()
-    await checkLimitedHealth()
-    await checkDeadHealth()
+    await checkEgressHealth(msg)
+    if (msg) { msg.textContent = "主池完成，正在检查限流池…" }
+    await checkLimitedHealth(msg)
+    if (msg) { msg.textContent = "限流池完成，正在检查不可用池…" }
+    await checkDeadHealth(msg)
+    if (msg) { msg.className = "msg"; msg.textContent = "全池健康检查完成（主池 / 限流池 / 不可用池）" }
   } catch (e) {
-    const msg = document.getElementById("egress-msg")
     if (msg) { msg.className = "msg err"; msg.textContent = "检查失败：" + e.message }
   }
   if (btn) { btn.textContent = "检查所有 IP 健康度"; btn.disabled = false }
@@ -3954,8 +4118,8 @@ async function moveAllDeadFromLimited() {
     msg.textContent = "已转移 " + (r.moved || []).length + " 个不可用出口到不可用池"
   } catch (e) { msg.className = "msg err"; msg.textContent = "转移失败：" + e.message }
 }
-async function checkDeadHealth() {
-  const msg = document.getElementById("dead-msg")
+async function checkDeadHealth(progressMsg) {
+  const msg = progressMsg || document.getElementById("dead-msg")
   const btn = document.getElementById("dead-check-btn")
   if (btn) { btn.textContent = "检查中…"; btn.disabled = true }
   try {
@@ -3969,11 +4133,13 @@ async function checkDeadHealth() {
       const got = (r.egress || [])[0]
       if (got) deadHealth[url] = { ok: got.ok, status: got.status, ms: got.ms, error: got.error }
       done++
+      msg.className = "msg"
+      msg.textContent = "不可用池检查中 " + done + "/" + dead.length + "…"
+      renderDeadList(dead)
     }
-    renderDeadList(dead)
     const restored = Object.keys(deadHealth).filter((u) => deadHealth[u] && deadHealth[u].ok).length
     msg.className = "msg"
-    msg.textContent = "检查完成：" + done + " 项，" + (dead.length - restored) + " 个仍不可用，" + restored + " 个已恢复（勾选可移回 IP 池）"
+    msg.textContent = "检查完成：不可用池 " + done + " 项，" + (dead.length - restored) + " 个仍不可用，" + restored + " 个已恢复（勾选可移回 IP 池）"
   } catch (e) { msg.className = "msg err"; msg.textContent = "检查失败：" + e.message }
   finally { if (btn) { btn.textContent = "健康检查"; btn.disabled = false } }
 }
@@ -4522,6 +4688,7 @@ async function refreshGatewayConfig() {
     document.getElementById("plan-zen").checked = c.plan === "zen"
     tokenBadge(!!c.authEnabled)
     renderTokenList(c.tokens || []) // 多 key 掩码列表（明文仅本会话生成/编辑后持有，GET 永不明文）
+    egressActiveList = c.egressActive || [] // 轮换子集（[]=全池）
     renderEgressList(c.egress || [], !!c.egressEnabled, !!c.ipRotation) // IP 轮换出口池 + 启用徽标
     renderLimitedList(c.limited || []) // 限流池
     renderDeadList(c.dead || []) // 不可用池（默认折叠，badge 显示数量）

@@ -2093,6 +2093,34 @@ t("egressEnabled() 动态判定：ip_rotation=false 或 egress<2 → false；≥
   try { rmSync(_gwCfgPath, { force: true }) } catch {}
 })
 
+t("egress_active 手动选中子集：egressList() 只用子集、egressEnabled() 子集≥1 即启用、空子集回退全池", () => {
+  // egressList()/egressEnabled() 每次读当前 gateway-config。写临时配置验证有效出口判定。
+  // 若测试模块为 go 档（ACTIVE_PLAN!=zen），egressEnabled 恒 false，断言只对 egressList 生效。
+  const P = { plan: "zen", egress: ["socks5://1.1.1.1:1080", "socks5://2.2.2.2:1080", "socks5://3.3.3.3:1080"] }
+  writeFileSync(_gwCfgPath, JSON.stringify({ ...P }))
+  const f1 = gw.egressList().map((e) => e.raw)
+  assert.deepEqual(f1, P.egress) // 无子集 → 全池
+  // 选中子集 [2.2.2.2]（单选也要能用：固定走该出口）
+  writeFileSync(_gwCfgPath, JSON.stringify({ ...P, egress_active: ["socks5://2.2.2.2:1080"] }))
+  const s1 = gw.egressList().map((e) => e.raw)
+  assert.deepEqual(s1, ["socks5://2.2.2.2:1080"])
+  if (gw.egressSnapshot().enabled) {
+    assert.equal(gw.egressEnabled(), true, "子集≥1 且未关开关 → 轮换启用（单选也可用）")
+  }
+  // 子集为 [] → 回退全池
+  writeFileSync(_gwCfgPath, JSON.stringify({ ...P, egress_active: [] }))
+  const f2 = gw.egressList().map((e) => e.raw)
+  assert.deepEqual(f2, P.egress)
+  // 子集含非法 url → 解析时忽略（parseEgressList 过滤）
+  writeFileSync(_gwCfgPath, JSON.stringify({ ...P, egress_active: ["socks5://2.2.2.2:1080", "http://bad:80"] }))
+  const s2 = gw.egressList().map((e) => e.raw)
+  assert.deepEqual(s2, ["socks5://2.2.2.2:1080"])
+  // readGatewayConfig 归一 egress_active（非数组 → []）
+  writeFileSync(_gwCfgPath, JSON.stringify({ ...P, egress_active: "socks5://2.2.2.2:1080" }))
+  assert.deepEqual(gw.readGatewayConfig().egress_active, [])
+  try { rmSync(_gwCfgPath, { force: true }) } catch {}
+})
+
 t("egressHealthCheck 无 key → 返回 error + 空 egress（不抛异常）", async () => {
   // 用临时 ZEN_CONFIG 指向无 key 配置跑健康检查（egressHealthCheck 读 loadConfig().keys）
   // 测试环境可能已有真实 go-keys；此用例只断言「有 keys 时结构契约」与「无 keys 时降级」。

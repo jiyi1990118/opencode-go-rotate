@@ -1233,6 +1233,68 @@ describe("网关配置路由（/api/gateway/plans + /api/gateway/config）", () 
     // 不可用池：move-to-dead（从主池/限流池移到 dead）+ restore-dead + set-dead
     // 先造数据：主池 1 项 + 限流池 1 项
     mod.writeGatewayConfig({ egress: ["socks5://3.3.3.3:1080", "socks5://4.4.4.4:1080"], limited: ["socks5://5.5.5.5:1080"] })
+    // 手动选中轮换子集：activate（从当前池选 1~N 个 → 非空子集 + 打开轮换开关）+ deactivate（恢复全池）
+    const act = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", {
+        method: "POST",
+        body: JSON.stringify({ action: "activate", urls: ["socks5://4.4.4.4:1080", "socks5://3.3.3.3:1080"] }),
+      }),
+    )
+    const actj = await act.json()
+    expect(actj.ok).toBe(true)
+    expect(actj.egressActive).toEqual(["socks5://4.4.4.4:1080", "socks5://3.3.3.3:1080"])
+    expect(actj.ipRotation).toBe(true) // 启动轮换：无论此前开关状态，激活即开启
+    expect(actj.needsRestart).toBe(false) // 网关 egressList()/egressEnabled() 动态读配置，无需重启
+    // 选中项前置到池列表头部（显示顺序=使用顺序）+ 其余保留原序
+    expect(actj.egress[0]).toBe("socks5://4.4.4.4:1080")
+    expect(actj.egress[1]).toBe("socks5://3.3.3.3:1080")
+    const cfgAfterAct = mod.readGatewayConfig()
+    expect(cfgAfterAct.egress_active).toEqual(["socks5://4.4.4.4:1080", "socks5://3.3.3.3:1080"])
+    expect(cfgAfterAct.egress[0]).toBe("socks5://4.4.4.4:1080") // 子集已换到头部
+    // 再次 activate 只选 1 个 → 该单项前置，另一个自动移出子集但保留在池中
+    const act1 = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", {
+        method: "POST",
+        body: JSON.stringify({ action: "activate", urls: ["socks5://3.3.3.3:1080"] }),
+      }),
+    )
+    const act1j = await act1.json()
+    expect(act1j.egressActive).toEqual(["socks5://3.3.3.3:1080"])
+    expect(act1j.egress[0]).toBe("socks5://3.3.3.3:1080")
+    expect(mod.readGatewayConfig().egress).toContain("socks5://4.4.4.4:1080") // 未选中项不删除
+    // activate 空 urls → 400
+    const actE = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "activate", urls: [] }) }),
+    )
+    expect(actE.status).toBe(400)
+    // writeGatewayConfig 拒绝选中池外成员
+    expect(() => mod.writeGatewayConfig({ egress_active: ["socks5://9.9.9.9:1080"] })).toThrow(/只能从当前 IP 池/)
+    // 池发生变化（move-to-dead 删掉激活项）→ 子集自动裁剪
+    const actPrune = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", {
+        method: "POST",
+        body: JSON.stringify({ action: "move-to-dead", urls: ["socks5://3.3.3.3:1080"] }),
+      }),
+    )
+    await actPrune.json() // ok:true（egress 中已删 3.3.3.3）
+    expect(mod.readGatewayConfig().egress_active).toEqual([]) // 已不在池中的选中项自动释放
+    // activate 2 个 → 子集 [4.4.4.4] 与 [3.3.3.3 (已 dead)]，只保留池内成员（writeGatewayConfig 校验拦截 → 先手动设置合法子集）
+    mod.writeGatewayConfig({ egress_active: ["socks5://4.4.4.4:1080"] })
+    expect(mod.readGatewayConfig().egress_active).toEqual(["socks5://4.4.4.4:1080"])
+    // deactivate：清空子集 → 恢复全池
+    const dea = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "deactivate" }) }),
+    )
+    const deaj = await dea.json()
+    expect(deaj.ok).toBe(true)
+    expect(deaj.egressActive).toEqual([])
+    expect(deaj.needsRestart).toBe(false)
+    expect(mod.readGatewayConfig().egress_active).toEqual([])
+    // GET /api/gateway/config 载荷携带 egressActive + egressEnabled（子集语义：选中≥1 即启用）
+    const gact = await (await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/config"))).json()
+    expect(Array.isArray(gact.egressActive)).toBe(true)
+    // 恢复本块产生的前置状态（子集清空 + 3.3.3.3 移回主池、dead 清空），供后续 move-to-dead 用例沿用
+    mod.writeGatewayConfig({ egress: ["socks5://3.3.3.3:1080", "socks5://4.4.4.4:1080"], limited: ["socks5://5.5.5.5:1080"], dead: [], egress_active: null })
     const mtd = await mod.handleWeb(
       new Request("http://127.0.0.1:8899/api/gateway/egress", {
         method: "POST",
@@ -1610,22 +1672,40 @@ describe("WEB_HTML 网关管理区块（主导航 + 套餐卡 + Token 卡）", (
     expect(html).toContain("async function addEgress()")
     expect(html).toContain("async function delEgress(")
     expect(html).toContain("async function clearEgress()")
-    expect(html).toContain("async function checkEgressHealth()")
+    expect(html).toContain("async function checkEgressHealth(")
     expect(html).toContain('api("/api/gateway/egress", { action: "add", url')
     expect(html).toContain('api("/api/gateway/egress", { action: "del", index:')
     expect(html).toContain('api("/api/gateway/egress", { action: "clear" })')
-    expect(html).toContain('api("/api/gateway/egress/health", {})')
+    expect(html).toContain('api("/api/gateway/egress/health", { url })') // 检查出口改为逐个出口实时探测（不再一次性整池长请求超时）
     expect(html).toContain("renderEgressList(c.egress || [], !!c.egressEnabled, !!c.ipRotation)")
     expect(html).toContain("egressHealth[") // 健康结果缓存渲染
     expect(html).toContain('class="badge b-available"') // 健康徽标
     expect(html).toContain('class="badge b-warn"')      // 429 被限流徽标
     expect(html).toContain('class="badge b-invalid"')   // 不可用徽标
+    // 主池多选 + 启用选中为轮换子集（2026-08-19 新增：手动挑几个 IP 立即启动轮换）
+    expect(html).toContain('id="egress-toolbar"')       // 主池勾选工具栏（全选/清空/已选 N/启用/恢复）
+    expect(html).toContain('id="egress-selcount"')
+    expect(html).toContain('id="egress-activate-btn"')
+    expect(html).toContain('id="egress-deactivate-btn"')
+    expect(html).toContain('onclick="egressSelAllToggle()"')
+    expect(html).toContain('onclick="clearEgressSel()"')
+    expect(html).toContain('onclick="activateEgressSel()"')
+    expect(html).toContain('onclick="deactivateEgressActive()"')
+    expect(html).toContain("async function activateEgressSel()")
+    expect(html).toContain("async function deactivateEgressActive()")
+    expect(html).toContain('api("/api/gateway/egress", { action: "activate", urls }')
+    expect(html).toContain('api("/api/gateway/egress", { action: "deactivate" })')
+    expect(html).toContain("egressActiveList") // 子集状态（=config.egressActive）渲染「轮换子集 X/N」徽标
+    // 激活后复选框保持勾选：勾选三态 = 显式勾选优先 ∪ 未显式操作时按「是否在轮换子集」展示（inActive 驱动）
+    expect(html).toContain("const isChecked = egressSel[i] === undefined ? inActive : !!egressSel[i]")
+    expect(html).toContain('title="勾选为轮换子集"') // 每行复选框
+    expect(html).toContain('<span class="badge b-go">轮换中</span>') // 当前在轮换子集的行标记
     // 限流池（专门管理被 429 限流出口）+ 检查所有 IP 健康度
     expect(html).toContain('id="gw-limited-card"')
     expect(html).toContain('id="limited-check-btn"')
     expect(html).toContain('id="limited-restore-btn"')
     expect(html).toContain("function renderLimitedList(")
-    expect(html).toContain("async function checkLimitedHealth()")
+    expect(html).toContain("async function checkLimitedHealth(")
     expect(html).toContain("async function moveToLimited(")
     expect(html).toContain("async function restoreSelectedLimited()")
     expect(html).toContain('api("/api/gateway/egress", { action: "move-to-limited", urls')
@@ -1640,7 +1720,7 @@ describe("WEB_HTML 网关管理区块（主导航 + 套餐卡 + Token 卡）", (
     expect(html).toContain('id="dead-restore-btn"')
     expect(html).toContain('id="dead-badge"')
     expect(html).toContain("function renderDeadList(")
-    expect(html).toContain("async function checkDeadHealth()")
+    expect(html).toContain("async function checkDeadHealth(")
     expect(html).toContain("async function restoreSelectedDead()")
     expect(html).toContain("async function moveToDead(")          // 主池单项 → 不可用池
     expect(html).toContain("async function moveToDeadFromLimited(") // 限流池单项 → 不可用池
