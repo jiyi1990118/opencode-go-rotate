@@ -90,6 +90,10 @@ def fut_iso(minutes_from_now):
     return (datetime.now(timezone.utc) + timedelta(minutes=minutes_from_now)).isoformat()
 
 
+def past_iso(minutes_ago):
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+
+
 def assert_cooldown_until_near(testcase, iso, expect_min, tol_min=2):
     """断言 cooldown_until ≈ now + expect_min（容差 tol_min 分钟）。"""
     t = datetime.fromisoformat(iso.replace("Z", "+00:00"))
@@ -1154,6 +1158,18 @@ class TestGoDomain(_CliCase):
         self.assertIn("go 冷却中: act3", out)
         self.assertIn("网关 冷却中: act1", out)
 
+    def test_status过期冷却不计入冷却摘要且显示available(self):
+        """过期冷却（T-2）：cooldown_until 已过期 → 不再列「冷却中」，address 状态显示 available"""
+        past = past_iso(10)  # 10 分钟前
+        write_cfg(self.home, [key("act1", "sk-a", cooldown_until=past), key("act2", "sk-b")],
+                  current="act1")
+        r = run_cli(["status"], self.home)
+        out = r.stdout
+        self.assertIn("zen 冷却中: (无)", out)          # act1 冷却已过期 → 不计入
+        self.assertIn("act1", out)                      # 仍列出当前 key
+        self.assertIn("available", out)                 # 过期冷却显示 available 而非冷却
+        self.assertNotIn("available (expired)", out)    # 旧自相矛盾文案已删
+
     # ---- 锁 / 残留 / 域隔离 ----
 
     def test_go写命令后无锁无tmp残留(self):
@@ -1324,6 +1340,24 @@ class TestCheckDualEndpoint(_CliCase):
         """源码结构：main() 中 check 经 _with_lock 包裹（写 go-keys.json 健康字段）"""
         src = open(CLI_PATH, encoding="utf-8").read()
         self.assertIn("_with_lock(lambda: do_check(load(), args[1:]))", src)
+
+    def test_gateway_healthz带token(self):
+        """源码结构（T-2）：_gateway_healthz 从 gateway-config 读 tokens[]/token 并带 Bearer——
+        设了网关 token 时不再把 401 误判为「网关 stopped」（历史假阴性根因）。"""
+        src = open(CLI_PATH, encoding="utf-8").read()
+        self.assertIn("tokens", src)  # _gateway_config 读取多 key tokens[]（与网关 resolveTokens 一致）
+        self.assertIn("req.add_header(\"Authorization\", f\"Bearer {token}\")", src)
+
+    def test_gateway_config读取tokens数组(self):
+        """源码结构（T-2）：_gateway_config 归一化 tokens[] 数组（多 token 鉴权，向后兼容单 token）"""
+        src = open(CLI_PATH, encoding="utf-8").read()
+        self.assertIn('"tokens": []', src)
+        self.assertIn('cfg["tokens"] = [t for t in data["tokens"]', src)
+
+    def test_status过期冷却显示available无矛盾文案(self):
+        """源码结构（T-2）：fmt_until 过期不再输出「available (expired)」自相矛盾文案"""
+        src = open(CLI_PATH, encoding="utf-8").read()
+        self.assertNotIn("available (expired)", src)
 
 
 if __name__ == "__main__":

@@ -876,6 +876,21 @@ describe("网关配置（gateway-config.json：套餐 + token）", () => {
     expect(() => mod.writeGatewayConfig({ egress: ["http://bad:80"] })).toThrow(/direct|socks5/)
     expect(existsSync(LOCK_FILE)).toBe(false)
   })
+  test("statusPayload.egressEnabled 动态反映网关出口池 + IP 轮换开关（P0-2 系统健康聚合用）", () => {
+    seed(twoKeys("b"))
+    // 默认网关配置：无出口 → egressEnabled false
+    mod.writeGatewayConfig({ egress: [] })
+    expect(mod.statusPayload().egressEnabled).toBe(false)
+    // 2 个 socks5 出口 + 开关缺省开 → true
+    mod.writeGatewayConfig({ egress: ["socks5://1.2.3.4:1080", "socks5://2.2.2.2:1080"] })
+    expect(mod.statusPayload().egressEnabled).toBe(true)
+    // 开关显式关 → false（即使 ≥2 出口）
+    mod.writeGatewayConfig({ egress: ["socks5://1.2.3.4:1080", "socks5://2.2.2.2:1080"], ip_rotation: false })
+    expect(mod.statusPayload().egressEnabled).toBe(false)
+    // 恢复：开关回开
+    mod.writeGatewayConfig({ egress: ["socks5://1.2.3.4:1080", "socks5://2.2.2.2:1080"], ip_rotation: true })
+    expect(mod.statusPayload().egressEnabled).toBe(true)
+  })
   test("validateEgressItem 格式校验矩阵", () => {
     expect(mod.validateEgressItem("direct")).toBe("direct")
     expect(mod.validateEgressItem("socks5://1.2.3.4:1080")).toBe("socks5://1.2.3.4:1080")
@@ -1121,6 +1136,66 @@ describe("网关配置路由（/api/gateway/plans + /api/gateway/config）", () 
     expect(baj.skipped.map((s: any) => s.reason)).toContain("格式非法") // http://bad 拒绝
     expect(mod.readGatewayConfig().egress).toContain("socks5://2.2.2.2:1080")
     expect(mod.readGatewayConfig().egress.filter((u) => u === "socks5://1.1.1.1:1080").length).toBe(1) // 无重复
+    // 限流池管理：move-to-limited 从主池移到 limited（不参与轮换）
+    const mtl = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", {
+        method: "POST",
+        body: JSON.stringify({ action: "move-to-limited", urls: ["socks5://2.2.2.2:1080", "socks5://2.2.2.2:1080", "http://bad:80"] }),
+      }),
+    )
+    const mtlj = await mtl.json()
+    expect(mtlj.ok).toBe(true)
+    expect(mtlj.moved).toEqual(["socks5://2.2.2.2:1080"]) // 非法项跳过
+    expect(mod.readGatewayConfig().egress).not.toContain("socks5://2.2.2.2:1080") // 已从主池移除
+    expect(mod.readGatewayConfig().limited).toContain("socks5://2.2.2.2:1080") // 已进限流池
+    // GET /api/gateway/config 透传 limited
+    const gl = await (await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/config"))).json()
+    expect(gl.limited).toContain("socks5://2.2.2.2:1080")
+    // move-to-limited 重复 → 不重复加入
+    await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", {
+        method: "POST",
+        body: JSON.stringify({ action: "move-to-limited", urls: ["socks5://2.2.2.2:1080"] }),
+      }),
+    )
+    expect(mod.readGatewayConfig().limited.filter((u) => u === "socks5://2.2.2.2:1080").length).toBe(1)
+    // 空 urls → 400
+    const mtlE = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "move-to-limited", urls: [] }) }),
+    )
+    expect(mtlE.status).toBe(400)
+    // restore：限流池出口探测可用 → 移回主池
+    const rst = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", {
+        method: "POST",
+        body: JSON.stringify({ action: "restore", urls: ["socks5://2.2.2.2:1080"] }),
+      }),
+    )
+    const rstj = await rst.json()
+    expect(rstj.ok).toBe(true)
+    expect(rstj.restored).toEqual(["socks5://2.2.2.2:1080"])
+    expect(mod.readGatewayConfig().limited).not.toContain("socks5://2.2.2.2:1080") // 已出限流池
+    expect(mod.readGatewayConfig().egress).toContain("socks5://2.2.2.2:1080") // 已回主池
+    // set-limited：直接重设（删除单项/清空）+ 非法格式拒绝
+    const setl = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", {
+        method: "POST",
+        body: JSON.stringify({ action: "set-limited", list: ["socks5://9.9.9.9:1080"] }),
+      }),
+    )
+    expect((await setl.json()).limited).toEqual(["socks5://9.9.9.9:1080"])
+    expect(mod.readGatewayConfig().limited).toEqual(["socks5://9.9.9.9:1080"])
+    const setlBad = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", {
+        method: "POST",
+        body: JSON.stringify({ action: "set-limited", list: ["http://bad:80"] }),
+      }),
+    )
+    expect(setlBad.status).toBe(400)
+    await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "set-limited", list: [] }) }),
+    )
+    expect(mod.readGatewayConfig().limited).toEqual([]) // 清空
     // 未知 action → 400
     const unk = await mod.handleWeb(
       new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "boom" }) }),
@@ -1220,6 +1295,19 @@ describe("WEB_HTML 网关管理区块（主导航 + 套餐卡 + Token 卡）", (
     expect(html).toContain('class="badge b-available"') // 健康徽标
     expect(html).toContain('class="badge b-warn"')      // 429 被限流徽标
     expect(html).toContain('class="badge b-invalid"')   // 不可用徽标
+    // 限流池（专门管理被 429 限流出口）+ 检查所有 IP 健康度
+    expect(html).toContain('id="gw-limited-card"')
+    expect(html).toContain('id="limited-check-btn"')
+    expect(html).toContain('id="limited-restore-btn"')
+    expect(html).toContain("function renderLimitedList(")
+    expect(html).toContain("async function checkLimitedHealth()")
+    expect(html).toContain("async function moveToLimited(")
+    expect(html).toContain("async function restoreSelectedLimited()")
+    expect(html).toContain('api("/api/gateway/egress", { action: "move-to-limited", urls')
+    expect(html).toContain('api("/api/gateway/egress", { action: "restore", urls')
+    expect(html).toContain('api("/api/gateway/egress", { action: "set-limited", list')
+    expect(html).toContain('api("/api/gateway/egress/health", { url') // 限流量身探测
+    expect(html).toContain("function checkAllHealth()")
     // IP 轮换总开关（关闭走本地直连）
     expect(html).toContain('id="ip-rotation-btn"')
     expect(html).toContain('onclick="toggleIpRotation()"')
@@ -1229,6 +1317,21 @@ describe("WEB_HTML 网关管理区块（主导航 + 套餐卡 + Token 卡）", (
     expect(html).toContain("所有请求走本地直连")
     // IP 轮换启用条件提示
     expect(html).toContain("≥2")
+    // P0-2 系统健康总览（sys-health 聚合点 + 异常状态中文映射 + 桌面告警）
+    expect(html).toContain('id="sys-health"')
+    expect(html).toContain('id="sys-health-report"')
+    expect(html).toContain("系统健康总览")
+    expect(html).toContain("function statusErrLabel(")
+    expect(html).toContain("new Notification(")
+    expect(html).toContain('tag: "gr-health"')
+    expect(html).toContain("已超过 24h 未复验")
+  })
+  test("P0-1 Web 服务强制回环绑定（源文件断言 hostname: 127.0.0.1，防回归到裸绑 *）", () => {
+    const src = readFileSync(PLUGIN_PATH, "utf8")
+    expect(src).toContain('hostname: "127.0.0.1"')
+    expect(src).toContain("Bun.serve({ port: WEB_PORT, hostname: \"127.0.0.1\"")
+    // 无鉴权仅本机的安全前提注释
+    expect(src).toContain("管理页无鉴权")
   })
   test("免费代理淘源卡（gw-proxy-card + 拉取按钮 + 候选状态渲染 + 加入池）", () => {
     const html: string = (mod as any).WEB_HTML

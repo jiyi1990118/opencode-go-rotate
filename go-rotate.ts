@@ -577,8 +577,17 @@ function statusPayload() {
     auto_web: cfg.auto_web !== false,
     keyCount: cfg.keys.length,
     availableCount: keys.filter((k) => k.state === "available").length,
+    egressEnabled: gatewayEgressEnabled(cfg),
     keys,
   }
+}
+
+/* egress 是否启用（P0-2 系统健康聚合用，动态读配置与开关） */
+function gatewayEgressEnabled(cfg: any): boolean {
+  const g = readGatewayConfig()
+  if (g.ip_rotation === false) return false
+  const list = (g.egress ?? []).filter((u: string) => u && u !== "direct")
+  return list.length >= 2
 }
 
 function logTail(n = 200): string {
@@ -848,11 +857,16 @@ async function gatewayTest(): Promise<{
  *  expectUrl 可选：只探测指定出口（限流池移回前验证是否解限）。 */
 async function gatewayEgressHealthProxy(expectUrl?: string): Promise<any> {
   try {
+    // 超时按池大小动态计算：网关并发 5 探测、每项最坏 15s → 最坏 ⌈N/5⌉×15s；再兜底 +10s
+    // 全池=0 项也按 1 项算（单 url 探测 15s+F 余量）；上限 150s 防极端池拖死 FE。
+    const poolN = expectUrl ? 1 : (readGatewayConfig().egress ?? []).length
+    const worst = Math.ceil(Math.max(poolN, 1) / 5) * 15000 + 10000
+    const timeoutMs = Math.min(worst, 150000)
     const q = expectUrl ? "?url=" + encodeURIComponent(expectUrl) : ""
     const r = await fetch(GATEWAY_BASE + "/api/gateway/egress/health" + q, {
        method: "POST",
        headers: gatewayAuthHeaders(),
-       signal: AbortSignal.timeout(90000), // 串行探测所有出口，给足时间
+       signal: AbortSignal.timeout(timeoutMs), // 并发探测所有出口，按池大小给足时间
      })
      const j: any = await r.json().catch(() => null)
      if (!r.ok || !j) return { ok: false, error: j?.error?.message ?? `网关健康检查失败 HTTP ${r.status}` }
@@ -1496,7 +1510,7 @@ if (action === "clear") {
                 if (!e) continue
                 if (egressSet.has(e)) egressSet.delete(e) // 从主池移除
                 if (!limitedSet.has(e)) limitedSet.add(e)  // 加入限流池
-                moved.push(e)
+                if (!moved.includes(e)) moved.push(e)
               }
               writeGatewayConfig({
                 egress: [...egressSet],
@@ -1517,7 +1531,7 @@ if (action === "clear") {
                 if (!e) continue
                 if (limitedSet.has(e)) limitedSet.delete(e)
                 if (!egressSet.has(e)) egressSet.add(e)
-                restored.push(e)
+                if (!restored.includes(e)) restored.push(e)
               }
               writeGatewayConfig({
                 egress: [...egressSet],
@@ -1575,7 +1589,8 @@ async function startWeb(force = false) {
   try {
     // 端口绑定失败即认为已有实例在跑（满足"web 只启动一个"）
     // idleTimeout 放宽到 120s：egress 健康检查串行探测所有出口最坏 ~90s，默认 10s 会被掐断。
-    server = Bun.serve({ port: WEB_PORT, fetch: handleWeb, idleTimeout: 120 })
+    // hostname 必须锁定 127.0.0.1：管理页无鉴权，绑定 * 会让局域网/公网可访问（安全前提是仅本机）。
+    server = Bun.serve({ port: WEB_PORT, hostname: "127.0.0.1", fetch: handleWeb, idleTimeout: 120 })
     webStarted = true
     log(`🌐 Web 管理界面: http://localhost:${WEB_PORT}`)
   } catch {
@@ -2085,6 +2100,7 @@ try {
       <div class="stat"><div class="v" id="ov-last-rotate">-</div><div class="l">最近轮换</div></div>
       <div class="stat"><div class="v" id="s-cooldown">-</div><div class="l">冷却窗口(min) <a href="javascript:void(0)" onclick="switchNav('tui')" style="color:#60a5fa">去 TUI</a></div></div>
       <div class="stat"><div class="v" id="s-autoweb">-</div><div class="l">Web 自动启动 <a href="javascript:void(0)" onclick="switchNav('gateway')" style="color:#60a5fa">去网关</a></div></div>
+      <div class="stat"><div class="v" id="sys-health"><span class="dot" style="margin-right:6px"></span>健康</div><div class="l">系统健康总览 <span class="muted" id="sys-health-report"></span></div></div>
     </div>
     <div class="muted banner" id="ov-hint" style="margin-top:12px">
       <span id="ov-hint-full"><b>①</b> 添加 key → 下方输入框　<b>②</b> 按钮设当前 key（Zen/Go/网关三域）　<b>③</b> 每 key 「检查」双套餐健康　<b>④</b> 各域手动轮换见 <a href="javascript:void(0)" onclick="switchNav('tui')" style="color:#60a5fa">TUI</a>，网关见 <a href="javascript:void(0)" onclick="switchNav('gateway')" style="color:#60a5fa">网关</a></span>
@@ -2329,11 +2345,18 @@ async function api(path, body) {
   return j
 }
 var health = {}
+/* P0-2 系统健康聚合：网关运行态由 refreshGateway 写入，egress 健康由 egressHealth 缓存 */
+var gwRunning = null
+var lastHealthLevel = "" // 三角色翻转检测（绿→黄/红 时触发一次桌面通知）
 /* P2-3：Key 表格渲染签名缓存（5s 轮询全量重建守卫） */
 var lastKeysSig = ""
 /* P1-1 XSS 修复：统一转义 HTML 特殊字符（用户可控字段拼 innerHTML / 属性前必须过 esc） */
 function esc(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]))
+}
+/* P0-2 系统健康聚合：key 状态枚举中文名（与表格 tip 命名一致） */
+function statusErrLabel(s) {
+  return { ok: "可用", invalid: "key 无效", nobalance: "余额不足", limited: "限流", error: "异常" }[s] || s
 }
 async function refresh() {
   try {
@@ -2376,6 +2399,50 @@ async function refresh() {
       hintEl.style.display = "inline"
     } else {
       hintEl.style.display = "none"
+    }
+    /* P0-2 系统健康总览：聚合 key/网关/出口池 → 绿(正常)/黄(降级)/红(告警) + 原因清单。
+     * 三角色翻转（非正常首次出现）时触发一次桌面通知（Notification API，未授权静默跳过）。 */
+    const problems = []
+    if (!st.keys.length) problems.push("未配置 key")
+    if (st.keys.length && st.availableCount === 0) problems.push("全部 key 冷却/不可用")
+    const badKey = st.keys.find(k => k.last_status && k.last_status !== "ok")
+    if (badKey) problems.push("存在异常 key: " + badKey.name + " (" + (statusErrLabel(badKey.last_status)) + ")")
+    if (gwRunning === false) problems.push("网关未运行")
+    if (st.egressEnabled && Object.keys(egressHealth).length > 0) {
+      const alive = Object.values(egressHealth).filter((h) => h.ok).length
+      if (alive === 0) problems.push("IP 轮换开启但出口池全不可用（降级直连）")
+    }
+    let level = problems.some(p => p.startsWith("未配置") || p.startsWith("全部 key") || p.startsWith("网关未运行")
+      || p.indexOf("出口池全不可用") >= 0) ? "red" : (problems.length ? "yellow" : "green")
+    const dot = document.getElementById("sys-health")
+    const dotColor = level === "red" ? "#ef4444" : level === "yellow" ? "#f59e0b" : "#22c55e"
+    dot.innerHTML = '<span class="dot" style="background:' + dotColor + ';margin-right:6px"></span>' +
+      (level === "green" ? "健康" : level === "yellow" ? "降级" : "告警")
+    document.getElementById("sys-health-report").textContent = problems.join("；") || "各组件正常"
+    if (lastHealthLevel !== level) {
+      lastHealthLevel = level
+      if (level !== "green") {
+        try {
+          if ("Notification" in window && Notification.permission === "granted") {
+            const d = new Notification("go-rotate 系统告警·" + (level === "red" ? "告警" : "降级"), {
+              body: problems.join("；"),
+              tag: "gr-health",
+            })
+            d.onclick = () => { window.focus() }
+          }
+        } catch (e) { /* 桌面通知非必要路径，静默 */ }
+      }
+    }
+    /* P0-3 陈旧探测提示：有 key 健康标记异常但探测时间过老（>24h）→ 提示建议重检 */
+    const STALE_MS = 24 * 3600 * 1000
+    const nowT = Date.now()
+    const staleKeys = st.keys.filter(k =>
+      (k.last_status && k.last_status !== "ok") &&
+      (!k.last_checked_zen || nowT - Date.parse(k.last_checked_zen) > STALE_MS) &&
+      (!k.last_checked_go || nowT - Date.parse(k.last_checked_go) > STALE_MS))
+    if (staleKeys.length) {
+      const el0 = document.getElementById("check-hint")
+      el0.textContent = "⚠️ " + staleKeys.map(k => k.name).join("/") + " 的异常健康标记已超过 24h 未复验，建议点击「检测所有 key」"
     }
     /* P2-3：表格增量守卫——三域字段（健康/冷却/当前/探测时间）无变化时跳过 5s 全量重建 */
     const sig = JSON.stringify(st.keys.map(k =>
@@ -2645,6 +2712,7 @@ async function refreshGateway() {
   }
   try {
     const g = await api("/api/gateway")
+    gwRunning = !!g.running
     const installed = !!g.ctlExists
     // 双域：网关卡「当前 key」走本地 statusPayload 网关域字段（current_gateway），
     // 不用 graft 的 healthz current（网关域名）。失败回退 healthz.current 兜底显示。
@@ -3007,7 +3075,7 @@ async function checkLimitedHealth() {
     msg.className = "msg"
     msg.textContent = "检查完成：" + done + " 项，" + (limited.length - restored) + " 个仍限流，" + restored + " 个已解除（勾选可移回 IP 池）"
   } catch (e) { msg.className = "msg err"; msg.textContent = "检查失败：" + e.message }
-  if (btn) { btn.textContent = "健康检查"; btn.disabled = false }
+  finally { if (btn) { btn.textContent = "健康检查"; btn.disabled = false } }
 }
 async function checkAllHealth() {
   // IP 池「检查所有 IP 健康度」：主池 egress + 限流池 limited 全部出口一次性健康检查

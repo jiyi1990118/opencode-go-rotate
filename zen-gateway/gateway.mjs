@@ -1482,16 +1482,17 @@ function truncationRetryPlan(bodyText, bodyObj) {
 }
 
 /** 推理模型截断自适配（非流式）：判定成立时放大 max_tokens 重发一次，返回新 bodyText；失败返回 null。 */
-async function retryTruncatedContent(bodyText, bodyObj, mappedModel, key, timeoutMs, clientSignal) {
+async function retryTruncatedContent(bodyText, bodyObj, mappedModel, key, timeoutMs, clientSignal, egress = null) {
   const next = truncationRetryPlan(bodyText, bodyObj)
   if (next == null) return null
-  log(`⚠️  推理模型 content 截断（finish=max_tokens），自动放大至 ${next} 重试一次`)
+  log(`⚠️  推理模型 content 截断（finish=max_tokens），自动放大至 ${next} 重试一次${egress ? `（出口 ${egress}）` : ""}`)
   const retry = await upstreamOnce(
     key,
     JSON.stringify({ ...bodyObj, model: mappedModel, max_tokens: next }),
     false,
     timeoutMs,
     clientSignal,
+    egress,
   )
   if (retry.res.ok) return await retry.res.text()
   log(`⚠️  截断重试仍失败（status=${retry.res.status}），透传原始响应`)
@@ -1523,7 +1524,7 @@ async function sendWithRotation(bodyObj, isStream, clientSignal, endpoint = "cha
       let retBody = retry.bodyText
       if (!isStream) {
         const full = retry.bodyText || (await retry.res.text())
-        const auto = await retryTruncatedContent(full, bodyObj, mappedModel, key.key, timeoutMs, clientSignal)
+        const auto = await retryTruncatedContent(full, bodyObj, mappedModel, key.key, timeoutMs, clientSignal, nextEgress)
         if (auto) {
           log(`✅  出口切换后截断重试成功`)
           appendUsage({ key: key.name, ok: true, model: mappedModel, rotated: false, endpoint })
@@ -1547,7 +1548,7 @@ async function sendWithRotation(bodyObj, isStream, clientSignal, endpoint = "cha
       if (!isStream) {
         // 非流式：读取上游 body（供截断判定 + handler 透传；upstreamOnce 成功时 bodyText=""）
         const full = await res.text()
-        const auto = await retryTruncatedContent(full, bodyObj, mappedModel, key.key, timeoutMs, clientSignal)
+        const auto = await retryTruncatedContent(full, bodyObj, mappedModel, key.key, timeoutMs, clientSignal, currentEgress())
         if (auto) {
           log(`✅  截断重试成功（放大 max_tokens 后返回完整内容）`)
           appendUsage({ key: key.name, ok: true, model: mappedModel, rotated: false, endpoint })

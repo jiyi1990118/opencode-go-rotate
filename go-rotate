@@ -152,7 +152,7 @@ def fmt_until(iso: str) -> str:
         t = datetime.fromisoformat(iso.replace("Z", "+00:00"))
         remain = t - datetime.now(timezone.utc)
         if remain.total_seconds() <= 0:
-            return "available (expired)"
+            return "available"
         mins = int(remain.total_seconds() // 60)
         return f"cooling, ~{mins}min left"
     except Exception:
@@ -180,13 +180,27 @@ def do_status(cfg):
     print(f"zen 当前: {cur or '(not set)'}{_cur_cooling(cfg, cur, 'cooldown_until')}")
     print(f"go 当前: {go_cur or '(not set)'}{_cur_cooling(cfg, go_cur, 'cooldown_until_go')}")
     print(f"网关当前: {gw_cur or '(not set)'}{_cur_cooling(cfg, gw_cur, 'cooldown_until_gateway')}")
-    # 每域冷却 key 摘要（可选展示）
+    # 每域冷却 key 摘要（可选展示）——过期冷却不再计入「冷却中」
+    now = datetime.now(timezone.utc).timestamp()
     for label, field in (("zen", "cooldown_until"), ("go", "cooldown_until_go"), ("网关", "cooldown_until_gateway")):
-        names = [k["name"] for k in cfg["keys"] if k.get(field)]
+        names = [k["name"] for k in cfg["keys"] if _cooling_active(k.get(field), now)]
         print(f"{label} 冷却中: {', '.join(names) if names else '(无)'}")
     # 网关状态（容错：网关没装/没跑不报错，2s 超时）
     ok, _ = _gateway_healthz()
     print(f"网关: running ({GATEWAY_PORT})" if ok else "网关: stopped")
+
+
+def _cooling_active(iso: str, now: float = None) -> bool:
+    """冷却是否仍在有效期内（过期/空 → False）。"""
+    if not iso:
+        return False
+    if now is None:
+        now = datetime.now(timezone.utc).timestamp()
+    try:
+        t = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return t.timestamp() > now
+    except Exception:
+        return True  # 解析失败的旧格式按「冷却中」保守展示
 
 
 def _cur_cooling(cfg, name, field):
@@ -194,7 +208,7 @@ def _cur_cooling(cfg, name, field):
     if not name:
         return ""
     for k in cfg["keys"]:
-        if k["name"] == name and k.get(field):
+        if k["name"] == name and _cooling_active(k.get(field)):
             return f"  ({fmt_until(k[field])})"
     return ""
 
@@ -677,11 +691,17 @@ def _schtasks(args):
 
 
 def _gateway_healthz():
-    """探测网关 /healthz（2s 超时），返回 (ok, info)。网关没装/没跑不报错。"""
+    """探测网关 /healthz（2s 超时），返回 (ok, info)。网关没装/没跑不报错。
+    设了 token（tokens[]/token）时必须带 Bearer——否则 401 会被误判为「没跑」（历史假阴性）。"""
     import urllib.request
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 本地探测不走代理
+    gcfg = _gateway_config()
+    token = (gcfg.get("tokens") or [None])[0] or gcfg.get("token")
+    req = urllib.request.Request(f"http://127.0.0.1:{GATEWAY_PORT}/healthz")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
     try:
-        with opener.open(f"http://127.0.0.1:{GATEWAY_PORT}/healthz", timeout=2) as r:
+        with opener.open(req, timeout=2) as r:
             if r.status != 200:
                 return False, {}
             return True, json.loads(r.read().decode("utf-8", "replace"))
@@ -859,7 +879,7 @@ def _gateway_logs(n_str="100"):
 def _gateway_config() -> dict:
     """读 gateway-config.json（容错：缺失/损坏回退默认 {plan:'go', token:None}）。
     保留未知扩展字段（向后兼容：将来新增字段不因写 plan/token 丢失）。"""
-    cfg = {"plan": "go", "token": None, "token_set_at": None}
+    cfg = {"plan": "go", "token": None, "token_set_at": None, "tokens": []}
     try:
         with open(GATEWAY_CONFIG) as f:
             data = json.load(f)
@@ -873,6 +893,11 @@ def _gateway_config() -> dict:
     if not (isinstance(data.get("token"), str) and data["token"]):
         cfg["token"] = None
         cfg["token_set_at"] = None
+    # tokens 多 key 鉴权（v 多 token 起优先）；数组无效 → 空列表
+    if isinstance(data.get("tokens"), list):
+        cfg["tokens"] = [t for t in data["tokens"] if isinstance(t, str) and t]
+    else:
+        cfg["tokens"] = []
     return cfg
 
 

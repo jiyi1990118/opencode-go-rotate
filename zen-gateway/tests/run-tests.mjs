@@ -2055,6 +2055,15 @@ t("非法状态行 → null", () => {
   assert.equal(gw.parseHead(""), null)
 })
 
+t("retryTruncatedContent 透传 egress（截断重试不绕开已被绕限流的出口，T-1 修复）", async () => {
+  // 静态断言：函数签名带第 7 参 egress，两个调用点分别透传 nextEgress / currentEgress
+  const src = readFileSync(new URL("../gateway.mjs", import.meta.url), "utf8")
+  assert.ok(src.includes("egress = null"), "retryTruncatedContent 第 7 参 egress 缺省 null（直连路径不变）")
+  assert.ok(src.includes("clientSignal, egress"), "上游调用透传 egress")
+  assert.ok(src.includes("clientSignal, nextEgress"), "出口轮换路径截断重试复用新出口")
+  assert.ok(src.includes("clientSignal, currentEgress()"), "直连成功路径截断重试复用当前出口（否则回到本地直连再撞 429）")
+})
+
 t("egressSnapshot / currentEgress / rotateEgress 模块状态（EGRESS_ENABLED 关时零行为）", () => {
   // 模块加载时按真实 gateway-config 固化；测试环境不配 egress → EGRESS_ENABLED 通常 false。
   // 只断言数据结构契约，不依赖具体开关。
