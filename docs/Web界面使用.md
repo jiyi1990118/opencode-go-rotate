@@ -83,6 +83,7 @@
 | POST | `/api/gateway/ladder/check` | `{urls?}` | `{ok, checkedAt, egress:[{url,ok,ms,google,youtube,exitIp,country,city,org,error}]}` | **科学上网筛选**：对每个 socks5 出口测「能否 CONNECT 被墙站点 google/youtube:443」+ 经出口查真实出口 IP 归属地（ip-api.com）。默认测全池/梯子池，可 `urls` 指定。 |
 | POST | `/api/gateway/egress`（梯子池动作） | `{action, ...}` | 动作对应列表 | **梯子专用出口池（第四池 ladder.egress）管理**：`add-ladder {url}` / `set-ladder {list}` / `move-to-ladder {urls}`（主池∪限流池∪不可用池并集抽取→梯子池） / `ladder-to-egress {urls}`（梯子池→主池） / `ladder-to-limited {urls}` / `ladder-to-dead {urls}`。均 `needsRestart:false`（梯子每连接动态读配置即时生效）。 |
 | POST | `/api/gateway/egress`（轮换子集） | `{action:"activate", urls:[]}` / `{action:"deactivate"}` | `{ok, egressActive, egress, ipRotation, enabled, needsRestart:false}` | **多选轮换子集（2026-08-19）**：`activate` 把勾选的 1~N 个 IP 池成员设为当前轮换子集（校验 ∈ 池，选中项前置到 `egress` 头部）+ 打开 `ip_rotation`，立即生效无需重启；`deactivate` 清空子集恢复全池。前端勾选三态：显式勾选优先、未操作按「是否在子集」保持勾选 + 「轮换中」徽标。 |
+| POST | `/api/gateway/proxies/webshare` | `{mode:"token"\|"link", value, limit?, timeout?}` | `{ok, total, checked, candidates:[{url, ok, ms, err}]}` | **Webshare 代理导入（2026-08-19）**：`mode=token`（API Token Key）走 `/api/v2/proxy/list/?mode=direct`；`mode=link` 直接 GET 面板下载链接。拉取后逐个做 SOCKS5 连通验证（opencode.ai:443）。DNS 污染绕过：固定 8.8.8.8/1.1.1.1 解析 + SNI 保持真实域名。 |
 | 其它 | 任意未匹配 | - | 404 `{"error":"not found"}` | POST 处理抛错时 400 `{"error":msg}` |
 
 所有写操作带**跨进程文件锁**（`withLockSync`：O_EXCL + 陈旧锁检测 + 5s 超时降级）与**原子写**（.tmp + rename），与 CLI / zen-gateway 同一套并发安全机制。

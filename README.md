@@ -30,6 +30,7 @@ opencode 的 opencode-go 多 key 自动轮换插件 + Web 管理界面。
 - ✅ **不可用池**：IP 池/限流池一键「→ 转移不可用」，把健康检查失败的出口移到单独「不可用池」（默认折叠）管理，恢复后移回
 - ✅ **实时健康检查**：「检查所有 IP 健康度」逐出口实时探测（每行徽标边查边更新 + 进度计数），大池不再一次性整池长请求超时；结果本地缓存，刷新页面徽标仍在
 - ✅ **多选轮换子集**：IP 池每行可勾选 1~N 个出口 →「启用选中为轮换（立即启动）」即时生效（选中项前置到列表头部、复选框保持勾选 + 「轮换中」徽标、`egress_active` 子集落盘）；「恢复全池轮换」一键回全池
+- ✅ **Webshare 代理导入**：Web 原生支持两种凭据导入官方代理——API Token Key（长期有效）或 Download 下载链接（短时效），逐个 SOCKS5 连通验证 + 有效项一键加入 IP 池（内置 DNS 污染绕过）
 - 联动文档：`docs/网关双套餐模型查看-phase22.md`
 - ✅ 测试体系：插件单测（`bun test tests/`）、CLI 单测（`python3 tests/test-go-rotate-cli.py`）、gateway 单测（`ZEN_TEST=1 node zen-gateway/tests/run-tests.mjs`）
 

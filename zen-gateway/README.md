@@ -159,31 +159,22 @@ curl -s -X POST -H "Authorization: Bearer <TOKEN>" http://127.0.0.1:18888/api/ga
 - 只读探测：不轮换、不冷却、不改 current。
 - Web 管理端（127.0.0.1:8899 → 网关 → IP 池卡「检查出口」按钮）已集成：逐项显示 `健康`/`IP 被限流 429`/`不可用` 徽标。修改出口后无需重启即可用「检查出口」验证。
 
-### 免费代理批量淘源（`fetch_proxies.py`）
+### Webshare 代理导入（Web「IP 池」卡，官方 API 拉取）
 
-根目录 `fetch_proxies.py`（零依赖 Python 标准库）批量拉取 4 个免费 SOCKS5 列表源 → 连通性验证 → 输出可直接粘贴进 `egress` 的 `socks5://host:port`：
+Web 管理端（127.0.0.1:8899 → 网关 → IP 池下方「Webshare 导入」卡）原生支持从 Webshare 官方 API 拉取代理清单，两种凭据任选其一：
 
 ```bash
-python3 fetch_proxies.py --check --limit 300 --timeout 6   # 拉取 + 连通性验证（默认验证目标 opencode.ai:443）
-python3 fetch_proxies.py --check --to 1.2.3.4:443          # 指定验证目标
-python3 fetch_proxies.py --limit 100                       # 仅拉取不验证
-python3 fetch_proxies.py --json                            # JSON 输出（供脚本消费）
+# 方式 1：API Token Key（面板长期有效，推荐）
+#   在 proxy.webshare.io 面板 → Account / API Keys 生成，粘贴进 Web「Token Key」输入框
+
+# 方式 2：下载链接（面板 Download 生成的短时效链接，几分钟内有效，过期重新生成）
+#   https://proxy.webshare.io/api/v2/proxy/list/download/<token>/.../?plan_id=...
 ```
 
-- 输出分两栏：`socks5://host:port \t OK/FALL \t ms`，OK 项按延迟升序排前面。
-- 选出的活代理填进 `egress` 后，用 Web/IP 池「检查出口」做**真实请求**验证——连通≠可用，免费数据中心 IP 大多已被 opencode.ai 限流（429），但限流是分时段的，池子轮换 + 健康检查会自动在各出口间浮动挑可用者。
-- 2026-08 实测：859 候选 → 154 连通（18% 存活率），其中大部分对 opencode.ai 返回 429（代理连通但 IP 被限），仅极少数能 200。稳定方案仍建议付费 SOCKS5（Webshare 免费档 10 IP 或 DataImpulse $1/GB）。
-
-### Web 集成（免费代理淘源卡）
-
-Web 管理端（127.0.0.1:8899 → 网关 → IP 池下方「免费代理」卡）已嵌入同一淘源能力，无需跑脚本：
-
-- **「拉取免费代理」**：一键拉取 4 源 → 逐个做 SOCKS5 连通验证（opencode.ai:443）→ 展示每个候选的状态（可用/不可用 + 延迟 + 失败原因 + 来源）。
-- **多列网格 + 勾选**：候选以紧凑网格展示，**有效项自动勾选**；顶部「全选有效 / 清空 / 添加选中（N）」一键批量加入。
-- **自动去重**：已在 IP 池中的候选自动灰置并禁用勾选（`bulk-add` 后端二次去重兜底），不重复添加。
-- **「加入 IP 池」**：可用代理一键加入 `egress` 池（走既有 `/api/gateway/egress add`），加入后刷新 IP 池卡。
-- **徽标**：`84/200 可用` 实时显示可用比例。
-- 后端 `POST /api/gateway/proxies/fetch`（`{limit, timeout}`，默认 200/5s，并发 30）纯 JS 实现（node:net SOCKS5 握手），零依赖、不需要 Python。
+- **「导入」**：拉取 Webshare 代理清单 → 逐个做 SOCKS5 连通验证（opencode.ai:443）→ 展示每个候选的状态（可用/不可用 + 延迟）并**自动勾选有效项**。
+- **一键加入**：顶部「全选有效 / 清空 / 添加选中（N）」批量加入 `egress` 池（`bulk-add` 二次去重，已在池中自动灰置）。
+- **徽标**：`10/10 可用` 实时显示可用比例。加入后可用「检查出口」做真实请求验证。
+- 后端 `POST /api/gateway/proxies/webshare`（`{mode:"token"|"link", value}`）纯 JS 实现：`node:https` + 自定义 DNS lookup（固定 8.8.8.8/1.1.1.1 解析，绕过 webshare.io 在本机的 DNS 污染）+ SNI 保持真实域名 + `node:net` SOCKS5 握手连通验证，零依赖、不需要 Python。
 - 注意：**连通 ≠ 可绕过限流**——免费数据中心 IP 大多是连通但被 opencode.ai 限 429。加入池后再用「检查出口」做真实请求判定。
 
 ## 梯子（本地 SOCKS5 透明代理，供其它应用科学上网）

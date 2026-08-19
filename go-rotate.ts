@@ -36,9 +36,10 @@ import path from "node:path"
 import { execFileSync } from "node:child_process"
 // 网关访问 token 生成（crypto.randomBytes(32) → 64 hex）；bun 兼容 node:crypto
 import { randomBytes } from "node:crypto"
-// 免费代理候选批量连通性验证（SOCKS5 握手 + CONNECT，与 gateway.mjs 同一思路，纯 JS 零依赖）
+// Webshare 代理导入 + 候选连通性验证（SOCKS5 握手 + CONNECT，与 gateway.mjs 同一思路，纯 JS 零依赖）
 import net from "node:net"
-import { lookup } from "node:dns"
+import { lookup, Resolver } from "node:dns"
+import https from "node:https"
 
 // 测试隔离：bun 的 homedir() 不尊重 $HOME（实测固定返回真实 home），故支持环境变量覆盖。
 // 生产环境不设这两个变量，行为与之前完全一致。
@@ -1002,31 +1003,78 @@ async function gatewayLadderCheck(urls?: string[]): Promise<any> {
   }
 }
 
-/* ---------------- 免费代理批量淘源 + 连通性验证（Web「IP 池」卡集成，零依赖） ----------------
- * 与根目录 fetch_proxies.py 同思路：拉 4 个免费 SOCKS5 列表源 → 去重 → 逐个做完整
- * SOCKS5 握手 + CONNECT 隧道到 opencode.ai:443，返回 {url, ok, ms, err} 供前端展示状态。 */
-
-const PROXY_SOURCES = {
-  proxifly: "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt",
-  thespeedx: "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
-  monosans: "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
-  clarketm: "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
-}
+/* ---------------- Webshare 代理导入 + 连通性验证（Web「IP 池」卡，零依赖） ----------------
+ * 支持两种凭据：① Download Link（面板「Download」生成的下载链接，短时效、含水敏 token）
+ *              ② API Token Key（面板长期有效的 api key）。
+ * mode=link  → 直接 GET 下载链接返回纯文本（每行 host:port:user:pass 或 socks5://）
+ * mode=token → GET /api/v2/proxy/list/?mode=direct&page_size=100 + Authorization: Token <key> → JSON results
+ * 解析为 socks5://user:pass@host:port → 逐个做完整 SOCKS5 握手 + CONNECT 隧道到 opencode.ai:443，
+ * 返回 {url, ok, ms, err} 供前端展示状态。 */
 
 const PROBE_HOST = "opencode.ai"
 const PROBE_PORT = 443
 
-/** 解析源文本 → socks5://host:port 唯一列表（容忍 host:port / socks5://host:port）。 */
-function parseProxyCandidates(text: string): string[] {
+/** Webshare API 域名在本机 DNS 可能被污染（GFW 返回错误 IP），用固定公开解析器（8.8.8.8/1.1.1.1）绕过。 */
+const WEBSHARE_HOST = "proxy.webshare.io"
+const WEBSHARE_RESOLVERS = ["8.8.8.8", "1.1.1.1"]
+
+/** 用公开解析器解析 host → IPv4 列表（绕过系统 DNS 污染）。失败返回 []。 */
+function webshareDnsResolve(hostname: string): Promise<string[]> {
+  return new Promise((resolve) => {
+    const r = new Resolver()
+    r.setServers(WEBSHARE_RESOLVERS)
+    r.resolve4(hostname, (err, addrs) => {
+      try { r.cancel() } catch {}
+      resolve(err || !addrs.length ? [] : addrs)
+    })
+  })
+}
+
+/** 对 Webshare Host 发起 HTTPS GET（自定义 lookup 用公开解析器 + SNI 保持真实域名）。 */
+function webshareHttpsGet(path: string, headers: Record<string, string>): Promise<{ status: number; body: string }> {
+  return new Promise((resolve) => {
+    const req = https.request({
+      hostname: WEBSHARE_HOST,
+      port: 443,
+      lookup: (h: string, opts: any, cb: any) => {
+        webshareDnsResolve(h).then((addrs) => {
+          if (!addrs.length) return cb(new Error("dns empty"))
+          if (opts.all) return cb(null, addrs.map((address) => ({ address, family: 4 })))
+          cb(null, addrs[0], 4)
+        })
+      },
+      servername: WEBSHARE_HOST,
+      headers: { host: WEBSHARE_HOST, "user-agent": "Mozilla/5.0", ...headers },
+      path,
+      method: "GET",
+      timeout: 15000,
+    }, (res) => {
+      let b = ""
+      res.on("data", (c) => (b += c))
+      res.on("end", () => resolve({ status: res.statusCode ?? 0, body: b }))
+    })
+    req.on("error", (e) => resolve({ status: 0, body: String(e.message) }))
+    req.end()
+  })
+}
+
+/** 解析 Webshare 下载链接返回的文本 → socks5://user:pass@host:port 唯一列表。
+ *  容忍行格式：host:port / host:port:user:pass / socks5://...@host:port；# 注释跳过。 */
+function parseWebshareDownloadText(text: string): string[] {
   const seen = new Set<string>()
   for (const raw of text.split("\n")) {
-    const line = raw.trim()
+    let line = raw.trim()
     if (!line || line.startsWith("#")) continue
-    const m = line.match(/(?:socks5:\/\/)?(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})/)
-    if (!m) continue
-    const port = Number(m[2])
-    if (!(port >= 1 && port <= 65535)) continue
-    seen.add(`socks5://${m[1]}:${port}`)
+    if (line.startsWith("socks5://")) line = line.slice("socks5://".length)
+    // 格式：host:port / host:port:user:pass（用户/密码可能含 :，取前两段为 host/port）
+    const parts = line.split(":")
+    if (parts.length < 2) continue
+    const host = parts[0]
+    const port = Number(parts[1])
+    if (!host || !(port >= 1 && port <= 65535)) continue
+    const rest = parts.slice(2)
+    const url = rest.length >= 2 ? `socks5://${rest[0]}:${rest.slice(1).join(":")}@${host}:${port}` : `socks5://${host}:${port}`
+    if (!seen.has(url)) seen.add(url)
   }
   return [...seen]
 }
@@ -1102,35 +1150,41 @@ function probeSocks5(url: string, timeoutMs = 5000): Promise<{ ok: boolean; ms: 
   })
 }
 
-/** 拉全部源 → 候选去重 → 并发验证（限制并发 30，防雪崩）。返回带状态的候选列表。 */
-async function fetchFreeProxies(limit = 200, timeoutMs = 5000): Promise<any> {
-  const fetches: Promise<void>[] = []
-  const pool: { url: string; source: string }[] = []
-  const seen = new Set<string>()
-  for (const [name, url] of Object.entries(PROXY_SOURCES)) {
-    fetches.push(
-      fetch(url, { signal: AbortSignal.timeout(15000) })
-        .then((r) => r.text())
-        .then((text) => {
-          for (const u of parseProxyCandidates(text)) {
-            if (seen.has(u)) continue
-            seen.add(u)
-            pool.push({ url: u, source: name })
-          }
-        })
-        .catch(() => {}),
-    )
+/** 拉取 Webshare 代理列表（mode=link 下载链接 / mode=token API Key）→ 候选去重 → 并发连通验证（限制并发 20）。
+ *  返回 {ok, total, checked, candidates:[{url, ok, ms, err}]}；凭据错误/网络失败返回 {ok:false, error}。 */
+async function fetchWebshareProxies(mode: string, value: string, limit = 200, timeoutMs = 5000): Promise<any> {
+  const input: string[] = []
+  const v = String(value ?? "").trim()
+  if (!v) return { ok: false, error: "缺少凭据：下载链接 或 API Token Key" }
+  if (mode === "token") {
+    const r = await webshareHttpsGet("/api/v2/proxy/list/?mode=direct&page_size=100", { authorization: `Token ${v}` })
+    if (r.status !== 200) return { ok: false, error: `Webshare API 请求失败 HTTP ${r.status}（凭据无效或已过期）: ${r.body.slice(0, 120)}` }
+    let j: any
+    try { j = JSON.parse(r.body) } catch (e) { return { ok: false, error: `Webshare API 返回非法 JSON: ${String(e)}` } }
+    const results: any[] = Array.isArray(j?.results) ? j.results : []
+    for (const it of results) {
+      const u = String(it?.username ?? ""), pw = String(it?.password ?? ""), host = String(it?.proxy_address ?? ""), port = it?.port
+      if (u && pw && host && Number(port) >= 1) input.push(`socks5://${u}:${pw}@${host}:${port}`)
+    }
+  } else {
+    // link：value=完整下载链接 → 取 path+query 拼接请求
+    let u: URL
+    try { u = new URL(v) } catch { return { ok: false, error: "下载链接格式无效" } }
+    const r = await webshareHttpsGet(u.pathname + u.search, {})
+    if (r.status !== 200) return { ok: false, error: `下载链接请求失败 HTTP ${r.status}（链接已过期，请重新生成）: ${r.body.slice(0, 120)}` }
+    input.push(...parseWebshareDownloadText(r.body))
   }
-  await Promise.allSettled(fetches)
+  const seen = new Set<string>()
+  const pool = input.filter((u) => (seen.has(u) ? false : (seen.add(u), true)))
   const limited = pool.slice(0, limit)
   const results: any[] = []
   const queue = [...limited]
-  const workers = Array.from({ length: Math.min(30, limited.length) }, async () => {
+  const workers = Array.from({ length: Math.min(20, limited.length || 1) }, async () => {
     for (;;) {
       const item = queue.shift()
       if (!item) break
-      const st = await probeSocks5(item.url, timeoutMs)
-      results.push({ url: item.url, source: item.source, ok: st.ok, ms: st.ms, err: st.err ?? null })
+      const st = await probeSocks5(item, timeoutMs)
+      results.push({ url: item, ok: st.ok, ms: st.ms, err: st.err ?? null })
     }
   })
   await Promise.allSettled(workers)
@@ -1608,14 +1662,14 @@ try {
       return json({ ok: false, error: String(e?.message ?? e) })
     }
   }
-  // 免费代理批量淘源：拉 4 源 → 连通性验证 → 带状态候选列表（供选择加入 egress）
-  if (method === "POST" && route === "/api/gateway/proxies/fetch") {
+  // Webshare 代理导入（下载链接 mode=link / API Token Key mode=token）→ 拉取清单 → 连通性验证 → 带状态候选列表
+  if (method === "POST" && route === "/api/gateway/proxies/webshare") {
     try {
       let body: any = {}
       try { body = await req.json() } catch {}
       const limit = Math.max(1, Math.min(Number(body?.limit) || 200, 500))
       const timeout = Math.max(1, Math.min(Number(body?.timeout) || 5000, 15000))
-      return json(await fetchFreeProxies(limit, timeout))
+      return json(await fetchWebshareProxies(String(body?.mode || "token"), String(body?.value || ""), limit, timeout))
     } catch (e: any) {
       return json({ ok: false, error: String(e?.message ?? e) })
     }
@@ -1786,7 +1840,7 @@ if (action === "clear") {
             }
             if (action === "bulk-add") {
               // 批量加入 + 去重：一次写锁加入多个出口，已存在/非法项跳过并报告。
-              // 淘源卡「添加选中」走这里（避免 N 次单条写锁）。
+              // Webshare 导入卡「添加选中」走这里（避免 N 次单条写锁）。
               const raw = Array.isArray(body.urls) ? body.urls.map((x: unknown) => String(x)) : []
               if (raw.length === 0) throw new Error("urls 不能为空")
               const cfg = readGatewayConfig()
@@ -2324,7 +2378,7 @@ try {
   .log-row pre { max-width: 100%; }
   .gr-tip { cursor: help; border-bottom: 1px dotted var(--tx-3); }
 
-  /* 免费代理淘源：多列网格紧凑布局 + 勾选项 */
+  /* Webshare 导入：多列网格紧凑布局 + 勾选项 */
   .proxy-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
   .proxy-toolbar .hint { flex: 1; min-width: 140px; }
   .proxy-grid { margin-top: 10px; display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 6px; }
@@ -2812,19 +2866,23 @@ try {
   </details>
 
   <div class="card" id="gw-proxy-card">
-    <b>免费代理（批量淘源） <span id="proxy-badge"></span></b>
+    <b>Webshare 导入 <span id="proxy-badge"></span></b>
     <div class="row" style="margin-top:10px">
-      <button class="primary" id="proxy-fetch-btn" onclick="fetchFreeProxies()">拉取免费代理</button>
-      <span class="muted" style="margin-left:8px;flex:1">拉取后逐个做 SOCKS5 连通验证（opencode.ai:443），勾选有效项后一键加入 IP 池。</span>
+      <select id="proxy-mode" style="width:150px">
+        <option value="token">API Token Key</option>
+        <option value="link">下载链接</option>
+      </select>
+      <input id="proxy-input" type="text" placeholder="Token Key 或 下载链接 URL" style="flex:1;min-width:0" />
+      <button class="primary" id="proxy-fetch-btn" onclick="fetchWebshareProxies()">导入</button>
     </div>
+    <div class="muted" style="margin-top:6px;flex:1">Webshare 官方 API 拉取代理清单，逐个做 SOCKS5 连通验证（opencode.ai:443），勾选有效项后一键加入 IP 池。Token Key 长期有效；下载链接几分钟内有效，过期需重新生成。</div>
     <div class="proxy-toolbar" id="proxy-toolbar" style="display:none">
       <button class="small" id="proxy-toggleall-btn" onclick="toggleProxyAll()">全选有效</button>
       <button class="small" onclick="clearProxySel()">清空</button>
       <button class="small primary" id="proxy-addsel-btn" onclick="addSelectedProxies()">＋ 添加选中（<span id="proxy-selcount">0</span>）</button>
       <span class="muted hint" id="proxy-toolbar-hint"></span>
     </div>
-    <div id="proxy-list" class="proxy-grid muted" style="margin-top:10px">未拉取。点「拉取免费代理」联网淘一批可用 SOCKS5 出口。</div>
-    <div class="muted" style="margin-top:6px">提示：连通 ≠ 可绕过限流——免费数据中心 IP 大多被 opencode.ai 限（429，分时段）。已在 IP 池中的项自动灰置不可重复添加。</div>
+    <div id="proxy-list" class="proxy-grid muted" style="margin-top:10px">未导入。粘贴 Token Key 或下载链接，点「导入」拉取 Webshare 代理。</div>
     <div id="proxy-msg" class="msg" style="margin-top:6px"></div>
   </div>
   </div>
@@ -3739,12 +3797,12 @@ function renderEgressList(egress, enabled, ipRotation) {
 function updateEgressSelCount() {
   const c = document.getElementById("egress-selcount")
   if (!c) return
-  // 勾选数 = 显式勾选（egressSel[i] 已定义）∪ 当前轮换子集（未显式操作过的，激活后保持勾选展示）
-  const n = currentEgressList.filter((e, i) => egressSel[i] === undefined ? (egressActiveList || []).includes(e) : !!egressSel[i]).length
+  // 勾选数 = 手动勾选（egressSel）∪ 当前轮换子集（egressActiveList，激活后保持勾选展示）
+  const n = currentEgressList.filter((e, i) => egressSel[i] || (egressActiveList || []).includes(e)).length
   c.textContent = n
 }
 function egressSelAllToggle() {
-  const allOn = currentEgressList.some((e, i) => egressSel[i] === undefined ? (egressActiveList || []).includes(e) : !!egressSel[i])
+  const allOn = currentEgressList.some((e, i) => egressSel[i] || (egressActiveList || []).includes(e))
   currentEgressList.forEach((_, i) => { egressSel[i] = !allOn })
   renderEgressList(currentEgressList, ipRotationOn)
 }
@@ -3754,9 +3812,9 @@ function clearEgressSel() {
 }
 async function activateEgressSel() {
   // 选中 N 个出口 → 设为轮换子集并立即启动（网关动态读配置，无需重启）
-  // 取勾选 = 显式勾选 ∪ 当前轮换子集（激活后复选框保持勾选；取消勾选某活跃项即表示想把它移出）
   const msg = document.getElementById("egress-msg")
-  const urls = currentEgressList.filter((e, i) => egressSel[i] === undefined ? (egressActiveList || []).includes(e) : !!egressSel[i])
+  const urls = currentEgressList.filter((e, i) => egressSel[i] || (egressActiveList || []).includes(e) ? e : false).filter(Boolean)
+  // 若全部取消勾选（已没有任何选中/在子集中）→ 提示
   if (!urls.length) { msg.className = "msg err"; msg.textContent = "未勾选任何出口（先勾选要作为轮换子集的出口）"; return }
   const btn = document.getElementById("egress-activate-btn")
   if (btn) { btn.disabled = true; btn.textContent = "启动中…" }
@@ -3777,7 +3835,6 @@ async function deactivateEgressActive() {
   try {
     const r = await api("/api/gateway/egress", { action: "deactivate" })
     egressActiveList = []
-    egressSel = {}
     ipRotationOn = !!r.ipRotation
     renderEgressList(r.egress || [], !!r.enabled, ipRotationOn)
     msg.className = "msg"
@@ -4217,16 +4274,19 @@ async function toggleIpRotation() {
     btn.textContent = old
   }
 }
-var proxyCandidates = [] // 免费代理候选缓存：{url, source, ok, ms, err, inPool}
+var proxyCandidates = [] // Webshare 导入候选缓存：{url, ok, ms, err, inPool}
 var proxySel = {} // 勾选状态：{ index: true }
-async function fetchFreeProxies() {
+async function fetchWebshareProxies() {
   const btn = document.getElementById("proxy-fetch-btn")
   const msg = document.getElementById("proxy-msg")
+  const mode = document.getElementById("proxy-mode").value
+  const value = document.getElementById("proxy-input").value.trim()
+  if (!value) { msg.className = "msg err"; msg.textContent = "先粘贴 Token Key 或下载链接"; return }
   const old = btn.textContent
-  btn.textContent = "拉取中…（联网 + 连通验证，约 30s）"; btn.disabled = true
+  btn.textContent = "导入中…（拉取 + 连通验证）"; btn.disabled = true
   try {
-    const r = await api("/api/gateway/proxies/fetch", { limit: 200, timeout: 5000 })
-    if (!r.ok) throw new Error(r.error || "拉取失败")
+    const r = await api("/api/gateway/proxies/webshare", { mode, value, limit: 200, timeout: 5000 })
+    if (!r.ok) throw new Error(r.error || "导入失败")
     // 拉当前池用于标记已存在项（去重灰置）
     let inPool = new Set()
     try { inPool = new Set((await api("/api/gateway/config")).egress || []) } catch {}
@@ -4237,9 +4297,9 @@ async function fetchFreeProxies() {
     renderProxyList()
     const good = proxyCandidates.filter((c) => c.ok).length
     msg.className = "msg"
-    msg.textContent = "共 " + r.total + " 候选，验证 " + r.checked + " 个，可用 " + good + " 个（已自动勾选可添加项）"
+    msg.textContent = "共 " + r.total + " 个代理，验证 " + r.checked + " 个，可用 " + good + " 个（已自动勾选可添加项）"
   } catch (e) {
-    msg.className = "msg err"; msg.textContent = "拉取失败：" + e.message
+    msg.className = "msg err"; msg.textContent = "导入失败：" + e.message
   }
   btn.textContent = old; btn.disabled = false
 }
@@ -4253,7 +4313,7 @@ function renderProxyList() {
     : ""
   const toolbar = document.getElementById("proxy-toolbar")
   if (toolbar) toolbar.style.display = proxyCandidates.length ? "flex" : "none"
-  if (!proxyCandidates.length) { el.textContent = "未拉取。点「拉取免费代理」联网淘一批可用 SOCKS5 出口。"; return }
+  if (!proxyCandidates.length) { el.textContent = "未导入。粘贴 Token Key 或下载链接，点「导入」拉取 Webshare 代理。"; return }
   el.innerHTML = proxyCandidates.map((c, i) => {
     const isSel = !!proxySel[i]
     const disable = !c.ok || c.inPool
@@ -4923,8 +4983,8 @@ export {
   gatewayTest,
   gatewayEgressHealthProxy,
   gatewayCtlExists,
-  fetchFreeProxies,
-  parseProxyCandidates,
+  fetchWebshareProxies,
+  parseWebshareDownloadText,
   genGatewayToken,
   readGatewayConfig,
   writeGatewayConfig,

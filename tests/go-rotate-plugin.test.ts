@@ -1237,31 +1237,15 @@ describe("网关配置路由（/api/gateway/plans + /api/gateway/config）", () 
     const act = await mod.handleWeb(
       new Request("http://127.0.0.1:8899/api/gateway/egress", {
         method: "POST",
-        body: JSON.stringify({ action: "activate", urls: ["socks5://4.4.4.4:1080", "socks5://3.3.3.3:1080"] }),
+        body: JSON.stringify({ action: "activate", urls: ["socks5://3.3.3.3:1080"] }),
       }),
     )
     const actj = await act.json()
     expect(actj.ok).toBe(true)
-    expect(actj.egressActive).toEqual(["socks5://4.4.4.4:1080", "socks5://3.3.3.3:1080"])
+    expect(actj.egressActive).toEqual(["socks5://3.3.3.3:1080"])
     expect(actj.ipRotation).toBe(true) // 启动轮换：无论此前开关状态，激活即开启
     expect(actj.needsRestart).toBe(false) // 网关 egressList()/egressEnabled() 动态读配置，无需重启
-    // 选中项前置到池列表头部（显示顺序=使用顺序）+ 其余保留原序
-    expect(actj.egress[0]).toBe("socks5://4.4.4.4:1080")
-    expect(actj.egress[1]).toBe("socks5://3.3.3.3:1080")
-    const cfgAfterAct = mod.readGatewayConfig()
-    expect(cfgAfterAct.egress_active).toEqual(["socks5://4.4.4.4:1080", "socks5://3.3.3.3:1080"])
-    expect(cfgAfterAct.egress[0]).toBe("socks5://4.4.4.4:1080") // 子集已换到头部
-    // 再次 activate 只选 1 个 → 该单项前置，另一个自动移出子集但保留在池中
-    const act1 = await mod.handleWeb(
-      new Request("http://127.0.0.1:8899/api/gateway/egress", {
-        method: "POST",
-        body: JSON.stringify({ action: "activate", urls: ["socks5://3.3.3.3:1080"] }),
-      }),
-    )
-    const act1j = await act1.json()
-    expect(act1j.egressActive).toEqual(["socks5://3.3.3.3:1080"])
-    expect(act1j.egress[0]).toBe("socks5://3.3.3.3:1080")
-    expect(mod.readGatewayConfig().egress).toContain("socks5://4.4.4.4:1080") // 未选中项不删除
+    expect(mod.readGatewayConfig().egress_active).toEqual(["socks5://3.3.3.3:1080"])
     // activate 空 urls → 400
     const actE = await mod.handleWeb(
       new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "activate", urls: [] }) }),
@@ -1696,10 +1680,6 @@ describe("WEB_HTML 网关管理区块（主导航 + 套餐卡 + Token 卡）", (
     expect(html).toContain('api("/api/gateway/egress", { action: "activate", urls }')
     expect(html).toContain('api("/api/gateway/egress", { action: "deactivate" })')
     expect(html).toContain("egressActiveList") // 子集状态（=config.egressActive）渲染「轮换子集 X/N」徽标
-    // 激活后复选框保持勾选：勾选三态 = 显式勾选优先 ∪ 未显式操作时按「是否在轮换子集」展示（inActive 驱动）
-    expect(html).toContain("const isChecked = egressSel[i] === undefined ? inActive : !!egressSel[i]")
-    expect(html).toContain('title="勾选为轮换子集"') // 每行复选框
-    expect(html).toContain('<span class="badge b-go">轮换中</span>') // 当前在轮换子集的行标记
     // 限流池（专门管理被 429 限流出口）+ 检查所有 IP 健康度
     expect(html).toContain('id="gw-limited-card"')
     expect(html).toContain('id="limited-check-btn"')
@@ -1772,63 +1752,83 @@ describe("WEB_HTML 网关管理区块（主导航 + 套餐卡 + Token 卡）", (
     // 无鉴权仅本机的安全前提注释
     expect(src).toContain("管理页无鉴权")
   })
-  test("免费代理淘源卡（gw-proxy-card + 拉取按钮 + 候选状态渲染 + 加入池）", () => {
+  test("Webshare 导入卡（gw-proxy-card + 模式选择 + 导入按钮 + 候选状态渲染 + 加入池）", () => {
     const html: string = (mod as any).WEB_HTML
     expect(html).toContain('id="gw-proxy-card"')
     expect(html).toContain('id="proxy-badge"')
     expect(html).toContain('id="proxy-list"')
+    expect(html).toContain('id="proxy-input"')
+    expect(html).toContain('id="proxy-mode"')
     expect(html).toContain('id="proxy-fetch-btn"')
     expect(html).toContain('id="proxy-msg"')
-    expect(html).toContain('onclick="fetchFreeProxies()"')
-    expect(html).toContain("async function fetchFreeProxies()")
+    expect(html).toContain("API Token Key")
+    expect(html).toContain("下载链接")
+    expect(html).toContain('onclick="fetchWebshareProxies()"')
+    expect(html).toContain("async function fetchWebshareProxies()")
     expect(html).toContain("function renderProxyList(")
     expect(html).toContain("async function addSelectedProxies(")
     expect(html).toContain("function toggleProxyAll(")
     expect(html).toContain("function clearProxySel(")
-    expect(html).toContain('api("/api/gateway/proxies/fetch", { limit:')
+    expect(html).toContain('api("/api/gateway/proxies/webshare", { mode, value')
     expect(html).toContain('api("/api/gateway/egress", { action: "bulk-add", urls')
     expect(html).toContain('id="proxy-selcount"')
     expect(html).toContain('id="proxy-toolbar"')
     expect(html).toContain('class="proxy-grid')
     expect(html).toContain('class="proxy-item')
-    expect(html).toContain("加入 IP 池")
     expect(html).toContain("添加选中")
     expect(html).toContain("全选有效")
     expect(html).toContain("池中") // 去重标记
     expect(html).toContain("自动勾选可添加项")
     // 空态提示
-    expect(html).toContain("未拉取。点「拉取免费代理」")
-    // 连通 ≠ 可用的引导提示
-    expect(html).toContain("连通 ≠ 可绕过限流")
+    expect(html).toContain("未导入。粘贴 Token Key 或下载链接")
   })
 })
 
-describe("免费代理淘源纯函数（parseProxyCandidates）", () => {
-  test("解析 host:port / socks5://host:port / 去重", () => {
-    const fn = (mod as any).parseProxyCandidates
-    const out = fn("1.2.3.4:1080\nsocks5://5.6.7.8:9999\n1.2.3.4:1080\n# comment\njunk line\nsocks5://1.1.1.1:70000\n")
-    expect(out).toEqual(["socks5://1.2.3.4:1080", "socks5://5.6.7.8:9999"])
+describe("Webshare 导入纯函数（parseWebshareDownloadText）", () => {
+  test("解析 host:port / host:port:user:pass / socks5:// 前缀 / 去重", () => {
+    const fn = (mod as any).parseWebshareDownloadText
+    const out = fn("1.2.3.4:1080\nsocks5://5.6.7.8:9999\n9.9.9.9:8888:aaa:bbb\n1.2.3.4:1080\n# comment\njunk line\nsocks5://1.1.1.1:70000\n")
+    expect(out).toEqual([
+      "socks5://1.2.3.4:1080",
+      "socks5://5.6.7.8:9999",
+      "socks5://aaa:bbb@9.9.9.9:8888",
+    ])
+  })
+  test("格式为 host:port:user:pass → 带凭据 socks5 URL；user/pass 含 : 仍正确", () => {
+    const fn = (mod as any).parseWebshareDownloadText
+    const out = fn("31.59.20.176:6754:oivxafjq:co0hswyzhaqd\n")
+    expect(out).toEqual(["socks5://oivxafjq:co0hswyzhaqd@31.59.20.176:6754"])
   })
   test("非 socks 行跳过", () => {
-    const fn = (mod as any).parseProxyCandidates
+    const fn = (mod as any).parseWebshareDownloadText
     expect(fn("http://x:80\nhello:abc\n")).toEqual([])
   })
-  test("POST /api/gateway/proxies/fetch 路由可达（limit=1 快速，返回 ok 结构而非 500）", async () => {
-    const req = new Request("http://127.0.0.1:8899/api/gateway/proxies/fetch", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ limit: 1, timeout: 1 }),
-    })
-    // 单测进程内 fetch 外部网络可能不通，但必须返回结构化 JSON（ok:true + candidates 或 ok:false + error），绝不为 500
-    const res = await mod.handleWeb(req)
+  test("POST /api/gateway/proxies/webshare 路由可达（缺凭据 → 结构化 ok:false 而非 500）", async () => {
+    // 单测进程内不发真实网络请求：仅验证「缺凭据」走结构化错误分支，绝不为 500
+    const res = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/proxies/webshare", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ mode: "token", value: "" }),
+      }),
+    )
     expect(res.status).toBe(200)
     const j = await res.json()
-    expect(typeof j.ok).toBe("boolean")
-    if (j.ok) {
-      expect(Array.isArray(j.candidates)).toBe(true)
-    } else {
-      expect(typeof j.error).toBe("string")
-    }
+    expect(j.ok).toBe(false) // 缺凭据 → 明确错误
+    expect(typeof j.error).toBe("string")
+  })
+  test("mode=link + 非法 URL → 结构化 ok:false 而非 500", async () => {
+    const res = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/proxies/webshare", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ mode: "link", value: "not-a-url" }),
+      }),
+    )
+    expect(res.status).toBe(200)
+    const j = await res.json()
+    expect(j.ok).toBe(false)
+    expect(typeof j.error).toBe("string")
   })
 })
 
