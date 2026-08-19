@@ -2292,6 +2292,12 @@ describe("双域独立轮换（current_gateway / cooldown_until_gateway 域分�
     expect(html).toContain('onclick="toggleAutoRotate()"')
     expect(html).toContain("function toggleAutoRotate()")
     expect(html).toContain('api("/api/gateway/config", { auto_rotate_keys: newOn })')
+    // 网关管理页内联「切换 key」：select + 设为当前 + 轮换到下一个（直接对应网关域 current_gateway）
+    expect(html).toContain('id="gw-key-select"')
+    expect(html).toContain('onclick="gwSetCurrentKey()"')
+    expect(html).toContain('onclick="gwRotateNext()"')
+    expect(html).toContain('api("/api/current", { name, domain: "gateway" })')
+    expect(html).toContain('api("/api/rotate", { domain: "gateway" })')
     expect(html).toContain('api("/api/rotate", { domain })')
     // 网关卡 gw-current 显示 statusPayload 网关域字段
     expect(html).toContain("(st && st.current_gateway)")

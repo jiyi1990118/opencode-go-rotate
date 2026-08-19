@@ -2774,6 +2774,13 @@ try {
       <div class="stat"><div class="v" id="gw-req">-</div><div class="l">总请求</div></div>
       <div class="stat"><div class="v" id="gw-mcount">-</div><div class="l">模型数 go+zen</div></div>
     </div>
+    <div class="row" style="margin-bottom:10px;align-items:center">
+      <span class="muted">切换 key：</span>
+      <select id="gw-key-select" style="flex:1;min-width:0"></select>
+      <button id="gw-key-set" class="primary" onclick="gwSetCurrentKey()">设为当前</button>
+      <button id="gw-key-next" class="gw" onclick="gwRotateNext()">轮换到下一个</button>
+    </div>
+    <div class="muted" style="margin-bottom:10px">改当前 key 立即生效（网关每请求读当前 key，写 current_gateway 字段；不写 auth.json）。「轮换到下一个」按网关域冷却跳过非可用 key。</div>
     <div class="row" style="margin-bottom:10px">
       <span class="muted" style="flex:1">管理操作（启停 launchd 服务，走跨进程锁）：</span>
       <button id="gw-start" onclick="gwManage('start')">启动</button>
@@ -3390,6 +3397,7 @@ async function refreshGateway() {
     // 不用 graft 的 healthz current（网关域名）。失败回退 healthz.current 兜底显示。
     const st = await api("/api/status").catch(() => null)
     const gwCur = (st && st.current_gateway) || (g.healthz && g.healthz.current) || "-"
+    renderGwKeySelect(st, gwCur)
     if (!g.running) {
       card.style.opacity = "0.55"
       setDash()
@@ -4299,6 +4307,34 @@ function renderAutoRotateBtn(on) {
   if (!btn) return
   btn.textContent = on ? "开启" : "关闭"
   btn.className = on ? "primary" : ""
+}
+function renderGwKeySelect(st, current) {
+  const sel = document.getElementById("gw-key-select")
+  if (!sel || !st || !Array.isArray(st.keys)) return
+  const names = st.keys.map(k => k.name)
+  sel.innerHTML = names.map(n => {
+    const cooldown = st.keys.some(k => k.name === n && (k.cooldown_until_gateway && Date.parse(k.cooldown_until_gateway) > Date.now()))
+    return '<option value="' + esc(n) + '"' + (n === current ? ' selected' : '') + (cooldown ? ' data-gw-cooling' : '') + '>' +
+      esc(n) + (cooldown ? '（网关域冷却中）' : n === current ? '（当前）' : '') + '</option>'
+  }).join("")
+}
+async function gwSetCurrentKey() {
+  const sel = document.getElementById("gw-key-select")
+  const msg = document.getElementById("gw-ctl-msg")
+  const name = sel.value
+  try {
+    await api("/api/current", { name, domain: "gateway" })
+    msg.className = "msg"; msg.textContent = "网关已切换 key —— " + name + "（不写 auth.json）"
+    refreshGateway(); refresh()
+  } catch (e) { msg.className = "msg err"; msg.textContent = "切换失败：" + e.message }
+}
+async function gwRotateNext() {
+  const msg = document.getElementById("gw-ctl-msg")
+  try {
+    await api("/api/rotate", { domain: "gateway" })
+    msg.className = "msg"; msg.textContent = "网关 key 已轮换到下一个（网关域冷却内 key 自动跳过）"
+    refreshGateway(); refresh()
+  } catch (e) { msg.className = "msg err"; msg.textContent = "轮换失败：" + e.message }
 }
 async function toggleAutoRotate() {
   const msg = document.getElementById("plan-msg")

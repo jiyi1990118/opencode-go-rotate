@@ -73,7 +73,7 @@
 | POST | `/api/keys/delete` | `{name}` | `{ok,status}` | 删除 key |
 | POST | `/api/current` | `{name}` | `{ok,status}` | 设为当前 |
 | POST | `/api/cooldown` | `{name, minutes:number\|null}` | `{ok,status}` | 设置冷却（null/0=清除） |
-| POST | `/api/rotate` | `{}` 或 `{domain:"go"\|"gateway"}` | `{ok,status}` | 手动轮换当前域（缺省 zen）。**domain=gateway**（2026-08-19）走网关域 `current_gateway` + `cooldown_until_gateway`，不写 auth.json（与 TUI/go 域独立）；Web「手动操作」区已加「网关轮换」按钮 |
+| POST | `/api/rotate` | `{}` 或 `{domain:"go"\|"gateway"}` | `{ok,status}` | 手动轮换当前域（缺省 zen）。**domain=gateway**（2026-08-19）走网关域 `current_gateway` + `cooldown_until_gateway`，不写 auth.json（与 TUI/go 域独立）。**网关管理页「切换 key」区**内联：下拉选 key +「设为当前」`/api/current {name, domain:"gateway"}` +「轮换到下一个」`/api/rotate {domain:"gateway"}`；「Key 管理」手动操作区另有「网关轮换」按钮 |
 | POST | `/api/web/off` | `{}` | `{ok,shutting_down,auto_web:false}` | `auto_web=false` + 300ms 后停 server |
 | POST | `/api/web/on` | `{}` | `{ok,auto_web:true,restarted}` | 开自动启动 + **立即重启**（server 未运行时拉起；`restarted` 表示本次是否真的拉起） |
 | POST | `/api/log/clear` | `{}` | `{ok,status}` | 清空日志 + 删归档 |

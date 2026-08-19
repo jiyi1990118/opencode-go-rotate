@@ -31,7 +31,7 @@ opencode 的 opencode-go 多 key 自动轮换插件 + Web 管理界面。
 - ✅ **实时健康检查**：「检查所有 IP 健康度」逐出口实时探测（每行徽标边查边更新 + 进度计数），大池不再一次性整池长请求超时；结果本地缓存，刷新页面徽标仍在
 - ✅ **多选轮换子集**：IP 池每行可勾选 1~N 个出口 →「启用选中为轮换（立即启动）」即时生效（选中项前置到列表头部、复选框保持勾选 + 「轮换中」徽标、`egress_active` 子集落盘）；「恢复全池轮换」一键回全池
 - ✅ **Webshare 代理导入**：Web 原生支持两种凭据导入官方代理——API Token Key（长期有效）或 Download 下载链接（短时效），逐个 SOCKS5 连通验证 + 有效项一键加入 IP 池（内置 DNS 污染绕过）
-- ✅ **网关 key 手动/自动轮换**：Web「手动操作」区新增「网关轮换」按钮（gateway 域 `current_gateway` 轮换，不写 auth.json）；「上游套餐」卡新增「网关 key 自动轮换」开关——`plan=go` 恒开、zen 免费档默认关（UA/频率限流轮换无效），可选显式开启（`auto_rotate_keys`）
+- ✅ **网关 key 手动/自动轮换**：网关管理页内联「切换 key」下拉（选 key 即「设为当前」，可「轮换到下一个」「自动轮换到下一个」——gateway 域 `current_gateway`，不写 auth.json；「Key 管理」页另有「网关轮换」按钮 + 「网关 key 自动轮换」开关：`plan=go` 恒开、zen 免费档默认关（UA/频率限流轮换无效），可选显式开启（`auto_rotate_keys`）
 - 联动文档：`docs/网关双套餐模型查看-phase22.md`
 - ✅ 测试体系：插件单测（`bun test tests/`）、CLI 单测（`python3 tests/test-go-rotate-cli.py`）、gateway 单测（`ZEN_TEST=1 node zen-gateway/tests/run-tests.mjs`）
 
