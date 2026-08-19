@@ -2139,6 +2139,105 @@ t("egressHealthCheck 有 key → 每个出口返回 index/url/ok 契约（网络
   }
 })
 
+// 梯子（读 gateway-config 的 ladder 字段 + 出口选择 + 隧道）—— 纯函数/同步路径测试；
+// 用 gw 已 import 的模块（其 GATEWAY_CONFIG=ZEN_GATEWAY_CONFIG 测试路径）直接写文件读取，避免 re-import 竞态。
+group("梯子（ladderConfig / ladderNextEgress / normalizeLadderConfig）")
+
+t("normalizeLadderConfig：纯函数归一（缺失→null / 完整→归一 / 非法容错）", () => {
+  assert.equal(gw.normalizeLadderConfig(null), null)
+  assert.equal(gw.normalizeLadderConfig("x"), null)
+  assert.deepEqual(gw.normalizeLadderConfig({ enabled: true, port: 10880, mode: "fixed", fixed: "socks5://1.2.3.4:1080" }), {
+    enabled: true, port: 10880, mode: "fixed", fixed: "socks5://1.2.3.4:1080",
+  })
+  assert.deepEqual(gw.normalizeLadderConfig({ enabled: "yes", port: "abc", mode: "weird" }), { enabled: false, port: 10880, mode: "rotate", fixed: null })
+  assert.deepEqual(gw.normalizeLadderConfig({}), { enabled: false, port: 10880, mode: "rotate", fixed: null })
+})
+
+t("readGatewayConfig：ladder 字段读取归一（写文件 → gw 读取）+ 缺失 → null", () => {
+  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "zen", ladder: { enabled: true, port: 10880, mode: "fixed", fixed: "socks5://1.2.3.4:1080" } }))
+  assert.deepEqual(gw.readGatewayConfig().ladder, { enabled: true, port: 10880, mode: "fixed", fixed: "socks5://1.2.3.4:1080" })
+  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "zen" }))
+  assert.equal(gw.readGatewayConfig().ladder, null)
+  try { rmSync(_gwCfgPath, { force: true }) } catch {}
+})
+
+t("ladderConfig：读当前 gateway-config 归一（enabled/port/mode/fixed）", () => {
+  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "zen", ladder: { enabled: true, port: 8890, mode: "rotate" } }))
+  const c = gw.ladderConfig()
+  assert.equal(c.enabled, true)
+  assert.equal(c.port, 8890)
+  assert.equal(c.mode, "rotate")
+  assert.equal(c.fixed, null)
+  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "zen" }))
+  const d = gw.ladderConfig()
+  assert.equal(d.enabled, false)
+  assert.equal(d.port, 10880)
+  assert.equal(d.mode, "rotate")
+  try { rmSync(_gwCfgPath, { force: true }) } catch {}
+})
+
+t("ladderNextEgress：fixed 模式返回固定出口；rotate 模式从池轮换（不依赖套餐开关）", () => {
+  writeFileSync(_gwCfgPath, JSON.stringify({
+    plan: "zen",
+    egress: ["socks5://1.1.1.1:1080", "socks5://2.2.2.2:1080"],
+    ladder: { enabled: true, port: 10880, mode: "fixed", fixed: "socks5://9.9.9.9:1080" },
+  }))
+  const e = gw.ladderNextEgress()
+  assert.ok(e && e.type === "socks5")
+  assert.equal(e.host, "9.9.9.9")
+  // rotate 模式：go 档（egressEnabled=false）也应从池轮换返回出口（梯子不依赖套餐开关）
+  writeFileSync(_gwCfgPath, JSON.stringify({
+    plan: "go",
+    egress: ["socks5://1.1.1.1:1080", "socks5://2.2.2.2:1080"],
+    ladder: { enabled: true, port: 10880, mode: "rotate" },
+  }))
+  const e2 = gw.ladderNextEgress()
+  assert.ok(e2 && e2.type === "socks5")
+  assert.ok(e2.host === "1.1.1.1" || e2.host === "2.2.2.2")
+  // 池无 socks5（仅 direct）→ null（本地直连兜底）
+  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "go", egress: ["direct"], ladder: { enabled: true, port: 10880, mode: "rotate" } }))
+  assert.equal(gw.ladderNextEgress(), null)
+  try { rmSync(_gwCfgPath, { force: true }) } catch {}
+})
+
+{
+  let ok = true
+  let err = null
+  const nameTunnel = "socks5TunnelConnect：对 mock SOCKS5（无认证）建 CONNECT 隧道成功"
+  try {
+    const net = await import("node:net")
+    const mock = net.createServer((c) => {
+      let buf = Buffer.alloc(0)
+      c.on("data", (d) => {
+        buf = Buffer.concat([buf, d])
+        if (buf.length >= 2 && buf[1] === 0x01 && buf.length >= 3) {
+          c.write(Buffer.from([0x05, 0x00]))
+          buf = buf.subarray(3)
+        }
+        if (buf.length >= 10) c.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]))
+      })
+    })
+    const port = 20089 + Math.floor(Math.random() * 100)
+    await new Promise((r) => mock.listen(port, "127.0.0.1", r))
+    try {
+      const e = { type: "socks5", host: "127.0.0.1", port, user: null, pass: null, raw: `socks5://127.0.0.1:${port}` }
+      const r = await gw.socks5TunnelConnect(e, "www.google.com", 443, 3000)
+      assert.ok(r && r.sock)
+      r.sock.destroy()
+      // CONNECT 到不可达目标 → reject（确认隧道失败路径）
+      let failed = false
+      try {
+        await gw.socks5TunnelConnect({ type: "socks5", host: "127.0.0.1", port: 1, user: null, pass: null, raw: "socks5://127.0.0.1:1" }, "www.google.com", 443, 1000)
+      } catch (e2) { failed = true }
+      assert.ok(failed)
+    } finally {
+      mock.close()
+    }
+  } catch (e) { ok = false; err = e }
+  if (ok) { passed++; groups[groups.length - 1].count++; console.log(`  ✅ ${nameTunnel}`) }
+  else { failures.push({ group: currentGroup, name: nameTunnel, error: err }); console.log(`  ❌ ${nameTunnel}\n     ${String((err && err.message) || err).split("\n").join("\n     ")}`) }
+}
+
 /* ================= 汇总 ================= */
 console.log(`\n${"=".repeat(64)}`)
 const total = passed + failures.length

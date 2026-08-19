@@ -25,6 +25,9 @@ opencode 的 opencode-go 多 key 自动轮换插件 + Web 管理界面。
 - ✅ **双套餐健康检查**：每 key 分别探测 zen 与 go 端点（`check` 或 Web「检查」按钮），状态列展示两行健康 + 探测时间
 - ✅ Web **4 区块导航**：Key 管理（三域健康总览 + key 双套餐健康列）/ TUI（zen+go 子卡设置）/ 网关 / 统计
 - ✅ 网关卡片**双套餐模型动态查看**：go 与 zen 全部模型（上游实时获取 + 内置兜底），各行分折叠块展示动态/内置计数，「刷新模型」一键重拉；网关设 token 时 Web 自动带 Bearer 读取（不再 401）
+- ✅ **梯子（本地 SOCKS5 透明代理）**：Web 一键启用，其它应用（浏览器/curl/git/系统代理）指向 `socks5://127.0.0.1:<port>` 即通过 IP 池出口上网——轮换模式每连接自动换 IP（坏出口自动顺延重试）、固定模式锁定指定出口；内置使用说明
+- ✅ **科学上网筛选**：Web「科学上网筛选」按钮对 IP 池每个出口测 google/youtube CONNECT + 出口 IP 归属地，筛出真能翻墙的代理
+- ✅ **不可用池**：IP 池/限流池一键「→ 转移不可用」，把健康检查失败的出口移到单独「不可用池」（默认折叠）管理，恢复后移回
 - 联动文档：`docs/网关双套餐模型查看-phase22.md`
 - ✅ 测试体系：插件单测（`bun test tests/`）、CLI 单测（`python3 tests/test-go-rotate-cli.py`）、gateway 单测（`ZEN_TEST=1 node zen-gateway/tests/run-tests.mjs`）
 

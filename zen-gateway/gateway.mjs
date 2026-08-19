@@ -516,6 +516,18 @@ const PLANS = {
   },
 }
 
+/** 归一化梯子配置（纯函数）：enabled→boolean、port→正整数(缺省10880)、mode→rotate|fixed、fixed→string|null。
+ *  输入非法/缺失 → null（未启用）。供 readGatewayConfig 与测试共用；确保两处语义一致。 */
+function normalizeLadderConfig(raw) {
+  if (!raw || typeof raw !== "object") return null
+  return {
+    enabled: raw.enabled === true,
+    port: Number.isInteger(raw.port) && raw.port > 0 ? raw.port : 10880,
+    mode: raw.mode === "fixed" ? "fixed" : "rotate",
+    fixed: typeof raw.fixed === "string" && raw.fixed ? raw.fixed : null,
+  }
+}
+
 /** 读 gateway-config.json（ZEN_GATEWAY_CONFIG 覆盖路径）。缺失/损坏/非法 → {}（零迁移回退）。
  *  纯函数：只读文件 + JSON.parse + 字段归一，绝不写文件。 */
 function readGatewayConfig() {
@@ -533,6 +545,7 @@ function readGatewayConfig() {
         : [],
       egress: Array.isArray(cfg.egress) ? cfg.egress.filter((e) => typeof e === "string") : [],
       ip_rotation: cfg.ip_rotation !== false, // 缺省开启；显式 false 关闭
+      ladder: normalizeLadderConfig(cfg.ladder),
     }
   } catch (e) {
     log(`⚠️  readGatewayConfig 失败（${GATEWAY_CONFIG}），回退默认: ${e.message}`)
@@ -935,8 +948,314 @@ function egressSucceeded() {
      // 保持原顺序
      out.push(...res.sort((a, b) => a.index - b.index))
    }
-   return { checkedAt: new Date().toISOString(), egress: out }
- }
+return { checkedAt: new Date().toISOString(), egress: out }
+  }
+
+  /* ---------------- 梯子（本地 SOCKS5 透明代理） ----------------
+   * 用途：在 127.0.0.1:<port> 开一个 SOCKS5 服务端，其它应用（浏览器/curl/git 等）把
+   * 代理指向它即可「科学上网」——每个 CONNECT 隧道经当前 egress 出口（轮换）或指定出口
+   * （fixed）转发到目标。hands 复用与 egress 相同的 SOCKS5 客户端逻辑。
+   * 配置：gateway-config.json `ladder: { enabled, port, mode: "rotate"|"fixed", fixed }`。
+   *   mode=rotate → 每次新连接用 currentEgress()（出口池轮换，IP 变化）；
+   *   mode=fixed  → 固定走 `fixed` 指定的出口（不参与轮换）。
+   * 只绑 127.0.0.1（安全基线：本机应用使用，不暴露内网）。 */
+
+  const LADDER_DEFAULT_PORT = 10880
+
+  let ladderServer = null
+  let ladderConns = 0
+
+  /** 读梯子配置（动态：每次读当前 gateway-config）。 */
+  function ladderConfig() {
+    const c = readGatewayConfig().ladder || {}
+    return {
+      enabled: c.enabled === true,
+      port: c.port || LADDER_DEFAULT_PORT,
+      mode: c.mode === "fixed" ? "fixed" : "rotate",
+      fixed: c.fixed || null,
+    }
+  }
+
+  /** @api 梯子当前状态（enabled/running/port/mode/fixed/conns/egressCount） */
+  function ladderStatus() {
+    const c = ladderConfig()
+    const socks5Count = egressList().filter((e) => e.type === "socks5").length
+    return {
+      enabled: c.enabled,
+      running: !!ladderServer,
+      port: c.port,
+      mode: c.mode,
+      fixed: c.fixed,
+      conns: ladderConns,
+      egressCount: socks5Count,
+    }
+  }
+
+  /** 梯子模式选出口：fixed → 固定出口；rotate → 按需从出口池轮换（每连接换一个，不依赖 zen 套餐开关）。
+   *  池无 socks5 出口 → null（本地直连兜底）。 */
+  function ladderNextEgress() {
+    const c = ladderConfig()
+    if (c.mode === "fixed" && c.fixed) return parseSocks5Url(c.fixed)
+    const L = egressList().filter((e) => e.type === "socks5")
+    if (!L.length) return null
+    _egressIdx = (_egressIdx + 1) % L.length
+    return L[_egressIdx]
+  }
+
+  /** @api POST /api/gateway/ladder {action:apply|stop} 应用梯子配置（启用→启动服务；停用→停止）。
+   *  go-rotate 写 gateway-config.ladder 后调它即时生效（无需重启网关）。 */
+  async function applyLadder() {
+    const c = ladderConfig()
+    if (c.enabled && !ladderServer) {
+      try {
+        ladderServer = net.createServer(handleLadderConn)
+        await new Promise((resolve, reject) => {
+          ladderServer.once("error", reject)
+          ladderServer.listen(c.port, "127.0.0.1", resolve)
+        })
+        ladderServer.on("error", (e) => log(`⚠️  梯子服务错误: ${e.message}`))
+        ladderServer.on("close", () => { ladderServer = null })
+        ladderConns = 0
+        log(`🚀  梯子 SOCKS5 已启动 127.0.0.1:${c.port} mode=${c.mode}${c.mode === "fixed" ? ` fixed=${c.fixed}` : ""}`)
+      } catch (e) {
+        if (ladderServer) { try { ladderServer.close() } catch {} ladderServer = null }
+        log(`⚠️  梯子启动失败: ${e.message}`)
+        throw new Error(`梯子启动失败: ${e.message}`)
+      }
+    } else if (!c.enabled && ladderServer) {
+      try { ladderServer.close() } catch {}
+      ladderServer = null
+      log(`⏹️  梯子 SOCKS5 已停止`)
+    }
+    return ladderStatus()
+  }
+
+  /** 停止梯子服务（卸载/进程退出等）。 */
+  function stopLadder() {
+    if (ladderServer) { try { ladderServer.close() } catch {} ladderServer = null }
+  }
+
+  /** 裸 SOCKS5 CONNECT 隧道：握手+认证（支持可选）+CONNECT 目标 → 成功 resolve({sock, rest})。
+   *  rest 是 CONNECT 回复后代理可能提前回发的首个数据片段（需 unshift 回 socket 别丢字节）。 */
+  function socks5TunnelConnect(egress, targetHost, targetPort, timeoutMs = 10000) {
+    return new Promise((resolve, reject) => {
+      const sock = net.connect(egress.port, egress.host)
+      let stage = 0
+      let authOk = false
+      const timer = setTimeout(() => fail(new Error(`socks5 tunnel timeout (${egress.host}:${egress.port})`)), timeoutMs)
+      const cleanup = () => clearTimeout(timer)
+      const fail = (err) => { cleanup(); sock.destroy(); reject(err) }
+      sock.on("error", (e) => fail(new Error(`socks5 connect error: ${e.message}`)))
+      sock.on("connect", () => {
+        const noAuth = !egress.user
+        const methods = noAuth ? [0x00] : [0x00, 0x02]
+        sock.write(Buffer.from([0x05, methods.length, ...methods]))
+      })
+      sock.on("data", (buf) => {
+        try {
+          if (stage === 0) {
+            if (buf.length < 2) return
+            const chosen = buf[1]
+            if (chosen === 0xff) return fail(new Error("socks5 auth not accepted"))
+            if (chosen === 0x02 && egress.user) {
+              const u = Buffer.from(egress.user, "utf8")
+              const p = Buffer.from(egress.pass || "", "utf8")
+              if (u.length > 255 || p.length > 255) return fail(new Error("socks5 user/pass too long"))
+              sock.write(Buffer.concat([Buffer.from([0x01, u.length]), u, Buffer.from([p.length]), p]))
+              stage = 0x10
+              return
+            }
+            if (chosen === 0x00) { sock.write(makeConnectReq(targetHost, targetPort)); stage = 1; return }
+            return fail(new Error(`socks5 unexpected auth method ${chosen}`))
+          }
+          if (stage === 0x10) {
+            if (buf.length < 2 || buf[1] !== 0x00) return fail(new Error("socks5 user-pass auth failed"))
+            sock.write(makeConnectReq(targetHost, targetPort))
+            stage = 1
+            return
+          }
+          if (stage === 1) {
+            if (buf.length < 2 || buf[1] !== 0x00) return fail(new Error(`socks5 CONNECT failed (reply code ${buf[1]})`))
+            const atyp = buf.length >= 4 ? buf[3] : null
+            let connLen = 4
+            if (atyp === 0x01) connLen += 4 + 2
+            else if (atyp === 0x04) connLen += 16 + 2
+            else if (atyp === 0x03) connLen += 1 + (buf.length > 4 ? buf[4] : 0) + 2
+            const rest = buf.length > connLen ? buf.subarray(connLen) : Buffer.alloc(0)
+            cleanup()
+            resolve({ sock, rest })
+          }
+        } catch (e) { fail(e) }
+      })
+    })
+  }
+
+  /** SOCKS5 回复错误码给梯子客户端：VER REP RSV ATYP(1) + 4B 0 + 2B 0（通用，供各阶段复用）。 */
+  function ladderFailReply(sock, code) {
+    try { sock.write(Buffer.from([0x05, code, 0x00, 0x01, 0, 0, 0, 0, 0, 0])) } catch {}
+    try { sock.end() } catch {}
+  }
+
+  /** 单条梯子连接：SOCKS5 server 端握手(no-auth) → 读 CONNECT 目标 → 经出口建立隧道 → 双向转发。 */
+  function handleLadderConn(client) {
+    ladderConns++
+    client.setNoDelay(true)
+    let buf = Buffer.alloc(0)
+    let handshakeDone = false
+    const onData = (data) => {
+      buf = Buffer.concat([buf, data])
+      if (!handshakeDone) {
+        // 握手：VER NMETHODS METHODS... → 回复 05 00（仅接受 no-auth）
+        if (buf.length < 2) return
+        const nm = buf[1]
+        if (buf.length < 2 + nm) return
+        buf = buf.subarray(2 + nm)
+        handshakeDone = true
+        client.write(Buffer.from([0x05, 0x00]))
+        if (buf.length < 1) return
+      }
+      // CONNECT 请求：VER CMD RSV ATYP ...（ATYP=0x01 IPv4 / 0x03 域名 / 0x04 IPv6）
+      for (;;) {
+        if (buf.length < 4) return
+        const ver = buf[0]
+        const cmd = buf[1]
+        const atyp = buf[3]
+        if (ver !== 0x05 || cmd !== 0x01) { ladderFailReply(client, 0x07); return }
+        let len = 0
+        if (atyp === 0x01) len = 4 + 4 + 2
+        else if (atyp === 0x03) len = 4 + 1 + buf[4] + 2
+        else if (atyp === 0x04) len = 4 + 16 + 2
+        else { ladderFailReply(client, 0x08); return }
+        if (buf.length < len) return
+        let host = ""
+        if (atyp === 0x01) host = `${buf[4]}.${buf[5]}.${buf[6]}.${buf[7]}`
+        else if (atyp === 0x03) host = buf.subarray(5, 5 + buf[4]).toString("utf8")
+        else {
+          const parts = []
+          for (let i = 4; i < 20; i += 2) parts.push((buf[i] << 8) + buf[i + 1])
+          host = parts.map((x) => x.toString(16)).join(":")
+        }
+        const port = (buf[len - 2] << 8) + buf[len - 1]
+        client.removeListener("data", onData)
+        void connectLadderUpstream(client, host, port)
+        return
+      }
+    }
+    client.on("data", onData)
+    client.on("error", () => { try { client.destroy() } catch {} ladderConns = Math.max(0, ladderConns - 1) })
+    client.on("close", () => { ladderConns = Math.max(0, ladderConns - 1) })
+  }
+
+  /** 经所选出口建立到目标的隧道并双向 pipe（mode=rotate → 每次新连接轮换当前 egress；换代失败自动顺延下一出口最多 3 次）。 */
+  async function connectLadderUpstream(client, host, port) {
+    const success = Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+    let lastErr = null
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const egress = ladderNextEgress()
+        if (!egress) {
+          // 无 socks5 出口（未配置/轮换关闭）→ 本地直连（避免死等；等价直连代理）
+          const up = net.connect(port, host)
+          up.on("error", () => ladderFailReply(client, 0x05))
+          up.on("connect", () => {
+            client.removeAllListeners()
+            client.write(success)
+            client.pipe(up)
+            up.pipe(client)
+          })
+          return
+        }
+        const { sock, rest } = await socks5TunnelConnect(egress, host, port)
+        client.removeAllListeners()
+        client.write(success)
+        if (rest.length) client.write(rest)
+        client.pipe(sock)
+        sock.pipe(client)
+        sock.on("error", () => { try { client.destroy() } catch {} })
+        client.on("error", () => { try { sock.destroy() } catch {} })
+        client.on("close", () => { try { sock.destroy() } catch {} })
+        sock.on("close", () => { try { client.destroy() } catch {} })
+        log(`🔀  梯子隧道: ${host}:${port} via ${egress.host}:${egress.port} (${ladderConfig().mode})`)
+        return
+      } catch (e) {
+        lastErr = e
+        // rotate 模式且池 >1 → 顺延下一个出口重试（免费代理时好时坏，自动跳过坏出口）；fixed/单出口不重测
+        const pool = egressList().filter((x) => x.type === "socks5")
+        if (ladderConfig().mode === "rotate" && pool.length > 1 && attempt < 2) {
+          log(`⚠️  梯子出口失败（${e.message}），顺延下一出口重试 #${attempt + 2}`)
+          continue
+        }
+        break
+      }
+    }
+    log(`⚠️  梯子隧道失败 ${host}:${port}: ${lastErr ? lastErr.message : "all egress failed"}`)
+    ladderFailReply(client, 0x05)
+  }
+
+  /* ---------------- 梯子科学上网筛选（/api/gateway/ladder/check） ----------------
+   * 对每个 socks5 出口（或指定 urls）：CONNECT google/youtube（被墙站点）能否建隧道 +
+   * 经出口 GET ip-api.com 拿真实出口 IP 归属地 → 判断该出口能否当科学上网代理。
+   * 纯探测不改配置不轮换。 */
+
+  /** 对单个出口做隧道连通探测（CONNECT 目标站点，成功后立即断开）。 */
+  function tunnelReachProbe(egress, host, port, timeoutMs = 8000) {
+    return new Promise((resolve) => {
+      const t0 = Date.now()
+      socks5TunnelConnect(egress, host, port, timeoutMs)
+        .then(({ sock }) => { try { sock.destroy() } catch {} resolve({ ok: true, ms: Date.now() - t0 }) })
+        .catch((err) => resolve({ ok: false, ms: Date.now() - t0, error: err.message }))
+    })
+  }
+
+  /** 经出口发一次明文 HTTP GET（ip-api.com 出口归属）。复用 socks5Request（secure=false）。 */
+  async function ladderGeoProbe(egress, timeoutMs = 8000) {
+    try {
+      const r = await socks5Request(egress, "ip-api.com", 80, {
+        method: "GET", path: "/json/?fields=status,country,city,org,query", headers: { host: "ip-api.com" },
+        body: "", timeoutMs, secure: false,
+      })
+      if (!r.ok) return { ok: false, error: `HTTP ${r.status}` }
+      const body = await r.text()
+      const j = JSON.parse(body)
+      if (j.status !== "success") return { ok: false, error: j.message || "ip-api 失败" }
+      return { ok: true, exitIp: j.query, country: j.country, city: j.city, org: j.org }
+    } catch (e) { return { ok: false, error: e.message } }
+  }
+
+  /** @api POST /api/gateway/ladder/check {urls?:string[]} 科学上网筛选出口池。并发 5。 */
+  async function ladderCheck(urls = null) {
+    let list
+    if (Array.isArray(urls) && urls.length) {
+      list = parseEgressList(urls)
+    } else {
+      list = egressList().filter((e) => e.type === "socks5")
+    }
+    if (!list.length) return { checkedAt: new Date().toISOString(), egress: [], error: "无 socks5 出口可测" }
+    const out = []
+    for (let base = 0; base < list.length; base += 5) {
+      const batch = list.slice(base, base + 5)
+      const res = await Promise.all(batch.map(async (e) => {
+        const start = Date.now()
+        const entry = { url: e.raw, ok: false }
+        const google = await tunnelReachProbe(e, "www.google.com", 443)
+        const youtube = await tunnelReachProbe(e, "www.youtube.com", 443)
+        entry.google = google.ok; entry.googleMs = google.ms
+        entry.youtube = youtube.ok; entry.youtubeMs = youtube.ms
+        if (google.ok && youtube.ok) {
+          const geo = await ladderGeoProbe(e)
+          if (geo.ok) { entry.exitIp = geo.exitIp; entry.country = geo.country; entry.city = geo.city; entry.org = geo.org }
+          else entry.error = geo.error
+          entry.ok = true
+        } else {
+          entry.error = google.error || youtube.error || "被墙站点不可达"
+        }
+        entry.ms = Date.now() - start
+        return entry
+      }))
+      out.push(...res)
+    }
+    return { checkedAt: new Date().toISOString(), egress: out }
+  }
 
  const DEFAULT_MODEL = ACTIVE_PLAN.defaultModel
 
@@ -2266,6 +2585,32 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 500, { error: e.message })
     }
   }
+  if (method === "GET" && route === "/api/gateway/ladder") {
+    // 梯子状态（enabled/running/port/mode/fixed/conns/egressCount）
+    return sendJson(res, 200, ladderStatus())
+  }
+  if (method === "POST" && route === "/api/gateway/ladder") {
+    // 梯子管理：{action:"apply"} 应用配置（启用→启动/停用→停止）；{action:"stop"} 强制停止
+    const action = String(url.searchParams.get("action") || "apply")
+    try {
+      if (action === "stop") { stopLadder(); return sendJson(res, 200, ladderStatus()) }
+      return sendJson(res, 200, await applyLadder())
+    } catch (e) { return sendJson(res, 500, { error: e.message }) }
+  }
+  if (method === "POST" && route === "/api/gateway/ladder/check") {
+    // 梯子科学上网筛选：探测每出口能否 CONNECT 被墙站点 + 真实出口 IP 归属
+    try {
+      let urls = null
+      const chunks = []
+      for await (const c of req) chunks.push(c)
+      const body = Buffer.concat(chunks).toString("utf8")
+      if (body) { try { urls = JSON.parse(body).urls ?? null } catch {} }
+      return sendJson(res, 200, await ladderCheck(urls))
+    } catch (e) {
+      log(`⚠️  梯子科学上网筛选失败: ${e.message}`)
+      return sendJson(res, 500, { error: e.message })
+    }
+  }
   if (method === "POST" && route === "/v1/chat/completions") {
     log(`➡️  POST /v1/chat/completions`)
     return handleChatCompletions(req, res)
@@ -2379,6 +2724,10 @@ if (!process.env.ZEN_TEST) {
     seedUsageCount()
     log(`📊  用量趋势文件: ${USAGE_FILE}`)
     startActiveProbe()
+    // 梯子模块：配置 enabled=true 时自动拉起本地 SOCKS5 服务（失败不阻塞 HTTP 网关）
+    if (ladderConfig().enabled) {
+      applyLadder().catch((e) => log(`⚠️  启动梯子失败（网关不受影响）: ${e.message}`))
+    }
   })
 }
 
@@ -2623,4 +2972,11 @@ export {
   egressHealthCheck,
   egressEnabled,
   egressList,
+  ladderConfig,
+  ladderStatus,
+  ladderNextEgress,
+  normalizeLadderConfig,
+  socks5TunnelConnect,
+  ladderCheck,
+  tunnelReachProbe,
 }

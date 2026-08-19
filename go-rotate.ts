@@ -876,6 +876,80 @@ async function gatewayEgressHealthProxy(expectUrl?: string): Promise<any> {
    }
  }
 
+/* ---------------- 梯子（本地 SOCKS5 透明代理）Web 集成 ----------------
+ * 梯子 = 网关在 127.0.0.1:<port> 起的本地 SOCKS5 服务，其它应用（浏览器/curl/git）指向它即可
+ * 科学上网；每个 CONNECT 隧道经出口池轮换（rotate）或固定出口（fixed）转发到目标。
+ * 配置写 gateway-config.json 的 ladder 字段（writeGatewayConfig 负责校验 + 锁），
+ * 写后调网关 apply 即时启动/停止（无需重启网关）。 */
+
+async function gatewayLadderFetch(url: string, init?: any): Promise<any> {
+  const r = await fetch(GATEWAY_BASE + url, init)
+  const j: any = await r.json().catch(() => null)
+  if (!r.ok) return { ok: false, running: false, error: j?.error?.message ?? `网关 HTTP ${r.status}` }
+  return { ok: true, ...(j ?? {}) }
+}
+
+/** 梯子状态（读 config 字段 + 网关运行态合并；网关不可达时给配置侧信息 + running:false）。 */
+async function gatewayLadderStatus(): Promise<any> {
+  const cfg = readGatewayConfig().ladder ?? { enabled: false, port: 10880, mode: "rotate", fixed: null }
+  try {
+    const g = await gatewayLadderFetch("/api/gateway/ladder", {
+      headers: gatewayAuthHeaders(),
+      signal: AbortSignal.timeout(2000),
+    })
+    return { ok: g.ok !== false, enabled: cfg.enabled, port: cfg.port, mode: cfg.mode, fixed: cfg.fixed, running: g.running === true, egressCount: g.egressCount ?? (readGatewayConfig().egress ?? []).length, conns: g.conns ?? 0, error: g.error }
+  } catch (e: any) {
+    return { ok: false, enabled: cfg.enabled, port: cfg.port, mode: cfg.mode, fixed: cfg.fixed, running: false, egressCount: (readGatewayConfig().egress ?? []).length, error: String(e?.message ?? e) }
+  }
+}
+
+/** 通知网关根据当前配置应用梯子（启用→启动；停用→停止）。 */
+async function gatewayLadderApply(): Promise<any> {
+  try {
+    const g = await gatewayLadderFetch("/api/gateway/ladder?action=apply", {
+      method: "POST",
+      headers: { ...gatewayAuthHeaders(), "content-type": "application/json" },
+      body: "{}",
+      signal: AbortSignal.timeout(4000),
+    })
+    return g.ok === false ? { ok: false, error: g.error } : { ok: true, running: g.running === true, port: g.port ?? 10880, mode: g.mode, enabled: g.enabled }
+  } catch (e: any) {
+    return { ok: false, error: String(e?.message ?? e) }
+  }
+}
+
+/** 强制停止梯子服务。 */
+async function gatewayLadderControl(action: "stop"): Promise<any> {
+  try {
+    const g = await gatewayLadderFetch("/api/gateway/ladder?action=" + action, {
+      method: "POST",
+      headers: { ...gatewayAuthHeaders(), "content-type": "application/json" },
+      body: "{}",
+      signal: AbortSignal.timeout(4000),
+    })
+    return g.ok === false ? { ok: false, error: g.error } : { ok: true, running: g.running === true }
+  } catch (e: any) {
+    return { ok: false, error: String(e?.message ?? e) }
+  }
+}
+
+/** 梯子科学上网筛选（代理到网关：探测每出口能否 CONNECT 被墙站点 + 出口 IP 归属）。 */
+async function gatewayLadderCheck(urls?: string[]): Promise<any> {
+  try {
+    const r = await fetch(GATEWAY_BASE + "/api/gateway/ladder/check", {
+      method: "POST",
+      headers: { ...gatewayAuthHeaders(), "content-type": "application/json" },
+      body: JSON.stringify({ urls: urls ?? null }),
+      signal: AbortSignal.timeout(60000), // 每出口最多 google+youtube+ip-api 三个探测，并发 5 → 池大时给足 60s
+    })
+    const j: any = await r.json().catch(() => null)
+    if (!r.ok || !j) return { ok: false, error: j?.error ?? `网关 HTTP ${r.status}` }
+    return { ok: true, ...j }
+  } catch (e: any) {
+    return { ok: false, error: String(e?.message ?? e) }
+  }
+}
+
 /* ---------------- 免费代理批量淘源 + 连通性验证（Web「IP 池」卡集成，零依赖） ----------------
  * 与根目录 fetch_proxies.py 同思路：拉 4 个免费 SOCKS5 列表源 → 去重 → 逐个做完整
  * SOCKS5 握手 + CONNECT 隧道到 opencode.ai:443，返回 {url, ok, ms, err} 供前端展示状态。 */
@@ -1056,11 +1130,18 @@ type GatewayConfig = {
   tokens: string[]
   egress: string[]
   limited: string[] // 已被上游限流（429）的出口，从主池移出单独管理（不参与轮换）
+  dead: string[] // 已确认不可用的出口（探测失败/超时），从主池/限流池移出单独管理（不参与轮换）
   ip_rotation: boolean // IP 轮换总开关（默认 true；false = 即使有出口池也直接走本地直连）
+  ladder: {
+    enabled: boolean
+    port: number
+    mode: "rotate" | "fixed"
+    fixed: string | null
+  } | null // 梯子（本地 SOCKS5 透明代理）：供其它应用科学上网使用；rotate=轮换出口池 / fixed=固定出口
 }
 
 function defaultGatewayConfig(): GatewayConfig {
-  return { plan: "go", token: null, token_set_at: null, tokens: [], egress: [], limited: [], ip_rotation: true }
+  return { plan: "go", token: null, token_set_at: null, tokens: [], egress: [], limited: [], dead: [], ip_rotation: true, ladder: null }
 }
 
 function readGatewayConfig(): GatewayConfig {
@@ -1083,6 +1164,18 @@ function readGatewayConfig(): GatewayConfig {
       limited: Array.isArray(raw.limited)
         ? raw.limited.filter((e: unknown): e is string => typeof e === "string" && e.length > 0)
         : [],
+      dead: Array.isArray(raw.dead)
+        ? raw.dead.filter((e: unknown): e is string => typeof e === "string" && e.length > 0)
+        : [],
+      ladder:
+        raw.ladder && typeof raw.ladder === "object"
+          ? {
+              enabled: raw.ladder.enabled === true,
+              port: Number.isInteger(raw.ladder.port) && (raw.ladder.port as number) > 0 ? (raw.ladder.port as number) : 10880,
+              mode: raw.ladder.mode === "fixed" ? "fixed" : "rotate",
+              fixed: typeof raw.ladder.fixed === "string" && raw.ladder.fixed ? raw.ladder.fixed : null,
+            }
+          : null,
       ip_rotation: raw.ip_rotation !== false, // 缺省开启；显式 false 关闭
     }
   } catch (e) {
@@ -1100,6 +1193,13 @@ function writeGatewayConfig(patch: {
   tokens?: string[] | null
   egress?: string[] | null
   limited?: string[] | null
+  dead?: string[] | null
+  ladder?: {
+    enabled?: boolean
+    port?: number
+    mode?: "rotate" | "fixed"
+    fixed?: string | null
+  } | null
   ip_rotation?: boolean
 }): GatewayConfig {
   return withLockSync<GatewayConfig>(() => {
@@ -1131,6 +1231,30 @@ function writeGatewayConfig(patch: {
           : patch.egress.filter((e) => typeof e === "string" && e.length > 0)
       if (cfg.egress.some((e) => e !== "direct" && !e.startsWith("socks5://")))
         throw new Error(`egress 只支持 "direct" 或 "socks5://host:port"（收到: ${cfg.egress.join(", ")}）`)
+    }
+    if (patch.dead !== undefined) {
+      if (patch.dead !== null && !Array.isArray(patch.dead))
+        throw new Error("dead 必须是字符串数组或 null（清空）")
+      cfg.dead =
+        patch.dead === null
+          ? []
+          : patch.dead.filter((e) => typeof e === "string" && e.length > 0)
+      if (cfg.dead.some((e) => e !== "direct" && !e.startsWith("socks5://")))
+        throw new Error(`dead 只支持 "direct" 或 "socks5://host:port"（收到: ${cfg.dead.join(", ")}）`)
+    }
+    if (patch.ladder !== undefined) {
+      if (patch.ladder === null) {
+        cfg.ladder = null
+      } else if (typeof patch.ladder === "object") {
+        const l = patch.ladder
+        const port = Number.isInteger(l.port) && (l.port as number) > 0 ? (l.port as number) : 10880
+        if (!(port >= 1 && port <= 65535)) throw new Error(`ladder.port 非法: ${l.port}`)
+        const mode = l.mode === "fixed" ? "fixed" : "rotate"
+        const fixed = typeof l.fixed === "string" && l.fixed ? l.fixed : null
+        if (mode === "fixed" && !fixed) throw new Error("ladder.mode=fixed 时必须指定 ladder.fixed 出口")
+        if (fixed && validateEgressItem(fixed) === null) throw new Error(`ladder.fixed 出口格式非法: ${fixed}`)
+        cfg.ladder = { enabled: l.enabled === true, port, mode, fixed }
+      }
     }
     if (patch.tokens !== undefined) {
       if (patch.tokens !== null && !Array.isArray(patch.tokens))
@@ -1180,6 +1304,8 @@ function gatewayConfigPayload() {
     tokenSetAt: cfg.token_set_at,
     egress: cfg.egress,
     limited: cfg.limited,
+    dead: cfg.dead,
+    ladder: cfg.ladder,
     ipRotation: cfg.ip_rotation,               // 总开关（false = 关闭，走本地直连）
     egressEnabled: cfg.ip_rotation && cfg.egress.length >= 2, // 实际轮换启用（开关开 && ≥2 出口）
     needsRestart: false, // GET 只读；needsRestart:true 仅由 POST 写操作返回
@@ -1343,6 +1469,43 @@ async function handleWeb(req: any): Promise<Response> {
       if (typeof b?.url === "string" && b.url) wantUrl = b.url
     } catch {}
     return json(await gatewayEgressHealthProxy(wantUrl))
+  }
+  // 梯子（本地 SOCKS5 透明代理）状态/管理/科学上网筛选
+  if (method === "GET" && route === "/api/gateway/ladder") {
+    return json(await gatewayLadderStatus())
+  }
+  if (method === "POST" && route === "/api/gateway/ladder") {
+    // {action:"set", ladder:{...}} 写配置 → 通知网关 apply（启动/停止即时生效）；
+    // {action:"apply"} 仅通知网关；{action:"stop"} 强制停止
+try {
+    const b: any = await req.json().catch(() => ({}))
+    const action = String(b?.action || "apply")
+    if (action === "set") {
+      writeGatewayConfig({ ladder: b?.ladder ?? null }) // 校验失败 throw → 下方 400
+      // 配置已落盘（主操作成功）；apply 失败不阻断 —— 前端可提示「已保存，网关未收到启停信号」
+      const ap = await gatewayLadderApply()
+      return json({ ok: true, written: true, running: ap.running === true, applyError: ap.error || null })
+    }
+    if (action === "stop") {
+      return json(await gatewayLadderControl("stop"))
+    }
+    const ap = await gatewayLadderApply()
+    return json({ ok: true, running: ap.running === true, applyError: ap.error || null })
+  } catch (e: any) {
+    // 写配置校验失败 → 400；其余（apply 网络异常）→ 200 + ok:false
+    if (/^(ladder\.|ladder 必须| ladder)/.test(e?.message ?? ""))
+      return json({ ok: false, error: String(e?.message ?? e) }, 400)
+    return json({ ok: false, error: String(e?.message ?? e) })
+  }
+  }
+  if (method === "POST" && route === "/api/gateway/ladder/check") {
+    // 梯子科学上网筛选：{urls?: string[]} 探测每出口能否 CONNECT 被墙站点 + 出口 IP 归属
+    try {
+      const b: any = await req.json().catch(() => ({}))
+      return json(await gatewayLadderCheck(Array.isArray(b?.urls) ? b.urls : undefined))
+    } catch (e: any) {
+      return json({ ok: false, error: String(e?.message ?? e) })
+    }
   }
   // 免费代理批量淘源：拉 4 源 → 连通性验证 → 带状态候选列表（供选择加入 egress）
   if (method === "POST" && route === "/api/gateway/proxies/fetch") {
@@ -1547,7 +1710,57 @@ if (action === "clear") {
               writeGatewayConfig({ limited: valid as string[] })
               return { ok: true, limited: valid as string[], needsRestart: true }
             }
-            throw new Error(`未知 action: ${action || "(空)"}（支持 add/del/clear/set/toggle/bulk-add/move-to-limited/restore/set-limited）`)
+            if (action === "move-to-dead") {
+              // 健康检查确认不可用（探测失败/超时）→ 从主池/限流池移到「不可用池」（不参与轮换）
+              const raw = Array.isArray(body.urls) ? body.urls.map((x: unknown) => String(x)) : []
+              if (raw.length === 0) throw new Error("urls 不能为空")
+              const cfg = readGatewayConfig()
+              const moved: string[] = []
+              const egressSet = new Set(cfg.egress)
+              const limitedSet = new Set(cfg.limited)
+              const deadSet = new Set(cfg.dead)
+              for (const u of raw) {
+                const e = validateEgressItem(u)
+                if (!e) continue
+                if (egressSet.has(e)) egressSet.delete(e)
+                if (limitedSet.has(e)) limitedSet.delete(e)
+                if (!deadSet.has(e)) deadSet.add(e)
+                if (!moved.includes(e)) moved.push(e)
+              }
+              writeGatewayConfig({
+                egress: [...egressSet],
+                limited: [...limitedSet],
+                dead: [...deadSet],
+              })
+              return { ok: true, moved, egress: list(), limited: [...limitedSet], dead: [...deadSet], needsRestart: true }
+            }
+            if (action === "restore-dead") {
+              // 不可用池出口重新探测发现可用 → 移回主池
+              const raw = Array.isArray(body.urls) ? body.urls.map((x: unknown) => String(x)) : []
+              if (raw.length === 0) throw new Error("urls 不能为空")
+              const cfg = readGatewayConfig()
+              const restored: string[] = []
+              const egressSet = new Set(cfg.egress)
+              const deadSet = new Set(cfg.dead)
+              for (const u of raw) {
+                const e = validateEgressItem(u)
+                if (!e) continue
+                if (deadSet.has(e)) deadSet.delete(e)
+                if (!egressSet.has(e)) egressSet.add(e)
+                if (!restored.includes(e)) restored.push(e)
+              }
+              writeGatewayConfig({ egress: [...egressSet], dead: [...deadSet] })
+              return { ok: true, restored, egress: list(), dead: [...deadSet], needsRestart: true }
+            }
+            if (action === "set-dead") {
+              // 直接重设不可用池（删除单项/清空）
+              const arr = Array.isArray(body.list) ? body.list.map((x: unknown) => String(x)) : []
+              const valid = arr.map((x) => validateEgressItem(x))
+              if (valid.some((v) => v === null)) throw new Error("list 格式非法（只支持 direct / socks5://host:port）")
+              writeGatewayConfig({ dead: valid as string[] })
+              return { ok: true, dead: valid as string[], needsRestart: true }
+            }
+            throw new Error(`未知 action: ${action || "(空)"}（支持 add/del/clear/set/toggle/bulk-add/move-to-limited/restore/set-limited/move-to-dead/restore-dead/set-dead）`)
           }
          return null
       }
@@ -2256,6 +2469,7 @@ try {
       <button class="primary" onclick="addEgress()">＋ 添加出口</button>
       <button id="egress-check-btn" onclick="checkEgressHealth()">检查出口</button>
       <button id="egress-checkall-btn" class="primary" onclick="checkAllHealth()">检查所有 IP 健康度</button>
+      <button id="egress-movedead-btn" onclick="moveAllDeadFromEgress()">→ 转移不可用</button>
       <button class="danger" onclick="clearEgress()">清空全部</button>
     </div>
     <div id="egress-list" class="muted" style="margin-top:10px">加载中…</div>
@@ -2267,6 +2481,7 @@ try {
     <b>限流池（被上游限流的出口） <span id="limited-badge"></span></b>
     <div class="row" style="margin-top:10px">
       <button id="limited-check-btn" onclick="checkLimitedHealth()">健康检查</button>
+      <button id="limited-movedead-btn" onclick="moveAllDeadFromLimited()">→ 转移不可用</button>
       <button id="limited-restore-btn" onclick="restoreSelectedLimited()">移回 IP 池</button>
       <span class="muted" style="margin-left:8px;flex:1">429 被限流的出口移到这里单独管理，不参与轮换；重新探测解限后可移回主池。</span>
     </div>
@@ -2275,6 +2490,26 @@ try {
     <div class="muted" style="margin-top:6px">「健康检查」对每个限流出口做真实最小探测——状态变为可用即解除限流，勾选后「移回 IP 池」。</div>
     <div id="limited-msg" class="msg" style="margin-top:6px"></div>
   </div>
+
+  <details class="card" id="gw-dead-card" style="margin-top:12px">
+    <summary style="cursor:pointer;user-select:none">
+      <b>不可用池（探测失败的出口） <span id="dead-badge"></span></b>
+      <span class="muted" style="margin-left:8px">▼ 展开 / 收起（正常情况收缩，有不可用出口时展开处理）</span>
+    </summary>
+    <div class="row" style="margin-top:10px">
+      <button id="dead-check-btn" onclick="checkDeadHealth()">健康检查</button>
+      <button id="dead-restore-btn" onclick="restoreSelectedDead()">移回 IP 池</button>
+      <span class="muted" style="margin-left:8px;flex:1">不可用（探测失败/超时）的出口移到这里单独管理，不参与轮换；重新探测恢复后可移回主池。</span>
+    </div>
+    <div id="dead-toolbar" class="proxy-toolbar" style="display:none">
+      <button class="small" onclick="deadSelAllToggle()">全选</button>
+      <button class="small" onclick="clearDeadSel()">清空</button>
+      <span class="muted" style="margin-left:8px">已选 <span id="dead-selcount">0</span></span>
+    </div>
+    <div id="dead-list" class="proxy-grid muted" style="margin-top:10px">无不可用出口。</div>
+    <div class="muted" style="margin-top:6px">「健康检查」对每个不可用出口做真实最小探测——状态变为可用即勾选「移回 IP 池」。</div>
+    <div id="dead-msg" class="msg" style="margin-top:6px"></div>
+  </details>
 
   <div class="card" id="gw-proxy-card">
     <b>免费代理（批量淘源） <span id="proxy-badge"></span></b>
@@ -2320,6 +2555,44 @@ try {
       <div class="muted" style="margin-top:6px">坑：只要 <code>ANTHROPIC_AUTH_TOKEN</code> 存在，claude code 就忽略 <code>ANTHROPIC_BASE_URL</code> 直连上游——切网关前必须移除。</div>
       <div style="margin-top:6px" class="actions"><button onclick="copyUsage('claude')">复制</button></div>
     </details>
+  </div>
+
+  <div class="card" id="gw-ladder-card">
+    <b>梯子（本地 SOCKS5 透明代理） <span id="ladder-badge"></span></b>
+    <div class="row" style="margin-top:10px">
+      <span class="muted" style="align-items:center;display:flex;flex:1;gap:8px">状态：
+        <span id="ladder-state">-</span>
+      </span>
+      <button id="ladder-toggle-btn" class="primary" onclick="ladderToggle()">启用</button>
+      <button id="ladder-check-surf-btn" onclick="ladderSurfCheck()">科学上网筛选</button>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <label class="muted" style="align-items:center;display:flex;gap:6px">本地端口 <input id="ladder-port" type="number" value="10880" min="1" max="65535" style="width:90px" /></label>
+      <label class="muted" style="align-items:center;display:flex;gap:6px">模式
+        <select id="ladder-mode" onchange="renderLadderState()">
+          <option value="rotate">轮换（出口池自动换 IP）</option>
+          <option value="fixed">指定固定出口</option>
+        </select>
+      </label>
+    </div>
+    <div id="ladder-fixed-row" class="row" style="margin-top:8px;display:none">
+      <label class="muted" style="align-items:center;display:flex;flex:1;gap:6px">固定出口
+        <select id="ladder-fixed" style="flex:1;min-width:0"></select>
+      </label>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button class="primary" onclick="ladderSave()">保存并应用</button>
+      <span class="muted" style="margin-left:8px;flex:1">保存后网关即时启动/停止本地 SOCKS5（无需重启网关）。</span>
+    </div>
+    <div class="muted" style="margin-top:6px">
+      提供 <code>socks5://127.0.0.1:<span id="ladder-port-hint">10880</span></code> 本地 SOCKS5 端口，任何应用（浏览器/curl/git/系统代理）指向它即可科学上网——每个连接经出口池智能换 IP（轮换模式）或固定出口转发。
+    </div>
+    <details style="margin-top:10px">
+      <summary>梯子使用说明</summary>
+      <pre style="margin-top:8px" id="ladder-usage-text"></pre>
+    </details>
+    <div id="ladder-surf-result" class="muted" style="margin-top:8px"></div>
+    <div id="ladder-msg" class="msg" style="margin-top:6px"></div>
   </div>
 
   <div class="card">
@@ -2933,6 +3206,9 @@ var ipRotationOn = true // IP 轮换总开关（false = 走本地直连）
 var currentEgressList = [] // 当前渲染的 egress 列表（供 moveToLimited 按下标操作）
 var limitedHealth = {} // 限流池健康检查结果缓存：{ [url]: {ok,status,ms,error} }
 var limitedSel = {} // 限流池勾选状态：{ index: true }
+var deadHealth = {} // 不可用池健康检查结果缓存：{ [url]: {ok,status,ms,error} }
+var deadSel = {} // 不可用池勾选状态：{ index: true }
+var deadList = [] // 当前渲染的 dead 列表
 function renderEgressList(egress, enabled, ipRotation) {
   const el = document.getElementById("egress-list")
   const badge = document.getElementById("egress-badge")
@@ -2960,17 +3236,21 @@ function renderEgressList(egress, enabled, ipRotation) {
     let h = ""
     const st = egressHealth[e]
     let limitedBtn = ""
+    let deadBtn = ""
     if (st) {
       if (st.ok) h = '<span class="badge b-available" title="' + esc(st.ms + "ms") + '">健康 ' + st.status + '</span>'
       else if (st.status === 429) {
         h = '<span class="badge b-warn" title="' + esc(st.error || "") + '">IP 被限流 429</span>'
         limitedBtn = '<button class="small" onclick="moveToLimited(' + i + ')">→ 限流池</button>'
       }
-      else h = '<span class="badge b-invalid" title="' + esc(st.error || "") + '">不可用</button></span>'
+      else {
+        h = '<span class="badge b-invalid" title="' + esc(st.error || "") + '">不可用</span>'
+        deadBtn = '<button class="small" onclick="moveToDead(' + i + ')">→ 不可用池</button>'
+      }
     }
     return '<div style="display:flex;align-items:center;gap:8px;padding:3px 0;border-bottom:1px solid var(--bd-2)">' +
       '<code style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(e) + '</code>' +
-      h + limitedBtn +
+      h + limitedBtn + deadBtn +
       (i === 0 ? '<span class="badge b-go">当前</span>' : "") +
       '<button class="small" onclick="delEgress(' + i + ')">删除</button></div>'
   }).join("")
@@ -3017,6 +3297,7 @@ function renderLimitedList(limited) {
         ' onchange="limitedSel[' + i + ']=this.checked;updateLimitedSelCount()">' +
       '<code title="' + esc(e) + '">' + esc(e.indexOf("//") >= 0 ? e.slice(e.indexOf("//") + 2) : e) + '</code>' +
       h +
+      (st && !st.ok && st.status !== 429 ? '<button class="small" onclick="moveToDeadFromLimited(' + i + ')">→ 不可用池</button>' : "") +
       '<button class="small" onclick="delLimited(' + i + ')">删除</button>' +
       '</label>'
   }).join("")
@@ -3078,12 +3359,13 @@ async function checkLimitedHealth() {
   finally { if (btn) { btn.textContent = "健康检查"; btn.disabled = false } }
 }
 async function checkAllHealth() {
-  // IP 池「检查所有 IP 健康度」：主池 egress + 限流池 limited 全部出口一次性健康检查
+  // IP 池「检查所有 IP 健康度」：主池 egress + 限流池 limited + 不可用池 dead 全部出口一次性健康检查
   const btn = document.getElementById("egress-checkall-btn")
   if (btn) { btn.textContent = "检查中…"; btn.disabled = true }
   try {
     await checkEgressHealth()
     await checkLimitedHealth()
+    await checkDeadHealth()
   } catch (e) {
     const msg = document.getElementById("egress-msg")
     if (msg) { msg.className = "msg err"; msg.textContent = "检查失败：" + e.message }
@@ -3107,6 +3389,174 @@ async function restoreSelectedLimited() {
     msg.className = "msg"
     msg.textContent = "已移回 IP 池：" + (r.restored || []).join(", ") + "（重启网关后生效）"
   } catch (e) { msg.className = "msg err"; msg.textContent = "移回失败：" + e.message }
+}
+/* ================= 不可用池（探测失败的出口） ================= */
+function renderDeadList(dead) {
+  const el = document.getElementById("dead-list")
+  const badge = document.getElementById("dead-badge")
+  dead = Array.isArray(dead) ? dead : []
+  deadList = dead
+  badge.innerHTML = dead.length
+    ? '<span class="badge b-invalid">' + dead.length + " 个不可用</span>"
+    : '<span class="badge b-stopped">0 个</span>'
+  const toolbar = document.getElementById("dead-toolbar")
+  if (toolbar) toolbar.style.display = dead.length ? "flex" : "none"
+  if (!dead.length) { el.textContent = "无不可用出口。"; return }
+  el.innerHTML = dead.map((e, i) => {
+    const st = deadHealth[e]
+    const isSel = !!deadSel[i]
+    let h = ""
+    if (st) {
+      if (st.ok) h = '<span class="badge b-available" title="' + esc((st.ms || 0) + "ms") + '">已恢复 ' + st.status + '</span>'
+      else if (st.status === 429) h = '<span class="badge b-warn">限流 429</span>'
+      else h = '<span class="badge b-invalid">仍不可用</span>'
+    } else {
+      h = '<span class="badge b-stopped">未探测</span>'
+    }
+    return '<label class="proxy-item">' +
+      '<input type="checkbox" ' + (isSel ? "checked" : "") +
+        ' onchange="deadSel[' + i + ']=this.checked;updateDeadSelCount()">' +
+      '<code title="' + esc(e) + '">' + esc(e.indexOf("//") >= 0 ? e.slice(e.indexOf("//") + 2) : e) + '</code>' +
+      h +
+      '<button class="small" onclick="delDead(' + i + ')">删除</button>' +
+      '</label>'
+  }).join("")
+  updateDeadSelCount()
+}
+function updateDeadSelCount() {
+  const c = document.getElementById("dead-selcount")
+  if (c) c.textContent = Object.keys(deadSel).filter((k) => deadSel[k]).length
+}
+function deadSelAllToggle() {
+  const allOn = Object.keys(deadSel).some((k) => deadSel[k])
+  deadList.forEach((_, i) => { deadSel[i] = !allOn })
+  renderDeadList(deadList)
+}
+function clearDeadSel() {
+  deadSel = {}
+  renderDeadList(deadList)
+}
+async function moveToDead(i) {
+  // 主池单项 → 不可用池
+  const url = currentEgressList[i]
+  if (!url) return
+  const msg = document.getElementById("egress-msg")
+  try {
+    const r = await api("/api/gateway/egress", { action: "move-to-dead", urls: [url] })
+    renderDeadList(r.dead || [])
+    const c = await api("/api/gateway/config")
+    renderEgressList(c.egress || [], !!c.egressEnabled, !!c.ipRotation)
+    msg.className = "msg"
+    msg.textContent = "已移入不可用池：" + url + "（重启网关后生效，不再参与轮换）"
+  } catch (e) { msg.className = "msg err"; msg.textContent = "移入失败：" + e.message }
+}
+async function moveToDeadFromLimited(i) {
+  // 限流池单项（探测不可用非 429）→ 不可用池
+  const cfg = await api("/api/gateway/config")
+  const limited = cfg.limited || []
+  const url = limited[i]
+  if (!url) return
+  const msg = document.getElementById("limited-msg")
+  try {
+    const r = await api("/api/gateway/egress", { action: "move-to-dead", urls: [url] })
+    renderDeadList(r.dead || [])
+    renderLimitedList(r.limited || [])
+    const c = await api("/api/gateway/config")
+    renderEgressList(c.egress || [], !!c.egressEnabled, !!c.ipRotation)
+    msg.className = "msg"
+    msg.textContent = "已移入不可用池：" + url
+  } catch (e) { msg.className = "msg err"; msg.textContent = "移入失败：" + e.message }
+}
+async function moveAllDeadFromEgress() {
+  // IP 池「一键转移不可用」：把健康检查结果为不可用（非 429）的出口全部移入不可用池
+  const msg = document.getElementById("egress-msg")
+  const urls = currentEgressList.filter((u) => {
+    const st = egressHealth[u]
+    return st && !st.ok && st.status !== 429
+  })
+  if (!urls.length) { msg.className = "msg err"; msg.textContent = "没有探测为「不可用」的出口（先点「检查出口」，非 429 失败项才会被转移）"; return }
+  try {
+    const r = await api("/api/gateway/egress", { action: "move-to-dead", urls })
+    renderDeadList(r.dead || [])
+    const c = await api("/api/gateway/config")
+    renderEgressList(c.egress || [], !!c.egressEnabled, !!c.ipRotation)
+    msg.className = "msg"
+    msg.textContent = "已转移 " + (r.moved || []).length + " 个不可用出口到不可用池：" + (r.moved || []).join(", ")
+  } catch (e) { msg.className = "msg err"; msg.textContent = "转移失败：" + e.message }
+}
+async function moveAllDeadFromLimited() {
+  // 限流池「一键转移不可用」：把探测为不可用（非 429）的出口全部移入不可用池
+  const msg = document.getElementById("limited-msg")
+  const cfg = await api("/api/gateway/config")
+  const limited = cfg.limited || []
+  const urls = limited.filter((u) => {
+    const st = limitedHealth[u]
+    return st && !st.ok && st.status !== 429
+  })
+  if (!urls.length) { msg.className = "msg err"; msg.textContent = "没有探测为「不可用」的出口（先点「健康检查」，非 429 失败项才会被转移）"; return }
+  try {
+    const r = await api("/api/gateway/egress", { action: "move-to-dead", urls })
+    renderDeadList(r.dead || [])
+    renderLimitedList(r.limited || [])
+    const c = await api("/api/gateway/config")
+    renderEgressList(c.egress || [], !!c.egressEnabled, !!c.ipRotation)
+    msg.className = "msg"
+    msg.textContent = "已转移 " + (r.moved || []).length + " 个不可用出口到不可用池"
+  } catch (e) { msg.className = "msg err"; msg.textContent = "转移失败：" + e.message }
+}
+async function checkDeadHealth() {
+  const msg = document.getElementById("dead-msg")
+  const btn = document.getElementById("dead-check-btn")
+  if (btn) { btn.textContent = "检查中…"; btn.disabled = true }
+  try {
+    const cfg = await api("/api/gateway/config")
+    const dead = cfg.dead || []
+    if (!dead.length) { msg.className = "msg"; msg.textContent = "不可用池为空"; return }
+    deadHealth = {}
+    let done = 0
+    for (const url of dead) {
+      const r = await api("/api/gateway/egress/health", { url })
+      const got = (r.egress || [])[0]
+      if (got) deadHealth[url] = { ok: got.ok, status: got.status, ms: got.ms, error: got.error }
+      done++
+    }
+    renderDeadList(dead)
+    const restored = Object.keys(deadHealth).filter((u) => deadHealth[u] && deadHealth[u].ok).length
+    msg.className = "msg"
+    msg.textContent = "检查完成：" + done + " 项，" + (dead.length - restored) + " 个仍不可用，" + restored + " 个已恢复（勾选可移回 IP 池）"
+  } catch (e) { msg.className = "msg err"; msg.textContent = "检查失败：" + e.message }
+  finally { if (btn) { btn.textContent = "健康检查"; btn.disabled = false } }
+}
+async function restoreSelectedDead() {
+  const cfg = await api("/api/gateway/config")
+  const dead = cfg.dead || []
+  const urls = dead.filter((_, i) => deadSel[i])
+  const msg = document.getElementById("dead-msg")
+  if (!urls.length) { msg.className = "msg err"; msg.textContent = "未勾选任何出口（先健康检查，勾选已恢复的）"; return }
+  try {
+    const r = await api("/api/gateway/egress", { action: "restore-dead", urls })
+    deadSel = {}
+    deadHealth = {}
+    renderDeadList(r.dead || [])
+    const c = await api("/api/gateway/config")
+    renderEgressList(c.egress || [], !!c.egressEnabled, !!c.ipRotation)
+    msg.className = "msg"
+    msg.textContent = "已移回 IP 池：" + (r.restored || []).join(", ") + "（重启网关后生效）"
+  } catch (e) { msg.className = "msg err"; msg.textContent = "移回失败：" + e.message }
+}
+async function delDead(i) {
+  const cfg = await api("/api/gateway/config")
+  const dead = cfg.dead || []
+  const target = dead[i]
+  if (!target) return
+  const msg = document.getElementById("dead-msg")
+  try {
+    const after = dead.filter((_, ix) => ix !== i)
+    await api("/api/gateway/egress", { action: "set-dead", list: after })
+    if (deadHealth[target]) delete deadHealth[target]
+    renderDeadList(after)
+    msg.className = "msg"; msg.textContent = "已删除不可用出口：" + target
+  } catch (e) { msg.className = "msg err"; msg.textContent = "删除失败：" + e.message }
 }
 async function addEgress() {
   const input = document.getElementById("egress-input")
@@ -3257,6 +3707,160 @@ async function refreshPlans() {
     document.getElementById("plan-meta").textContent = meta || "暂无套餐数据"
   } catch (e) { document.getElementById("plan-meta").textContent = "套餐信息获取失败：" + e.message }
 }
+var ladderState = { enabled: false, port: 10880, mode: "rotate", fixed: null, running: false }
+function renderLadderState() {
+  const el = document.getElementById("ladder-state")
+  if (!el) return
+  el.innerHTML = ladderState.running && ladderState.enabled
+    ? '<span class="badge b-running">运行中 · 127.0.0.1:' + ladderState.port + '</span>'
+    : ladderState.enabled
+      ? '<span class="badge b-stopped">已启用未启动</span>'
+      : '<span class="badge b-stopped">已停用</span>'
+  const badge = document.getElementById("ladder-badge")
+  if (badge) badge.innerHTML = ladderState.enabled
+    ? '<span class="badge b-running">启用</span>'
+    : '<span class="badge b-stopped">停用</span>'
+  const btn = document.getElementById("ladder-toggle-btn")
+  if (btn) {
+    btn.textContent = ladderState.enabled ? "停用" : "启用"
+    btn.className = ladderState.enabled ? "danger" : "primary"
+  }
+  const hint = document.getElementById("ladder-port-hint")
+  if (hint) hint.textContent = ladderState.port
+  const portEl = document.getElementById("ladder-port")
+  if (portEl) portEl.value = ladderState.port
+  const modeEl = document.getElementById("ladder-mode")
+  if (modeEl) modeEl.value = ladderState.mode
+  const fixedRow = document.getElementById("ladder-fixed-row")
+  if (fixedRow) fixedRow.style.display = ladderState.mode === "fixed" ? "flex" : "none"
+  const fixedEl = document.getElementById("ladder-fixed")
+  if (fixedEl && fixedEl.options.length === 0) {
+    const pools = currentEgressList.concat((deadList || []))
+    ;(new Set(pools.concat([ladderState.fixed].filter(Boolean)))).forEach((u) => {
+      if (u && u !== "direct") fixedEl.add(new Option(shortUrl(u), u, u === ladderState.fixed, u === ladderState.fixed))
+    })
+  }
+  if (fixedEl && ladderState.fixed && ![...fixedEl.options].some((o) => o.value === ladderState.fixed)) {
+    fixedEl.add(new Option(shortUrl(ladderState.fixed), ladderState.fixed, true, true))
+  }
+  if (fixedEl) fixedEl.value = ladderState.fixed || fixedEl.options[0]?.value || ""
+  renderLadderUsage()
+}
+function shortUrl(u) {
+  return u && u.indexOf("//") >= 0 ? u.slice(u.indexOf("//") + 2) : u
+}
+function renderLadderUsage() {
+  const el = document.getElementById("ladder-usage-text")
+  if (!el) return
+  const addr = "socks5://127.0.0.1:" + ladderState.port
+  el.textContent =
+    "一、系统全局代理（macOS 系统设置 → 网络 → 高级 → 代理：开启 SOCKS 代理）：\\n" +
+    "   服务器: 127.0.0.1   端口: " + ladderState.port + "\\n\\n" +
+    "二、命令行临时使用（curl）：\\n" +
+    "   curl --proxy " + addr + " https://www.google.com\\n\\n" +
+    "三、git 走梯子（拉取 GitHub 等）：\\n" +
+    "   git config --global http.proxy " + addr + "\\n" +
+    "   git config --global https.proxy " + addr + "\\n" +
+    "   （取消：git config --global --unset http.proxy / --unset https.proxy）\\n\\n" +
+    "四、浏览器扩展（SwitchyOmega 等）新建代理：\\n" +
+    "   协议 SOCKS5 / 服务器 127.0.0.1 / 端口 " + ladderState.port + "\\n\\n" +
+    "五、其它应用（终端代理 / 下载工具）：把 SOCKS5 代理指到 127.0.0.1:" + ladderState.port + " 即可。\\n\\n" +
+    "模式说明：\\n" +
+    "   · 轮换模式 —— 每个新连接自动换一个出口 IP（出口池 ≥2 项才有效），适合被按 IP 限流的场景\\n" +
+    "   · 固定模式 —— 始终走你指定的那个出口（适合需要固定出口 IP 的场景）\\n\\n" +
+    "注意：梯子走的是上方「IP 池（轮换出口）」的 socks5 出口；若池为空或已停用则退化为本地直连。"
+}
+async function refreshLadder() {
+  try {
+    const cfg = (await api("/api/gateway/config")) || {}
+    ladderState.enabled = !!(cfg.ladder && cfg.ladder.enabled)
+    ladderState.port = (cfg.ladder && cfg.ladder.port) || 10880
+    ladderState.mode = (cfg.ladder && cfg.ladder.mode) || "rotate"
+    ladderState.fixed = (cfg.ladder && cfg.ladder.fixed) || null
+    const st = await api("/api/gateway/ladder")
+    if (st && st.ok !== false) { ladderState.running = !!st.running; if (st.egressCount != null) ladderState.egressCount = st.egressCount }
+    renderLadderState()
+  } catch (e) {
+    const msg = document.getElementById("ladder-msg")
+    if (msg) { msg.className = "msg err"; msg.textContent = "梯子状态读取失败：" + e.message }
+  }
+}
+function ladderCollectConfig() {
+  const port = Number(document.getElementById("ladder-port").value)
+  const mode = document.getElementById("ladder-mode").value
+  const fixed = mode === "fixed" ? document.getElementById("ladder-fixed").value : null
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("端口非法（1-65535）")
+  if (mode === "fixed" && !fixed) throw new Error("固定模式必须选择一个出口")
+  return { enabled: ladderState.enabled, port, mode, fixed }
+}
+async function ladderSave() {
+  const msg = document.getElementById("ladder-msg")
+  try {
+    const cfg = ladderCollectConfig()
+    msg.className = "msg"
+    msg.textContent = "保存并应用梯子…"
+    const r = await api("/api/gateway/ladder", { action: "set", ladder: cfg })
+    if (r.ok === false) throw new Error(r.error || "应用失败")
+    ladderState.enabled = cfg.enabled
+    ladderState.port = cfg.port
+    ladderState.mode = cfg.mode
+    ladderState.fixed = cfg.fixed
+    ladderState.running = !!r.running
+    renderLadderState()
+    msg.textContent = r.running
+      ? "梯子已启动：" + (r.port || cfg.port) + "（即时生效，无需重启网关）"
+      : "梯子已停用（配置已保存）"
+  } catch (e) { msg.className = "msg err"; msg.textContent = "保存失败：" + e.message }
+}
+async function ladderToggle() {
+  const msg = document.getElementById("ladder-msg")
+  try {
+    // 切换 enabled 并保存应用
+    const cfg = ladderCollectConfig()
+    cfg.enabled = !ladderState.enabled
+    msg.className = "msg"
+    msg.textContent = "正在切换梯子…"
+    const r = await api("/api/gateway/ladder", { action: "set", ladder: cfg })
+    if (r.ok === false) throw new Error(r.error || "应用失败")
+    ladderState.enabled = cfg.enabled
+    ladderState.port = cfg.port
+    ladderState.mode = cfg.mode
+    ladderState.fixed = cfg.fixed
+    ladderState.running = !!r.running
+    renderLadderState()
+    msg.textContent = r.running
+      ? "梯子已启动（127.0.0.1:" + (r.port || cfg.port) + "）"
+      : "梯子已停用"
+  } catch (e) { msg.className = "msg err"; msg.textContent = "切换失败：" + e.message }
+}
+async function ladderSurfCheck() {
+  const resultEl = document.getElementById("ladder-surf-result")
+  const msg = document.getElementById("ladder-msg")
+  if (resultEl) resultEl.textContent = "科学上网筛选进行中（对每个 socks5 出口测 google/youtube 隧道 + 出口归属，请稍候）…"
+  try {
+    const r = await api("/api/gateway/ladder/check", {})
+    if (r.ok === false) throw new Error(r.error || "筛选失败")
+    msg.className = "msg"; msg.textContent = "筛选完成（" + new Date(r.checkedAt).toLocaleTimeString() + "）"
+    if (!resultEl) return
+    const list = r.egress || []
+    if (!list.length) { resultEl.textContent = "无 socks5 出口可测（先在 IP 池添加出口）。"; return }
+    resultEl.innerHTML = list.map((x) =>
+      '<div class="proxy-item" style="align-items:center;display:flex;gap:8px;border-bottom:1px solid var(--bd-2);padding:3px 0">' +
+      '<code style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(x.url) + '">' + esc(shortUrl(x.url)) + '</code>' +
+      (x.ok
+        ? '<span class="badge b-available">可科学上网 ' + x.ms + "ms</span>"
+        : '<span class="badge b-invalid">不可用</span>') +
+      '<span class="muted" style="white-space:nowrap">google ' + (x.google ? '<span style="color:var(--ok,#34d399)">✓</span>' : '<span style="color:var(--err,#f87171)">✗</span>') +
+      ' youtube ' + (x.youtube ? '<span style="color:var(--ok,#34d399)">✓</span>' : '<span style="color:var(--err,#f87171)">✗</span>') + '</span>' +
+      (x.exitIp ? '<span class="badge b-go" title="' + esc(x.org || "") + '">' + esc(x.country + (x.city ? "/" + x.city : "")) + " · " + esc(x.exitIp) + '</span>' : '') +
+      (x.error ? '<span class="muted" style="font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:160px" title="' + esc(x.error) + '">' + esc(x.error) + "</span>" : "") +
+      '</div>'
+    ).join("")
+  } catch (e) {
+    msg.className = "msg err"; msg.textContent = "筛选失败：" + e.message
+    if (resultEl) resultEl.textContent = ""
+  }
+}
 async function refreshGatewayConfig() {
   try {
     const c = await api("/api/gateway/config")
@@ -3265,7 +3869,10 @@ async function refreshGatewayConfig() {
     tokenBadge(!!c.authEnabled)
     renderTokenList(c.tokens || []) // 多 key 掩码列表（明文仅本会话生成/编辑后持有，GET 永不明文）
     renderEgressList(c.egress || [], !!c.egressEnabled, !!c.ipRotation) // IP 轮换出口池 + 启用徽标
+    renderLimitedList(c.limited || []) // 限流池
+    renderDeadList(c.dead || []) // 不可用池（默认折叠，badge 显示数量）
   } catch (e) { showTokenMsg("配置读取失败：" + e.message, true) }
+  refreshLadder() // 梯子状态（异步，不阻塞配置渲染）
 }
 function showTokenMsg(m, isErr) {
   const el = document.getElementById("token-msg")

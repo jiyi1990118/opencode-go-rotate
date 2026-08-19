@@ -186,6 +186,46 @@ Web 管理端（127.0.0.1:8899 → 网关 → IP 池下方「免费代理」卡�
 - 后端 `POST /api/gateway/proxies/fetch`（`{limit, timeout}`，默认 200/5s，并发 30）纯 JS 实现（node:net SOCKS5 握手），零依赖、不需要 Python。
 - 注意：**连通 ≠ 可绕过限流**——免费数据中心 IP 大多是连通但被 opencode.ai 限 429。加入池后再用「检查出口」做真实请求判定。
 
+## 梯子（本地 SOCKS5 透明代理，供其它应用科学上网）
+
+在 `gateway-config.json` 配置 `ladder` 字段即可在**本机**开启一个 SOCKS5 透明代理服务（默认 `127.0.0.1:10880`）。任何应用（浏览器 / curl / git / 下载工具 / 系统代理）把 SOCKS5 代理指向它，即可通过「IP 池（egress）」的出口上网——轮换模式每个连接自动换出口 IP，固定模式锁定指定出口：
+
+```jsonc
+{
+  "plan": "go",
+  "egress": ["socks5://host1:1080", "socks5://host2:1080"],   // ≥2 项供轮换
+  "ladder": {
+    "enabled": true,
+    "port": 10880,          // 本地 SOCKS5 监听端口（仅 127.0.0.1，安全基线）
+    "mode": "rotate",       // "rotate"=每连接轮换出口池 | "fixed"=固定走指定出口
+    "fixed": "socks5://host1:1080"  // mode="fixed" 时使用的出口（可选）
+  }
+}
+```
+
+- **服务仅绑定 127.0.0.1**：只供本机应用使用，不暴露内网（安全基线，同网关 HTTP）。
+- **rotate 模式**：每个新连接自动顺延一个出口（不依赖 zen 套餐开关），某出口连接失败会**自动顺延下一出口重试最多 3 次**（免费代理时好时坏也能大体稳定）。
+- **fixed 模式**：始终走 `fixed` 指定的出口（适合需要固定出口 IP 的场景）。
+- **即时生效**：改配置后用 Web 或 `POST /api/gateway/ladder?action=apply` 应用；网关启动时若 `enabled:true` 也会自动拉起。
+- 池为空或已停用时退化为**本地直连**（等价纯本地代理）。
+
+### 梯子 API
+
+- `GET /api/gateway/ladder` → 状态 `{enabled, running, port, mode, fixed, conns, egressCount}`
+- `POST /api/gateway/ladder?action=apply` → 按当前配置启停（enabled→启动 / 否则停止）
+- `POST /api/gateway/ladder?action=stop` → 强制停止
+- `POST /api/gateway/ladder/check`（`{urls?}`）→ **科学上网筛选**：对每个 socks5 出口测「能否 CONNECT 被墙站点（google/youtube:443）」+ 经出口查真实出口 IP 归属地（ip-api.com），返回 `{url, ok, ms, google, youtube, exitIp, country, city, org}`。
+
+### Web 集成（梯子卡 + 不可用池）
+
+Web 管理端（127.0.0.1:8899 → 网关 → 梯子卡）：
+
+- **启停 / 端口 / 模式**：一键启用/停用、改本地端口、切换「轮换 / 指定固定出口」（固定出口从 IP 池下拉选择），保存即应用（无需重启网关）。
+- **科学上网筛选**：「科学上网筛选」按钮对池中每个出口做 google/youtube CONNECT + 出口 IP 归属测试，逐项显示「可科学上网」徽标与归属地，帮你在免费代理里筛出真能翻墙的。
+- **使用说明**：内置折叠「梯子使用说明」——系统代理 / curl / git / 浏览器扩展 / 其它应用配置方法。
+- **不可用池**：IP 池 + 限流池各有一键「→ 转移不可用」按钮，把健康检查失败（非 429）的出口移到「不可用池」（默认折叠容器），避免坏代理继续参与轮换；不可用池「健康检查」恢复后可「移回 IP 池」。
+- 免费代理时好时坏：实测一次筛出 3 个可用（香港 UCloud / 新加坡中转，出口 IP 与代理一致=真透明转发），数小时后全部超时——**免费稳定性差，建议用稳定付费代理**。
+
 ## 验证
 
 ```bash

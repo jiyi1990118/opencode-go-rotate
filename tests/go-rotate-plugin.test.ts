@@ -1196,11 +1196,160 @@ describe("网关配置路由（/api/gateway/plans + /api/gateway/config）", () 
       new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "set-limited", list: [] }) }),
     )
     expect(mod.readGatewayConfig().limited).toEqual([]) // 清空
+    // 不可用池：move-to-dead（从主池/限流池移到 dead）+ restore-dead + set-dead
+    // 先造数据：主池 1 项 + 限流池 1 项
+    mod.writeGatewayConfig({ egress: ["socks5://3.3.3.3:1080", "socks5://4.4.4.4:1080"], limited: ["socks5://5.5.5.5:1080"] })
+    const mtd = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", {
+        method: "POST",
+        body: JSON.stringify({ action: "move-to-dead", urls: ["socks5://4.4.4.4:1080", "socks5://5.5.5.5:1080", "http://bad:80"] }),
+      }),
+    )
+    const mtdj = await mtd.json()
+    expect(mtdj.ok).toBe(true)
+    expect(mtdj.moved).toEqual(["socks5://4.4.4.4:1080", "socks5://5.5.5.5:1080"]) // 非法项跳过
+    const afterMtd = mod.readGatewayConfig()
+    expect(afterMtd.egress).toEqual(["socks5://3.3.3.3:1080"]) // 主池删 4.4.4.4
+    expect(afterMtd.limited).toEqual([]) // 限流池删 5.5.5.5
+    expect(afterMtd.dead).toEqual(["socks5://4.4.4.4:1080", "socks5://5.5.5.5:1080"])
+    // GET config 透传 dead
+    const gd = await (await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/config"))).json()
+    expect(gd.dead).toEqual(["socks5://4.4.4.4:1080", "socks5://5.5.5.5:1080"])
+    // 重复 move-to-dead → 不重复加入
+    await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", {
+        method: "POST", body: JSON.stringify({ action: "move-to-dead", urls: ["socks5://4.4.4.4:1080"] }),
+      }),
+    )
+    expect(mod.readGatewayConfig().dead.filter((u) => u === "socks5://4.4.4.4:1080").length).toBe(1)
+    // 空 urls → 400
+    const mtdE = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "move-to-dead", urls: [] }) }),
+    )
+    expect(mtdE.status).toBe(400)
+    // restore-dead：恢复 → 回主池
+    const rstd = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", {
+        method: "POST", body: JSON.stringify({ action: "restore-dead", urls: ["socks5://5.5.5.5:1080"] }),
+      }),
+    )
+    const rstdj = await rstd.json()
+    expect(rstdj.ok).toBe(true)
+    expect(rstdj.restored).toEqual(["socks5://5.5.5.5:1080"])
+    expect(mod.readGatewayConfig().dead).toEqual(["socks5://4.4.4.4:1080"])
+    expect(mod.readGatewayConfig().egress).toContain("socks5://5.5.5.5:1080")
+    // set-dead：直接重设 + 非法拒绝
+    const setd = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", {
+        method: "POST", body: JSON.stringify({ action: "set-dead", list: ["socks5://8.8.8.8:1080"] }),
+      }),
+    )
+    expect((await setd.json()).dead).toEqual(["socks5://8.8.8.8:1080"])
+    const setdBad = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", {
+        method: "POST", body: JSON.stringify({ action: "set-dead", list: ["http://bad:80"] }),
+      }),
+    )
+    expect(setdBad.status).toBe(400)
+    await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "set-dead", list: [] }) }),
+    )
+    expect(mod.readGatewayConfig().dead).toEqual([]) // 清空
     // 未知 action → 400
     const unk = await mod.handleWeb(
       new Request("http://127.0.0.1:8899/api/gateway/egress", { method: "POST", body: JSON.stringify({ action: "boom" }) }),
     )
     expect(unk.status).toBe(400)
+  })
+})
+
+describe("梯子（本地 SOCKS5 透明代理）Web 集成", () => {
+  test("写配置：/api/gateway/ladder {action:set} 校验 + 持久化 + 网关不可达降级", async () => {
+    // 合法配置
+    const ok = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/ladder", {
+        method: "POST",
+        body: JSON.stringify({ action: "set", ladder: { enabled: true, port: 10880, mode: "fixed", fixed: "socks5://123.58.219.171:10808" } }),
+      }),
+    )
+    const okj = await ok.json()
+    expect(okj.ok).toBe(true) // 网关不可达时也返回 ok:true（配置已落盘；apply 失败在 error 字段）
+    expect(mod.readGatewayConfig().ladder).toEqual({ enabled: true, port: 10880, mode: "fixed", fixed: "socks5://123.58.219.171:10808" })
+    // GET /api/gateway/config 透传 ladder
+    const gc = await (await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/config"))).json()
+    expect(gc.ladder).toEqual({ enabled: true, port: 10880, mode: "fixed", fixed: "socks5://123.58.219.171:10808" })
+    // 非法端口 → 写失败（400）
+    const bad = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/ladder", {
+        method: "POST",
+        body: JSON.stringify({ action: "set", ladder: { enabled: true, port: 99999 } }),
+      }),
+    )
+    expect(bad.status).toBe(400)
+    // mode=fixed 无 fixed 出口 → 400
+    const noFixed = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/ladder", {
+        method: "POST",
+        body: JSON.stringify({ action: "set", ladder: { enabled: true, port: 10880, mode: "fixed", fixed: null } }),
+      }),
+    )
+    expect(noFixed.status).toBe(400)
+    // fixed 出口格式非法 → 400
+    const badFixed = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/ladder", {
+        method: "POST",
+        body: JSON.stringify({ action: "set", ladder: { enabled: true, port: 10880, mode: "fixed", fixed: "http://bad:80" } }),
+      }),
+    )
+    expect(badFixed.status).toBe(400)
+    // 清空（ladder:null）
+    await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/ladder", {
+        method: "POST",
+        body: JSON.stringify({ action: "set", ladder: null }),
+      }),
+    )
+    expect(mod.readGatewayConfig().ladder).toBe(null)
+  })
+  test("状态路由：GET /api/gateway/ladder 网关不可达 → ok:false 降级含配置侧信息", async () => {
+    const st = await (await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/ladder"))).json()
+    expect(st.ok).toBe(false) // 测试 env 网关不可达
+    expect(st.running).toBe(false)
+    expect(typeof st.port).toBe("number")
+    expect(typeof st.mode).toBe("string")
+  })
+  test("科学上网筛选路由：POST /api/gateway/ladder/check 网关不可达 → ok:false 不抛异常", async () => {
+    const r = await (await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/ladder/check", {
+        method: "POST",
+        body: JSON.stringify({ urls: ["socks5://123.58.219.171:10808"] }),
+      }),
+    )).json()
+    expect(r.ok).toBe(false)
+    expect(typeof r.error).toBe("string")
+  })
+  test("WEB_HTML 梯子卡片：容器/启停/端口/模式/科学上网筛选/使用说明", () => {
+    const html: string = (mod as any).WEB_HTML
+    expect(html).toContain('id="gw-ladder-card"')
+    expect(html).toContain('id="ladder-badge"')
+    expect(html).toContain('id="ladder-toggle-btn"')
+    expect(html).toContain('id="ladder-check-surf-btn"')
+    expect(html).toContain('id="ladder-port"')
+    expect(html).toContain('id="ladder-mode"')
+    expect(html).toContain('id="ladder-fixed-row"')
+    expect(html).toContain("function renderLadderState()")
+    expect(html).toContain("function renderLadderUsage()")
+    expect(html).toContain("async function refreshLadder()")
+    expect(html).toContain("async function ladderSave()")
+    expect(html).toContain("async function ladderToggle()")
+    expect(html).toContain("async function ladderSurfCheck()")
+    expect(html).toContain('api("/api/gateway/ladder", { action: "set", ladder: cfg })')
+    expect(html).toContain("科学上网筛选")
+    expect(html).toContain("梯子使用说明")
+    expect(html).toContain("socks5://127.0.0.1:")
+    expect(html).toContain("git config --global http.proxy")
+    expect(html).toContain("轮换模式")
+    expect(html).toContain("固定模式")
   })
 })
 
@@ -1308,6 +1457,27 @@ describe("WEB_HTML 网关管理区块（主导航 + 套餐卡 + Token 卡）", (
     expect(html).toContain('api("/api/gateway/egress", { action: "set-limited", list')
     expect(html).toContain('api("/api/gateway/egress/health", { url') // 限流量身探测
     expect(html).toContain("function checkAllHealth()")
+    // 不可用池（探测失败出口，默认折叠 details）+ 一键转移不可用（主池/限流池）
+    expect(html).toContain('id="gw-dead-card"') // details 折叠容器（正常收缩）
+    expect(html).toContain("<details") // 默认折叠实现
+    expect(html).toContain('id="dead-check-btn"')
+    expect(html).toContain('id="dead-restore-btn"')
+    expect(html).toContain('id="dead-badge"')
+    expect(html).toContain("function renderDeadList(")
+    expect(html).toContain("async function checkDeadHealth()")
+    expect(html).toContain("async function restoreSelectedDead()")
+    expect(html).toContain("async function moveToDead(")          // 主池单项 → 不可用池
+    expect(html).toContain("async function moveToDeadFromLimited(") // 限流池单项 → 不可用池
+    expect(html).toContain("async function moveAllDeadFromEgress()")  // IP 池一键转移不可用
+    expect(html).toContain("async function moveAllDeadFromLimited()") // 限流池一键转移不可用
+    expect(html).toContain("async function delDead(")
+    expect(html).toContain('api("/api/gateway/egress", { action: "move-to-dead", urls')
+    expect(html).toContain('api("/api/gateway/egress", { action: "restore-dead", urls')
+    expect(html).toContain('api("/api/gateway/egress", { action: "set-dead", list')
+    expect(html).toContain('id="egress-movedead-btn"')   // IP 池「→ 转移不可用」
+    expect(html).toContain('id="limited-movedead-btn"')  // 限流池「→ 转移不可用」
+    expect(html).toContain("没有探测为「不可用」的出口")
+    expect(html).toContain("不可用池为空")
     // IP 轮换总开关（关闭走本地直连）
     expect(html).toContain('id="ip-rotation-btn"')
     expect(html).toContain('onclick="toggleIpRotation()"')
