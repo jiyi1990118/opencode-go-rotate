@@ -795,6 +795,26 @@ describe("网关功能测试路由（POST /api/gateway/test，测试 env 网关�
     expect(typeof j.error).toBe("string")
     expect(j.error.length).toBeGreaterThan(0)
   })
+  test("出口健康缓存：read/write 纯函数 + GET /api/gateway/egress/health/cache 读取路由", async () => {
+    // 纯函数：写 → 读回 → 覆盖残留 url
+    const url = "socks5://10.0.0.1:1080"
+    const entry = { ok: true, status: 200, ms: 321, error: null, checkedAt: "2026-08-19T07:00:00.000Z" }
+    mod.writeEgressHealthCache({ [url]: entry, "socks5://stale:1080": { ok: false } })
+    const cache = mod.readEgressHealthCache()
+    expect(cache[url].ok).toBe(true)
+    expect(cache[url].checkedAt).toBe(entry.checkedAt)
+    // 路由读取
+    const res = await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/egress/health/cache"))
+    expect(res.status).toBe(200)
+    const j = await res.json()
+    expect(j.ok).toBe(true)
+    expect(j.cache[url].status).toBe(200)
+    // 损坏文件容错
+    writeFileSync(mod.EGRESS_HEALTH_FILE, "{bad json")
+    expect(mod.readEgressHealthCache()).toEqual({})
+    // 清理
+    try { rmSync(mod.EGRESS_HEALTH_FILE, { force: true }) } catch {}
+  })
 })
 
 /* ================= go + zen 双套餐模型动态查看（Web 面板 + 路由，隔离不可达网关降级） ================= */
@@ -1581,6 +1601,8 @@ describe("WEB_HTML 网关管理区块（主导航 + 套餐卡 + Token 卡）", (
     expect(html).toContain('onclick="checkEgressHealth()"')
     expect(html).toContain('id="egress-check-btn"')
     expect(html).toContain('id="egress-checkall-btn"')
+    expect(html).toContain("async function loadEgressHealthCache(")
+    expect(html).toContain('api("/api/gateway/egress/health/cache")')
     expect(html).toContain('onclick="checkAllHealth()"')
     expect(html).toContain("async function checkAllHealth()")
     expect(html).toContain("检查所有 IP 健康度")

@@ -675,6 +675,9 @@ function gatewayAuthHeaders(): Record<string, string> {
 const GATEWAY_CONFIG_FILE =
   process.env.GOROTATE_GATEWAY_CONFIG ??
   path.join(homedir(), ".local", "share", "zen-gateway", "gateway-config.json")
+// 出口健康检查结果本地缓存（与 gateway-config 同目录独立文件，勿污染 gateway-config schema）。
+// 每次健康检查成功后写入；页面加载时读回渲染健康徽标（无需重探）。
+const EGRESS_HEALTH_FILE = path.join(path.dirname(GATEWAY_CONFIG_FILE), "egress-health.json")
 // 套餐元数据（go 订阅 / zen 免费）。modelCount = 内置兜底模型表数量（运行时模型以 /v1/models 为准；
 // 免费名单会变，内置表仅兜底）。同一 opencode key 双端点通用，切换只需换上游 base + 默认模型。
 const GATEWAY_PLANS = [
@@ -870,9 +873,31 @@ async function gatewayTest(): Promise<{
   }
 }
 
+/** 出口健康检查结果本地缓存：读（损坏/缺失回退 {}）。不含敏感信息，纯 {url:{ok,status,ms,error,checkedAt}}。 */
+function readEgressHealthCache(): Record<string, any> {
+  try {
+    if (!existsSync(EGRESS_HEALTH_FILE)) return {}
+    const raw = JSON.parse(readFileSync(EGRESS_HEALTH_FILE, "utf8"))
+    return raw && typeof raw === "object" ? raw : {}
+  } catch (e) {
+    log(`readEgressHealthCache error: ${(e as Error).message}`)
+    return {}
+  }
+}
+
+/** 出口健康检查结果本地缓存：原子写（.tmp + rename），写失败仅 log 不阻断调用链。 */
+function writeEgressHealthCache(map: Record<string, any>) {
+  try {
+    mkdirSync(path.dirname(EGRESS_HEALTH_FILE), { recursive: true })
+    atomicWrite(EGRESS_HEALTH_FILE, JSON.stringify(map, null, 2), 0o600)
+  } catch (e) {
+    log(`writeEgressHealthCache error: ${(e as Error).message}`)
+  }
+}
+
 /** 出口池健康检查代理：转发到网关 POST /api/gateway/egress/health（真实最小探测每出口）。
  *  网关不可达 → {ok:false, error}；可达则返回 {ok:true, checkedAt, egress:[{index,url,ok,status,ms,error}]}。
- *  expectUrl 可选：只探测指定出口（限流池移回前验证是否解限）。 */
+ *  expectUrl 可选：只探测指定出口（限流池移回前验证是否解限）。成功结果写入本地缓存（刷新页面后健康徽标仍在）。 */
 async function gatewayEgressHealthProxy(expectUrl?: string): Promise<any> {
   try {
     // 超时按池大小动态计算：网关并发 5 探测、每项最坏 15s → 最坏 ⌈N/5⌉×15s；再兜底 +10s
@@ -888,7 +913,16 @@ async function gatewayEgressHealthProxy(expectUrl?: string): Promise<any> {
      })
      const j: any = await r.json().catch(() => null)
      if (!r.ok || !j) return { ok: false, error: j?.error?.message ?? `网关健康检查失败 HTTP ${r.status}` }
-     return { ok: true, checkedAt: j.checkedAt, egress: j.egress ?? [] }
+     // 成功：把本次探测结果合并写入本地缓存（含 checkedAt 时间戳，供页面加载回显 / 陈旧提示）
+     const egress = j.egress ?? []
+     if (Array.isArray(egress) && egress.length) {
+       const cache = readEgressHealthCache()
+       for (const x of egress) {
+         if (x?.url) cache[x.url] = { ok: x.ok, status: x.status, ms: x.ms, error: x.error, checkedAt: j.checkedAt ?? new Date().toISOString() }
+       }
+       writeEgressHealthCache(cache)
+     }
+     return { ok: true, checkedAt: j.checkedAt, egress }
    } catch (e: any) {
      return { ok: false, error: String(e?.message ?? e) }
    }
@@ -1512,6 +1546,10 @@ async function handleWeb(req: any): Promise<Response> {
       if (typeof b?.url === "string" && b.url) wantUrl = b.url
     } catch {}
     return json(await gatewayEgressHealthProxy(wantUrl))
+  }
+  // 出口健康检查结果本地缓存读取（页面加载回显用；GET 幂等只读）
+  if (method === "GET" && route === "/api/gateway/egress/health/cache") {
+    return json({ ok: true, checkedAt: null, cache: readEgressHealthCache() })
   }
   // 梯子（本地 SOCKS5 透明代理）状态/管理/科学上网筛选
   if (method === "GET" && route === "/api/gateway/ladder") {
@@ -3595,7 +3633,7 @@ function renderEgressList(egress, enabled, ipRotation) {
     let limitedBtn = ""
     let deadBtn = ""
     if (st) {
-      if (st.ok) h = '<span class="badge b-available" title="' + esc(st.ms + "ms") + '">健康 ' + st.status + '</span>'
+      if (st.ok) h = '<span class="badge b-available" title="' + esc(healthTitle(st, st.ms + "ms")) + '">健康 ' + st.status + '</span>'
       else if (st.status === 429) {
         h = '<span class="badge b-warn" title="' + esc(st.error || "") + '">IP 被限流 429</span>'
         limitedBtn = '<button class="small" onclick="moveToLimited(' + i + ')">→ 限流池</button>'
@@ -3644,7 +3682,7 @@ function renderLimitedList(limited) {
     const isSel = !!limitedSel[i]
     let h = ""
     if (st) {
-      if (st.ok) h = '<span class="badge b-available" title="' + esc((st.ms || 0) + "ms") + '">已解除 ' + st.status + '</span>'
+      if (st.ok) h = '<span class="badge b-available" title="' + esc(healthTitle(st, (st.ms || 0) + "ms")) + '">已解除 ' + st.status + '</span>'
       else if (st.status === 429) h = '<span class="badge b-warn">仍限流 429</span>'
       else h = '<span class="badge b-invalid">不可用</span>'
     } else {
@@ -3766,7 +3804,7 @@ function renderDeadList(dead) {
     const isSel = !!deadSel[i]
     let h = ""
     if (st) {
-      if (st.ok) h = '<span class="badge b-available" title="' + esc((st.ms || 0) + "ms") + '">已恢复 ' + st.status + '</span>'
+      if (st.ok) h = '<span class="badge b-available" title="' + esc(healthTitle(st, (st.ms || 0) + "ms")) + '">已恢复 ' + st.status + '</span>'
       else if (st.status === 429) h = '<span class="badge b-warn">限流 429</span>'
       else h = '<span class="badge b-invalid">仍不可用</span>'
     } else {
@@ -4164,6 +4202,15 @@ function renderLadderState() {
 function shortUrl(u) {
   return u && u.indexOf("//") >= 0 ? u.slice(u.indexOf("//") + 2) : u
 }
+/** 健康徽标 title：附加探测时间（来自本地缓存 checkedAt；无则省略）。 */
+function healthTitle(st, msText) {
+  let t = msText || (st && st.ms != null ? st.ms + "ms" : "")
+  if (st && st.checkedAt) {
+    const hm = String(st.checkedAt).replace("T", " ").slice(5, 16) // MM-DD HH:MM（UTC）
+    t += t ? " · 探测 " + hm : "探测 " + hm
+  }
+  return t || ""
+}
 function renderLadderUsage() {
   const el = document.getElementById("ladder-usage-text")
   if (!el) return
@@ -4269,7 +4316,7 @@ function renderLadderEgress() {
     const isSel = !!ladderEgressSel[i]
     let h = ""
     if (st) {
-      if (st.ok) h = '<span class="badge b-available" title="' + esc((st.ms || 0) + "ms") + '">健康 ' + (st.status || "") + '</span>'
+      if (st.ok) h = '<span class="badge b-available" title="' + esc(healthTitle(st, (st.ms || 0) + "ms")) + '">健康 ' + (st.status || "") + '</span>'
       else if (st.status === 429) h = '<span class="badge b-warn">限流 429</span>'
       else h = '<span class="badge b-invalid">不可用</span>'
     } else {
@@ -4478,8 +4525,31 @@ async function refreshGatewayConfig() {
     renderEgressList(c.egress || [], !!c.egressEnabled, !!c.ipRotation) // IP 轮换出口池 + 启用徽标
     renderLimitedList(c.limited || []) // 限流池
     renderDeadList(c.dead || []) // 不可用池（默认折叠，badge 显示数量）
+    await loadEgressHealthCache(c) // 回显上次健康检查结果（不用重探；填充后重渲染三池 + 梯子池）
+    renderEgressList(c.egress || [], !!c.egressEnabled, !!c.ipRotation)
+    renderLimitedList(c.limited || [])
+    renderDeadList(c.dead || [])
+    renderLadderEgress()
   } catch (e) { showTokenMsg("配置读取失败：" + e.message, true) }
   refreshLadder() // 梯子状态（异步，不阻塞配置渲染）
+}
+async function loadEgressHealthCache(c) {
+  // 读取本地缓存的健康检查结果（上次探测），按各池成员 url 填充对应 health map → 刷新后徽标仍在。
+  try {
+    const r = await api("/api/gateway/egress/health/cache")
+    if (!r || !r.cache) return
+    // 只保留仍在对应池里的 url（避免过期项残留徽标）
+    const poolUrls = new Set((c?.egress || []).concat(c?.limited || []).concat(c?.dead || []).concat((c?.ladder && c.ladder.egress) || []))
+    egressHealth = {}; limitedHealth = {}; deadHealth = {}; ladderEgressHealth = {}
+    for (const url of Object.keys(r.cache)) {
+      if (!poolUrls.has(url)) continue
+      const entry = r.cache[url]
+      if ((c?.egress || []).includes(url)) egressHealth[url] = entry
+      if ((c?.limited || []).includes(url)) limitedHealth[url] = entry
+      if ((c?.dead || []).includes(url)) deadHealth[url] = entry
+      if (c?.ladder && (c.ladder.egress || []).includes(url)) ladderEgressHealth[url] = entry
+    }
+  } catch (e) { /* 缓存读失败静默（不阻塞页面） */ }
 }
 function showTokenMsg(m, isErr) {
   const el = document.getElementById("token-msg")
@@ -4692,6 +4762,9 @@ export {
   readGatewayConfig,
   writeGatewayConfig,
   validateEgressItem,
+  readEgressHealthCache,
+  writeEgressHealthCache,
+  EGRESS_HEALTH_FILE,
   maskGatewayToken,
   gatewayConfigPayload,
   gatewayPlansPayload,
