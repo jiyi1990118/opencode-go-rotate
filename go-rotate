@@ -1205,8 +1205,9 @@ def main():
         do_uninstall(force=("-y" in args or "--yes" in args))
         return
     if cmd == "check":
-        # check 写各 key 健康状态/探测时间 → 持锁
-        _with_lock(lambda: do_check(load(), args[1:]))
+        # check 探测走网络（最长 ~15s/端点）——不持跨进程锁（P2-1 遗留修复）：
+        # last_status/last_checked 非关键字段，容忍并发写竞态，避免长锁阻塞插件/CLI 轮换；save() 本身仍是原子写。
+        do_check(load(), args[1:])
         return
     if cmd == "web":
         # web on/off 写配置 → 持锁；web（独立启动）不写配置不持锁

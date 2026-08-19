@@ -546,6 +546,7 @@ function readGatewayConfig() {
         : [],
       egress: Array.isArray(cfg.egress) ? cfg.egress.filter((e) => typeof e === "string") : [],
       ip_rotation: cfg.ip_rotation !== false, // 缺省开启；显式 false 关闭
+      egress_index: Number.isInteger(cfg.egress_index) && cfg.egress_index >= 0 ? cfg.egress_index : 0, // 出口轮换游标（重启续接，缺省 0）
       ladder: normalizeLadderConfig(cfg.ladder),
     }
   } catch (e) {
@@ -843,7 +844,8 @@ const MODELS_API = UPSTREAM_BASE + "/models"
  * 出口选择：FreeUsageLimitError 时切到下一出口重试一次（成功固化）；平时固定在当前健康出口，不无脑轮换。
  * 开关 / 列表均「按需读当前配置」动态判定——Web 改 ip_rotation 或 egress 后无需重启即时生效。 */
 const EGRESS_LIST_INIT = parseEgressList(_GW_CFG && _GW_CFG.egress)
-let _egressIdx = 0
+// 出口轮换游标：启动时从 gateway-config 的 egress_index 续接（P2-3 遗留——重启不再回 0 撞死代理）；无配置/非法 → 0
+let _egressIdx = Number.isInteger(_GW_CFG && _GW_CFG.egress_index) && _GW_CFG.egress_index >= 0 ? _GW_CFG.egress_index : 0
 let _egressOk = true // 当前出口是否健康（429 → false 触发切换）
 let _ladderIdx = 0 // 梯子专用池轮换计数器（独立于 _egressIdx：梯子流量不扰动网关 HTTP 轮换序列）
 
@@ -878,7 +880,26 @@ function rotateEgress() {
   _egressIdx = (_egressIdx + 1) % L.length
   const next = L[_egressIdx]
   log(`🔁  zen 档出口轮换: ${prev.raw || "direct"} → ${next ? next.raw : "direct"}`)
+  // 持久化游标（fire-and-forget：重启后从新出口续接；写入失败静默 log 不阻断）。锁 = go-keys.json.lock，
+  // 与 Web/CLI 写 gateway-config（withLockSync 同锁）跨进程互斥，防并发读改写互相覆盖。
+  void persistEgressIndex(_egressIdx)
   return currentEgress()
+}
+
+/** 持久化出口轮换游标到 gateway-config.json 的 egress_index 字段（读改写保留其余字段）。
+ *  轮换频率极低（仅 429 触发），写盘开销可忽略；失败只 log 不抛（不阻断轮换）。 */
+function persistEgressIndex(index) {
+  return withLockAsync(() => {
+    try {
+      if (!existsSync(GATEWAY_CONFIG)) return // 无配置文件（如 go 档未建）不落盘
+      const raw = JSON.parse(readFileSync(GATEWAY_CONFIG, "utf8"))
+      if (!raw || typeof raw !== "object") return
+      raw.egress_index = index
+      atomicWrite(GATEWAY_CONFIG, JSON.stringify(raw, null, 2))
+    } catch (e) {
+      log(`⚠️  持久化 egress_index 失败（不阻断轮换）: ${e.message}`)
+    }
+  })
 }
 
 /** 请求成功后调用：确认当前出口健康（egressOk 复位，避免连续成功仍误判）。 */
@@ -961,6 +982,26 @@ return { checkedAt: new Date().toISOString(), egress: out }
    *   mode=rotate → 每次新连接用 currentEgress()（出口池轮换，IP 变化）；
    *   mode=fixed  → 固定走 `fixed` 指定的出口（不参与轮换）。
    * 只绑 127.0.0.1（安全基线：本机应用使用，不暴露内网）。 */
+
+  /** 同出口连续失败日志合并器（纯函数工厂，便于单测）：免费代理死亡时同一出口会
+   *  反复超时刷屏——只在「第 1 次」与「每满 5 次」打日志，其余静默累积；出口成功一次即归零。
+   *  key 用 `${host}:${port}`（不含凭据，避免密码入内存键/日志）。 */
+  function createLadderFailLogger(logFn) {
+    const m = new Map() // key → 连续失败次数
+    return {
+      fail(key, msg) {
+        const c = (m.get(key) || 0) + 1
+        m.set(key, c)
+        if (c === 1 || c % 5 === 0) logFn(msg)
+      },
+      ok(key) { m.delete(key) }, // 成功 → 归零
+      count(key) { return m.get(key) || 0 }, // 测试/调用方查询
+      size() { return m.size },
+    }
+  }
+
+  /** 梯子失败日志合并实例（模块级单实例；成功归零，连续失败只在 1/5/10… 打日志）。 */
+  const ladderFailLog = createLadderFailLogger((m) => log(m))
 
   const LADDER_DEFAULT_PORT = 10880
 
@@ -1158,6 +1199,7 @@ return { checkedAt: new Date().toISOString(), egress: out }
   async function connectLadderUpstream(client, host, port) {
     const success = Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
     let lastErr = null
+    let lastEgress = null // 本次尝试实际消费的出口（失败日志合并 key 用）
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const egress = ladderNextEgress()
@@ -1173,6 +1215,7 @@ return { checkedAt: new Date().toISOString(), egress: out }
           })
           return
         }
+        lastEgress = egress
         const { sock, rest } = await socks5TunnelConnect(egress, host, port)
         client.removeAllListeners()
         client.write(success)
@@ -1183,6 +1226,7 @@ return { checkedAt: new Date().toISOString(), egress: out }
         client.on("error", () => { try { sock.destroy() } catch {} })
         client.on("close", () => { try { sock.destroy() } catch {} })
         sock.on("close", () => { try { client.destroy() } catch {} })
+        ladderFailLog.ok(`${egress.host}:${egress.port}`) // 隧道成功 → 该出口失败计数归零
         log(`🔀  梯子隧道: ${host}:${port} via ${egress.host}:${egress.port} (${ladderConfig().mode})`)
         return
       } catch (e) {
@@ -1192,14 +1236,18 @@ return { checkedAt: new Date().toISOString(), egress: out }
         const ladderPool = parseEgressList(c.egress).filter((x) => x.type === "socks5")
         const mainPool = egressList().filter((x) => x.type === "socks5")
         const pool = ladderPool.length > 0 ? ladderPool : mainPool // 与 ladderNextEgress 同优先级链
+        const key = lastEgress ? `${lastEgress.host}:${lastEgress.port}` : host
         if (c.mode === "rotate" && pool.length > 1 && attempt < 2) {
-          log(`⚠️  梯子出口失败（${e.message}），顺延下一出口重试 #${attempt + 2}`)
+          // 顺延中间行同样走合并（免费代理死亡时不再逐次刷屏）
+          ladderFailLog.fail(key, `⚠️  梯子出口失败（${e.message}），顺延下一出口重试 #${attempt + 2}`)
           continue
         }
         break
       }
     }
-    log(`⚠️  梯子隧道失败 ${host}:${port}: ${lastErr ? lastErr.message : "all egress failed"}`)
+    const fkey = lastEgress ? `${lastEgress.host}:${lastEgress.port}` : host
+    // 最终失败行受合并控制：同出口连续失败只在第 1 次与每 5 次打印（其余静默累积，成功归零）
+    ladderFailLog.fail(fkey, `⚠️  梯子隧道失败 ${host}:${port}: ${lastErr ? lastErr.message : "all egress failed"}`)
     ladderFailReply(client, 0x05)
   }
 
@@ -2978,6 +3026,7 @@ export {
   parseHead,
   currentEgress,
   rotateEgress,
+  persistEgressIndex,
   egressSucceeded,
   egressSnapshot,
   egressHealthCheck,
@@ -2986,6 +3035,7 @@ export {
   ladderConfig,
   ladderStatus,
   ladderNextEgress,
+  createLadderFailLogger,
   normalizeLadderConfig,
   socks5TunnelConnect,
   ladderCheck,

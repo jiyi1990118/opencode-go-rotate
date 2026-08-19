@@ -747,6 +747,24 @@ async function gatewayLog(): Promise<{ ok: boolean; text: string; source: string
   return { ok: r.ok, text: r.output, source: r.ok ? "zen-gateway logs" : "none" }
 }
 
+/** 用量趋势（只读代理）：把网关 GET /api/usage/trend?days=N 透传给 Web（go-rotate.ts 不落盘聚合，
+ *  网关已按日聚合返回 {total, byKey, byDay, byEndpoint, badLines, window}）。
+ *  带网关鉴权头 + 2s 超时；网关不可达 / 非 JSON / 非 200 一律降级 {ok:false, error}（不抛异常）。 */
+async function gatewayUsageTrend(days?: string | null): Promise<any> {
+  try {
+    let q = "?days=7"
+    const n = Number(days)
+    if (days !== undefined && days !== null && days !== "" && Number.isInteger(n) && n > 0) q = "?days=" + encodeURIComponent(String(n))
+    const r = await fetch(GATEWAY_BASE + "/api/usage/trend" + q, { headers: gatewayAuthHeaders(), signal: AbortSignal.timeout(2000) })
+    if (!r.ok) return { ok: false, error: "gateway HTTP " + r.status }
+    const j: any = await r.json().catch(() => null)
+    if (!j || typeof j !== "object") return { ok: false, error: "gateway 返回非 JSON" }
+    return { ok: true, ...j }
+  } catch (e: any) {
+    return { ok: false, error: String(e?.message ?? e) }
+  }
+}
+
 async function gatewayStatus(): Promise<{
   running: boolean
   ctlExists: boolean
@@ -1132,6 +1150,7 @@ type GatewayConfig = {
   limited: string[] // 已被上游限流（429）的出口，从主池移出单独管理（不参与轮换）
   dead: string[] // 已确认不可用的出口（探测失败/超时），从主池/限流池移出单独管理（不参与轮换）
   ip_rotation: boolean // IP 轮换总开关（默认 true；false = 即使有出口池也直接走本地直连）
+  egress_index: number // 网关 HTTP 出口轮换游标（重启后续接；由网关 persistEgressIndex 写入，插件只读透传）
   ladder: {
     enabled: boolean
     port: number
@@ -1142,7 +1161,7 @@ type GatewayConfig = {
 }
 
 function defaultGatewayConfig(): GatewayConfig {
-  return { plan: "go", token: null, token_set_at: null, tokens: [], egress: [], limited: [], dead: [], ip_rotation: true, ladder: null }
+  return { plan: "go", token: null, token_set_at: null, tokens: [], egress: [], limited: [], dead: [], ip_rotation: true, egress_index: 0, ladder: null }
 }
 
 function readGatewayConfig(): GatewayConfig {
@@ -1181,6 +1200,7 @@ function readGatewayConfig(): GatewayConfig {
             }
           : null,
       ip_rotation: raw.ip_rotation !== false, // 缺省开启；显式 false 关闭
+      egress_index: Number.isInteger(raw.egress_index) && (raw.egress_index as number) >= 0 ? (raw.egress_index as number) : 0,
     }
   } catch (e) {
     log(`readGatewayConfig error: ${(e as Error).message}`)
@@ -1203,8 +1223,9 @@ function writeGatewayConfig(patch: {
     port?: number
     mode?: "rotate" | "fixed"
     fixed?: string | null
-  } | null
+} | null
   ip_rotation?: boolean
+  egress_index?: number
 }): GatewayConfig {
   return withLockSync<GatewayConfig>(() => {
     const cfg = readGatewayConfig()
@@ -1215,6 +1236,11 @@ function writeGatewayConfig(patch: {
     }
     if (patch.ip_rotation !== undefined) {
       cfg.ip_rotation = patch.ip_rotation === true // 严格布尔；非 true 视为关闭
+    }
+    if (patch.egress_index !== undefined) {
+      if (!Number.isInteger(patch.egress_index) || (patch.egress_index as number) < 0)
+        throw new Error("egress_index 必须是非负整数")
+      cfg.egress_index = patch.egress_index
     }
     if (patch.limited !== undefined) {
       if (patch.limited !== null && !Array.isArray(patch.limited))
@@ -1441,6 +1467,7 @@ async function handleWeb(req: any): Promise<Response> {
   }
   if (method === "GET" && route === "/api/gateway") return json(await gatewayStatus())
   if (method === "GET" && route === "/api/gateway/log") return json(await gatewayLog())
+  if (method === "GET" && route === "/api/gateway/usage/trend") return json(await gatewayUsageTrend(url.searchParams.get("days")))
   if (method === "GET" && route === "/api/gateway/models") return json(await gatewayModelsProxy())
   if (method === "GET" && route === "/api/gateway/plans") return json(gatewayPlansPayload())
   if (method === "GET" && route === "/api/gateway/config") return json(gatewayConfigPayload())
@@ -2058,6 +2085,8 @@ try {
     /* 品牌 + 语义色 */
     --brand: #3b82f6;  --brand-strong: #2563eb;  --link: #60a5fa;
     --success: #4ade80;  --warning: #fbbf24;  --danger: #f87171;  --info: #60a5fa;
+    /* 用量趋势图表色（成功/失败；canvas 需真实色值，drawTrendChart 经 getComputedStyle 取） */
+    --ok: #34d399;  --err: #f87171;
     --success-soft: rgba(74,222,128,.12);
     --warning-soft: rgba(251,191,36,.12);
     --danger-soft: rgba(248,113,113,.12);
@@ -2125,6 +2154,8 @@ try {
     --warning-soft: rgba(202,138,4,.12);
     --danger-soft: rgba(220,38,38,.08);
     --info-soft: rgba(37,99,235,.10);
+    /* 用量趋势图表色（浅色加深保证白底对比） */
+    --ok: #059669;  --err: #dc2626;
     /* 按钮语义色（浅色覆盖：中性白底灰框深字；primary 深蓝底白字；danger 浅红底深红字） */
     --btn-bg: #ffffff;  --btn-bd: #c2c9d2;  --btn-fg: #16181c;
     --btn-bg-hover: #f1f4f7;  --btn-bd-hover: #a6afba;  --btn-fg-hover: #16181c;
@@ -2323,6 +2354,9 @@ try {
   .dot.ok   { background: var(--success); box-shadow: 0 0 6px rgba(74,222,128,.5); }
   .dot.warn { background: var(--warning); box-shadow: 0 0 6px rgba(251,191,36,.5); }
   .dot.err  { background: var(--danger);  box-shadow: 0 0 6px rgba(248,113,113,.5); }
+  /* 用量趋势图例色块 */
+  .trend-legend { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
+  #trend-days { width: auto; height: 28px; padding: 0 6px; }
 
   /* ============ 输入框 ============ */
   input { font: inherit; width: 100%; height: 30px; padding: 4px 10px;
@@ -2490,8 +2524,37 @@ try {
   </div>
   </div>
 
-  <!-- ============ 统计 · 分析与日志（轮换统计 + 运行日志 + 网关日志，双列） ============ -->
+  <!-- ============ 统计 · 分析与日志（用量趋势 + 轮换统计 + 运行日志 + 网关日志，双列） ============ -->
   <div class="block" id="nav-stats" style="display:none">
+  <div class="card" id="gw-usage-trend-card">
+    <div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+      <b>用量趋势</b>
+      <div class="row" style="flex-wrap:wrap">
+        <span class="muted" style="display:flex;align-items:center;gap:4px">近
+          <select id="trend-days" onchange="refreshUsageTrend()">
+            <option value="7" selected>7</option>
+            <option value="30">30</option>
+          </select> 天</span>
+        <button onclick="refreshUsageTrend()">刷新</button>
+      </div>
+    </div>
+    <div class="stats" style="margin-bottom:10px">
+      <div class="stat"><div class="v" id="tr-total">-</div><div class="l">总请求</div></div>
+      <div class="stat"><div class="v" id="tr-ok">-</div><div class="l">成功</div></div>
+      <div class="stat"><div class="v" id="tr-fail">-</div><div class="l">失败</div></div>
+      <div class="stat"><div class="v" id="tr-rot">-</div><div class="l">轮换次数</div></div>
+    </div>
+    <div style="position:relative">
+      <canvas id="trend-canvas" style="width:100%;height:220px;display:block"></canvas>
+      <div id="trend-empty" class="muted" style="position:absolute;inset:0;display:none;align-items:center;justify-content:center;flex-direction:column;text-align:center;pointer-events:none">图表数据不足</div>
+    </div>
+    <div style="margin-top:10px" class="row" style="flex-wrap:wrap">
+      <span style="display:inline-flex;align-items:center;gap:5px;margin-right:14px"><i class="trend-legend" style="background:var(--ok,#34d399)"></i>成功</span>
+      <span style="display:inline-flex;align-items:center;gap:5px"><i class="trend-legend" style="background:var(--err,#f87171)"></i>失败</span>
+      <span class="muted" id="trend-hint" style="margin-left:auto;text-align:right"></span>
+    </div>
+  </div>
+
   <div class="card">
     <div style="margin-bottom:8px;display:flex;align-items:center;justify-content:space-between">
       <b>轮换统计</b>
@@ -2598,6 +2661,7 @@ try {
       <button id="egress-check-btn" onclick="checkEgressHealth()">检查出口</button>
       <button id="egress-checkall-btn" class="primary" onclick="checkAllHealth()">检查所有 IP 健康度</button>
       <button id="egress-movedead-btn" onclick="moveAllDeadFromEgress()">→ 转移不可用</button>
+      <button id="egress-prune-btn" class="primary" onclick="pruneEgress()">一键整理</button>
       <button class="danger" onclick="clearEgress()">清空全部</button>
     </div>
     <div id="egress-list" class="muted" style="margin-top:10px">加载中…</div>
@@ -2965,6 +3029,8 @@ function toggleTheme() {
   const next = cur === "light" ? "dark" : "light"
   document.documentElement.setAttribute("data-theme", next)
   try { localStorage.setItem("gr-theme", next) } catch (e) {}
+  /* 用量趋势：切换主题后用缓存的 lastTrend 重绘（canvas 取色随主题变，免重新拉取） */
+  if (lastTrend) { try { renderTrend(lastTrend) } catch (e) {} }
 }
 async function addKey() {
   const name = document.getElementById("new-name").value.trim()
@@ -3081,6 +3147,9 @@ async function refreshStats() {
   /* P2-4：统计区块隐藏时不轮询（10s 常驻 interval 守卫），切到该区块时 switchNav 手动触发 */
   const navStats = document.getElementById("nav-stats")
   if (!navStats || navStats.style.display !== "block") return
+  /* 用量趋势：并入同一 10s 轮询。放这里而非函数尾部——尾部在「无轮换记录」分支有早退，
+   * 会导致趋势卡永远不刷新（真实场景 stats-tbody 常为空）。独立 fire-and-forget，互不阻塞。 */
+  refreshUsageTrend()
   try {
     const st = await api("/api/stats")
     document.getElementById("st-total").textContent = st.totalRotations
@@ -3305,6 +3374,148 @@ async function refreshGwLog() {
     pre.textContent = "获取失败: " + e.message
     pre.style.color = "#f87171"
   }
+}
+
+/* ---- 用量趋势（/api/gateway/usage/trend 代理 + Canvas 零依赖折线图） ----
+ * 数据源：网关 /api/usage/trend 实时聚合 usage.jsonl → {total, byKey, byDay, byEndpoint},
+ * byDay[date] = {requests, success, rotated}（无 fail 字段，失败 = requests - success）。
+ * 刷新节奏：并入 refreshStats（nav-stats 可见时 10s 一次）+ 天数切换/手动刷新 + 主题切换重绘（cache 免请求）。 */
+var lastTrend = null // 最近一次成功数据缓存（主题切换 / 10s 内复用，避免重复拉取）
+
+/** 从 computed style 取 CSS 变量色值（canvas 不能直接用 var()，需真实色值；主题切换后取到新值） */
+function cssVar(name, fb) {
+  try {
+    const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim()
+    return v || fb
+  } catch (e) { return fb }
+}
+
+/** Y 轴最大值取「向上取整的整数」：1/2/5×10^k 阶梯，保证网格刻度干净 */
+function niceCeil(v) {
+  const val = Number(v)
+  if (!Number.isFinite(val) || val <= 0) return 1
+  if (val === 1) return 1
+  const p = Math.pow(10, Math.floor(Math.log10(val)))
+  const m = val / p
+  const step = m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10
+  return step * p
+}
+
+/** 空态/失败态：清空摘要与画布，显示提示文字（覆盖层）。 */
+function setTrendEmpty(msg) {
+  lastTrend = null
+  const canvas = document.getElementById("trend-canvas")
+  if (canvas) { const c = canvas.getContext("2d"); if (c) c.clearRect(0, 0, canvas.width, canvas.height) }
+  const ids = ["tr-total", "tr-ok", "tr-fail", "tr-rot"]
+  for (let i = 0; i < ids.length; i++) { const el = document.getElementById(ids[i]); if (el) el.textContent = "-" }
+  const hint = document.getElementById("trend-hint")
+  if (hint) hint.textContent = ""
+  const emptyEl = document.getElementById("trend-empty")
+  if (emptyEl) { emptyEl.textContent = msg; emptyEl.style.display = "flex" }
+}
+
+/** 拉取 + 渲染。网关不可达/失败 → 卡片降级「网关未运行」；无数据 → 「数据不足」。 */
+async function refreshUsageTrend() {
+  const navStats = document.getElementById("nav-stats")
+  if (!navStats || navStats.style.display !== "block") return
+  const daysSel = document.getElementById("trend-days")
+  const days = daysSel && /^\\d+$/.test(daysSel.value) ? parseInt(daysSel.value, 10) : 7
+  try {
+    const d = await api("/api/gateway/usage/trend?days=" + days)
+    if (!d || d.ok === false) { setTrendEmpty("网关未运行（用量接口不可达，开启 zen-gateway 后自动恢复）"); return }
+    lastTrend = d
+    renderTrend(d)
+  } catch (e) {
+    setTrendEmpty("加载失败：" + (e && e.message ? e.message : e))
+  }
+}
+
+/** 渲染：摘要数字 + Canvas 折线（成功/失败两色，X 轴日期、Y 轴请求数）。 */
+function renderTrend(d) {
+  const byDay = d.byDay || {}
+  const keys = Object.keys(byDay).filter(kk => byDay[kk] && byDay[kk].requests > 0).sort()
+  const emptyEl = document.getElementById("trend-empty")
+  const hintEl = document.getElementById("trend-hint")
+  if (!keys.length) { setTrendEmpty("数据不足（近 " + (d.window && d.window.days ? d.window.days : 7) + " 天暂无请求记录）"); return }
+  const n = keys.length
+  let total = 0, ok = 0, fail = 0, rot = 0
+  for (let i = 0; i < n; i++) {
+    const dd = byDay[keys[i]] || {}
+    total += dd.requests || 0
+    ok += dd.success || 0
+    fail += Math.max(0, (dd.requests || 0) - (dd.success || 0))
+    rot += dd.rotated || 0
+  }
+  document.getElementById("tr-total").textContent = String(total)
+  document.getElementById("tr-ok").textContent = String(ok)
+  document.getElementById("tr-fail").textContent = String(fail)
+  document.getElementById("tr-rot").textContent = String(rot)
+  const byKey = d.byKey || {}
+  if (hintEl) hintEl.textContent = "近 " + (d.window && d.window.days ? d.window.days : n) + " 天 · UTC 按日聚合 · " + Object.keys(byKey).length + " 个 key 有记录"
+  const canvas = document.getElementById("trend-canvas")
+  if (!canvas || typeof canvas.getContext !== "function") { if (emptyEl) emptyEl.style.display = "none"; return }
+  const dpr = window.devicePixelRatio || 1
+  const W = canvas.clientWidth || 320
+  const H = 220
+  canvas.width = Math.round(W * dpr)
+  canvas.height = Math.round(H * dpr)
+  const ctx = canvas.getContext("2d")
+  if (!ctx) { if (emptyEl) emptyEl.style.display = "none"; return }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  ctx.clearRect(0, 0, W, H)
+  const padL = 42, padR = 14, padT = 12, padB = 26
+  const plotW = W - padL - padR
+  const plotH = H - padT - padB
+  const tx = cssVar("--tx-3", "#6b7280")
+  const grid = cssVar("--bd-2", "#2c3442")
+  const okColor = cssVar("--ok", "#34d399")
+  const errColor = cssVar("--err", "#f87171")
+  const xFor = (i) => n === 1 ? padL + plotW / 2 : padL + (i / (n - 1)) * plotW
+  let maxV = 0
+  for (let i = 0; i < n; i++) { const v = byDay[keys[i]].requests || 0; if (v > maxV) maxV = v }
+  const niceMax = niceCeil(maxV)
+  ctx.font = "11px system-ui, sans-serif"
+  ctx.textAlign = "right"
+  ctx.textBaseline = "middle"
+  ctx.strokeStyle = grid
+  ctx.fillStyle = tx
+  for (let g = 0; g <= 4; g++) {
+    const y = padT + plotH - (g / 4) * plotH
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke()
+    ctx.fillText(String(Math.round(niceMax * g / 4)), padL - 6, y)
+  }
+  ctx.textAlign = "center"
+  ctx.textBaseline = "top"
+  const step = Math.max(1, Math.ceil(n / 5))
+  for (let i = 0; i < n; i++) {
+    const x = xFor(i)
+    ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + plotH); ctx.stroke()
+    if (i === 0 || i === n - 1 || i % step === 0) ctx.fillText(String(keys[i]).slice(5), x, padT + plotH + 7)
+  }
+  const toPts = (pick) => {
+    const pts = []
+    for (let i = 0; i < n; i++) {
+      const dd = byDay[keys[i]] || {}
+      const v = Math.min(Math.max(0, pick(dd)), niceMax)
+      pts.push([xFor(i), padT + plotH - (v / niceMax) * plotH])
+    }
+    return pts
+  }
+  const drawLine = (pts, color) => {
+    if (!pts.length) return
+    ctx.strokeStyle = color
+    ctx.fillStyle = color
+    ctx.lineWidth = 1.6
+    ctx.lineJoin = "round"
+    ctx.lineCap = "round"
+    ctx.beginPath()
+    for (let i = 0; i < pts.length; i++) { if (i === 0) ctx.moveTo(pts[i][0], pts[i][1]); else ctx.lineTo(pts[i][0], pts[i][1]) }
+    ctx.stroke()
+    for (let i = 0; i < pts.length; i++) { ctx.beginPath(); ctx.arc(pts[i][0], pts[i][1], 2.4, 0, Math.PI * 2); ctx.fill() }
+  }
+  drawLine(toPts(dd => (dd.requests || 0) - (dd.success || 0)), errColor)
+  drawLine(toPts(dd => dd.success || 0), okColor)
+  if (emptyEl) { emptyEl.style.display = "none"; emptyEl.textContent = "" }
 }
 
 /* ---- 主导航：区块切换（CSS display，全部区块常驻 DOM 避免重复拉取） ---- */
@@ -3632,6 +3843,58 @@ async function moveAllDeadFromEgress() {
     msg.className = "msg"
     msg.textContent = "已转移 " + (r.moved || []).length + " 个不可用出口到不可用池：" + (r.moved || []).join(", ")
   } catch (e) { msg.className = "msg err"; msg.textContent = "转移失败：" + e.message }
+}
+async function pruneEgress() {
+  // IP 池「一键整理」：把健康检查结果分类——429 被限流 → 限流池、不可用（非 429）→ 不可用池，
+  // 主池只保留健康项；未探测项跳过不转移（等先跑「检查所有 IP 健康度」）。复用 move-to-dead/move-to-limited 各一次。
+  const msg = document.getElementById("egress-msg")
+  if (!currentEgressList.length) { msg.className = "msg err"; msg.textContent = "主池为空，无需整理"; return }
+  const classified = currentEgressList.filter((u) => egressHealth[u])
+  if (!classified.length) {
+    msg.className = "msg err"
+    msg.textContent = "还没有健康检查数据（先点「检查所有 IP 健康度」再整理）"
+    return
+  }
+  const limitedUrls = []
+  const deadUrls = []
+  const unknown = []
+  for (const u of currentEgressList) {
+    const st = egressHealth[u]
+    if (!st) { unknown.push(u); continue }
+    if (st.ok) continue
+    if (st.status === 429) limitedUrls.push(u)
+    else deadUrls.push(u)
+  }
+  if (!limitedUrls.length && !deadUrls.length) {
+    msg.className = "msg"
+    msg.textContent = "已整理：主池 " + currentEgressList.length + " 个出口全部健康，无需转移"
+    return
+  }
+  try {
+    let toLimited = 0
+    let toDead = 0
+    let deadAfter = []
+    let limitedAfter = []
+    if (deadUrls.length) {
+      const r = await api("/api/gateway/egress", { action: "move-to-dead", urls: deadUrls })
+      toDead = (r.moved || []).length
+      deadAfter = r.dead || []
+    }
+    if (limitedUrls.length) {
+      const r2 = await api("/api/gateway/egress", { action: "move-to-limited", urls: limitedUrls })
+      toLimited = (r2.moved || []).length
+      limitedAfter = r2.limited || []
+    }
+    renderDeadList(deadAfter)
+    renderLimitedList(limitedAfter)
+    const c = await api("/api/gateway/config")
+    renderEgressList(c.egress || [], !!c.egressEnabled, !!c.ipRotation)
+    const left = (c.egress || []).length
+    let hint = ""
+    if (unknown.length) hint = "（" + unknown.length + " 项未探测已跳过）"
+    msg.className = "msg"
+    msg.textContent = "已整理：" + toLimited + " 移入限流池，" + toDead + " 移入不可用池，主池剩 " + left + " 可用" + hint
+  } catch (e) { msg.className = "msg err"; msg.textContent = "整理失败：" + e.message }
 }
 async function moveAllDeadFromLimited() {
   // 限流池「一键转移不可用」：把探测为不可用（非 429）的出口全部移入不可用池
@@ -4419,6 +4682,7 @@ export {
   gatewayStatus,
   gatewayManage,
   gatewayLog,
+  gatewayUsageTrend,
   gatewayTest,
   gatewayEgressHealthProxy,
   gatewayCtlExists,

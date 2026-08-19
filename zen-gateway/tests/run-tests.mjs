@@ -2224,6 +2224,167 @@ t("ladderNextEgress：fixed 优先 → 梯子池优先级锁死（主池在场�
   try { rmSync(_gwCfgPath, { force: true }) } catch {}
 })
 
+/* ================= 出口轮换游标持久化（egress_index：启动续接 + 轮换写回，P2-3） ================= */
+group("出口轮换游标持久化（egress_index：重启续接 + 轮换写回）")
+
+// 独立 fresh 实例：配置文件带 egress_index=3（模块加载时读入游标，模拟「重启后从上次出口续接」，
+// 不再回到第 0 出口撞死代理）。env 存原值恢复，绝不碰真实配置。
+const EI_CFG = "/tmp/zen-gateway-unittest-gwcfg-ei.json"
+writeFileSync(EI_CFG, JSON.stringify({
+  plan: "zen", ip_rotation: true,
+  egress: ["socks5://11.11.11.11:1080", "socks5://22.22.22.22:1080"],
+  egress_index: 3,
+}))
+let gwEi = null
+{
+  const saved = process.env.ZEN_GATEWAY_CONFIG
+  process.env.ZEN_GATEWAY_CONFIG = EI_CFG
+  try {
+    gwEi = await import("../gateway.mjs?egress-init=" + Date.now())
+  } catch (e) {
+    failures.push({ group: currentGroup, name: "C1 fresh import（egress_index=3 配置，zen 档）", error: e })
+    console.log(`  ❌ C1 fresh import（egress_index=3）: ${String((e && e.message) || e)}`)
+  } finally {
+    process.env.ZEN_GATEWAY_CONFIG = saved
+  }
+}
+
+t("读配置 egress_index=3 → _egressIdx 初值 3（egressSnapshot.index）", () => {
+  assert.ok(gwEi, "fresh 实例应可加载")
+  assert.equal(gwEi.egressSnapshot().index, 3)
+})
+
+t("currentEgress 按游标 3 取出口（3 % 2 = 1 → 第 2 个 socks5 出口）", () => {
+  assert.ok(gwEi, "fresh 实例应可加载")
+  assert.equal(gwEi.egressEnabled(), true, "zen + egress≥2 + ip_rotation 未关 → 轮换启用")
+  const e = gwEi.currentEgress()
+  assert.ok(e && e.type === "socks5")
+  assert.equal(e.host, "22.22.22.22")
+})
+
+t("rotate 后游标 mod 循环：index 3 → (3+1)%2=0 → currentEgress 取第 1 个出口", () => {
+  assert.ok(gwEi, "fresh 实例应可加载")
+  const e = gwEi.rotateEgress()
+  assert.equal(gwEi.egressSnapshot().index, 0, "游标恒 < 池长（mod 循环），3+1 对 2 取模 = 0")
+  assert.ok(e && e.type === "socks5" && e.host === "11.11.11.11")
+})
+
+{
+  let ok = true
+  let err = null
+  const name = "rotateEgress 触发 egress_index 写回 + persistEgressIndex 显式调用（await 落盘验证，保留其余字段）"
+  try {
+    // 上一步 rotate 后游标=0（mod 循环）；fire-and-forget withLockAsync 写盘 → 轮询等落盘（无锁竞争时毫秒级）
+    for (let i = 0; i < 50; i++) {
+      try { if (JSON.parse(readFileSync(EI_CFG, "utf8")).egress_index === 0) break } catch {}
+      await new Promise((r) => setTimeout(r, 20))
+    }
+    let raw = JSON.parse(readFileSync(EI_CFG, "utf8"))
+    assert.equal(raw.egress_index, 0)
+    assert.equal(raw.plan, "zen") // 其余字段保留（读改写不清库）
+    assert.ok(Array.isArray(raw.egress) && raw.egress.length === 2)
+    // 显式 persistEgressIndex(1)：直接 await 验证函数本身（写回指定游标 + 保留 ip_rotation 等字段）
+    await gwEi.persistEgressIndex(1)
+    raw = JSON.parse(readFileSync(EI_CFG, "utf8"))
+    assert.equal(raw.egress_index, 1)
+    assert.equal(raw.ip_rotation, true)
+  } catch (e) { ok = false; err = e }
+  if (ok) { passed++; groups[groups.length - 1].count++; console.log(`  ✅ ${name}`) }
+  else { failures.push({ group: currentGroup, name, error: err }); console.log(`  ❌ ${name}\n     ${String((err && err.message) || err)}`) }
+}
+
+{
+  let ok = true
+  let err = null
+  const name = "缺省（无 egress_index 字段）→ _egressIdx 0（fresh 实例，兼容旧配置零迁移）"
+  try {
+    const p2 = "/tmp/zen-gateway-unittest-gwcfg-ei2.json"
+    writeFileSync(p2, JSON.stringify({ plan: "zen", egress: ["socks5://1.1.1.1:1080", "socks5://2.2.2.2:1080"] }))
+    const saved = process.env.ZEN_GATEWAY_CONFIG
+    process.env.ZEN_GATEWAY_CONFIG = p2
+    let gwEi2 = null
+    try { gwEi2 = await import("../gateway.mjs?egress-init2=" + Date.now()) } finally { process.env.ZEN_GATEWAY_CONFIG = saved }
+    assert.ok(gwEi2, "缺省配置 fresh 实例应可加载")
+    assert.equal(gwEi2.egressSnapshot().index, 0)
+  } catch (e) { ok = false; err = e }
+  if (ok) { passed++; groups[groups.length - 1].count++; console.log(`  ✅ ${name}`) }
+  else { failures.push({ group: currentGroup, name, error: err }); console.log(`  ❌ ${name}\n     ${String((err && err.message) || err)}`) }
+}
+
+t("egress_index 非法值（负数/非整数/字符串数字）→ readGatewayConfig 兜底 0", () => {
+  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "zen", egress_index: -1 }))
+  assert.equal(gw.readGatewayConfig().egress_index, 0)
+  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "zen", egress_index: "3" }))
+  assert.equal(gw.readGatewayConfig().egress_index, 0)
+  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "zen", egress_index: 2.5 }))
+  assert.equal(gw.readGatewayConfig().egress_index, 0)
+  try { rmSync(_gwCfgPath, { force: true }) } catch {}
+})
+
+t("egress_index 合法整数 → 原样返回", () => {
+  writeFileSync(_gwCfgPath, JSON.stringify({ plan: "zen", egress_index: 7 }))
+  assert.equal(gw.readGatewayConfig().egress_index, 7)
+  try { rmSync(_gwCfgPath, { force: true }) } catch {}
+})
+
+/* ================= 梯子失败日志合并（同出口连续失败防刷屏） ================= */
+group("梯子失败日志合并（createLadderFailLogger）")
+
+t("第一次失败打日志、2-4 次静默累积、第 5 次再打（连续失败只在 1/5/10… 次打印）", () => {
+  const logs = []
+  const L = gw.createLadderFailLogger((m) => logs.push(m))
+  L.fail("1.1.1.1:1080", "f1")
+  L.fail("1.1.1.1:1080", "f2")
+  L.fail("1.1.1.1:1080", "f3")
+  L.fail("1.1.1.1:1080", "f4")
+  assert.equal(logs.length, 1, "1-4 次只打第 1 次")
+  assert.equal(logs[0], "f1")
+  L.fail("1.1.1.1:1080", "f5")
+  assert.equal(logs.length, 2, "第 5 次再打")
+  assert.equal(logs[1], "f5")
+  assert.equal(L.count("1.1.1.1:1080"), 5)
+  // 第 10 次 → 每满 5 次
+  for (let i = 6; i <= 9; i++) L.fail("1.1.1.1:1080", `f${i}`)
+  assert.equal(logs.length, 2, "6-9 次静默")
+  L.fail("1.1.1.1:1080", "f10")
+  assert.equal(logs.length, 3, "第 10 次（5 的倍数）再打")
+})
+
+t("同一出口成功一次即归零（count=0，下次失败重新从第 1 次打）", () => {
+  const logs = []
+  const L = gw.createLadderFailLogger((m) => logs.push(m))
+  for (let i = 0; i < 4; i++) L.fail("2.2.2.2:1080", `f${i}`) // 只打 f0
+  L.ok("2.2.2.2:1080")
+  assert.equal(L.count("2.2.2.2:1080"), 0)
+  L.fail("2.2.2.2:1080", "again")
+  assert.equal(L.count("2.2.2.2:1080"), 1)
+  assert.equal(logs.length, 2, "归零后再次失败按第 1 次打")
+  assert.equal(logs[0], "f0")
+  assert.equal(logs[1], "again")
+})
+
+t("不同出口计数独立（Map key=host:port；只 match 目标出口不清其它出口）", () => {
+  const logs = []
+  const L = gw.createLadderFailLogger((m) => logs.push(m))
+  L.fail("3.3.3.3:1", "a1")
+  L.fail("4.4.4.4:2", "b1")
+  L.fail("3.3.3.3:1", "a2")
+  assert.equal(logs.length, 2, "两出口各第 1 次各打 1 条")
+  assert.equal(L.count("3.3.3.3:1"), 2)
+  assert.equal(L.count("4.4.4.4:2"), 1)
+  assert.equal(L.size(), 2)
+  L.ok("3.3.3.3:1") // 只清一个
+  assert.equal(L.count("4.4.4.4:2"), 1)
+  assert.equal(L.size(), 1)
+})
+
+t("connectLadderUpstream 已接入合并器（源码断言）：成功 ok 归零 + 失败路径 fail 合并", () => {
+  const src = readFileSync(new URL("../gateway.mjs", import.meta.url), "utf8")
+  assert.ok(src.includes("ladderFailLog.ok("), "隧道成功 → 该出口失败计数归零")
+  assert.ok(src.includes("ladderFailLog.fail("), "失败路径（顺延中间行 + 最终失败行）走合并器")
+  assert.ok(src.includes("c === 1 || c % 5 === 0"), "只在第 1 次与每满 5 次打日志（其余静默累积）")
+})
+
 {
   let ok = true
   let err = null

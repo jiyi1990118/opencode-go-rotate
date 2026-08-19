@@ -876,6 +876,20 @@ describe("网关配置（gateway-config.json：套餐 + token）", () => {
     expect(() => mod.writeGatewayConfig({ egress: ["http://bad:80"] })).toThrow(/direct|socks5/)
     expect(existsSync(LOCK_FILE)).toBe(false)
   })
+  test("writeGatewayConfig egress_index 持久化 + 承载（Web 写不丢网关游标）", () => {
+    // 网关 persistEgressIndex 写入 egress_index；插件写其它字段时应保留（防读改写清掉网关游标）
+    mod.writeGatewayConfig({ egress: ["socks5://1.1.1.1:1080"], egress_index: 2 })
+    expect(mod.readGatewayConfig().egress_index).toBe(2)
+    // 模拟 Web 改 plan（不带 egress_index）→ 游标保留
+    mod.writeGatewayConfig({ plan: "zen" })
+    expect(mod.readGatewayConfig().egress_index).toBe(2)
+    // 显式写回 0
+    mod.writeGatewayConfig({ egress_index: 0 })
+    expect(mod.readGatewayConfig().egress_index).toBe(0)
+    // 非法
+    expect(() => mod.writeGatewayConfig({ egress_index: -1 })).toThrow(/非负整数/)
+    expect(existsSync(LOCK_FILE)).toBe(false)
+  })
   test("statusPayload.egressEnabled 动态反映网关出口池 + IP 轮换开关（P0-2 系统健康聚合用）", () => {
     seed(twoKeys("b"))
     // 默认网关配置：无出口 → egressEnabled false
@@ -1261,6 +1275,39 @@ describe("网关配置路由（/api/gateway/plans + /api/gateway/config）", () 
     )
     expect(unk.status).toBe(400)
   })
+  test("一键整理 prune 流程：健康项保留、429→限流池、不可用→不可用池（两次 action 组合，等价前端 pruneEgress）", async () => {
+    // 铺数据：主池 = 健康 7.7.7.7 / 429 限流 6.6.6.6 / 不可用 5.5.5.5；限流池/不可用池各预置一项（验证原有项不丢）
+    mod.writeGatewayConfig({
+      egress: ["socks5://7.7.7.7:1080", "socks5://6.6.6.6:1080", "socks5://5.5.5.5:1080"],
+      limited: ["socks5://9.9.9.9:1080"],
+      dead: ["socks5://8.8.8.8:1080"],
+    })
+    // 第一步（pruneEgress 先执行）：健康检查非 ok 非 429 → move-to-dead
+    const p1 = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", {
+        method: "POST",
+        body: JSON.stringify({ action: "move-to-dead", urls: ["socks5://5.5.5.5:1080"] }),
+      }),
+    )
+    const p1j = await p1.json()
+    expect(p1j.ok).toBe(true)
+    expect(p1j.moved).toEqual(["socks5://5.5.5.5:1080"])
+    // 第二步（pruneEgress 后执行）：status===429 → move-to-limited（主池此刻仍含 6.6.6.6）
+    const p2 = await mod.handleWeb(
+      new Request("http://127.0.0.1:8899/api/gateway/egress", {
+        method: "POST",
+        body: JSON.stringify({ action: "move-to-limited", urls: ["socks5://6.6.6.6:1080"] }),
+      }),
+    )
+    const p2j = await p2.json()
+    expect(p2j.ok).toBe(true)
+    expect(p2j.moved).toEqual(["socks5://6.6.6.6:1080"])
+    // 最终三池：主池只剩健康项；限流池/不可用池原有项保留并追加
+    const fin = mod.readGatewayConfig()
+    expect(fin.egress).toEqual(["socks5://7.7.7.7:1080"])
+    expect(fin.limited).toEqual(["socks5://9.9.9.9:1080", "socks5://6.6.6.6:1080"])
+    expect(fin.dead).toEqual(["socks5://8.8.8.8:1080", "socks5://5.5.5.5:1080"])
+  })
 })
 
 describe("梯子（本地 SOCKS5 透明代理）Web 集成", () => {
@@ -1583,6 +1630,19 @@ describe("WEB_HTML 网关管理区块（主导航 + 套餐卡 + Token 卡）", (
     expect(html).toContain('api("/api/gateway/egress", { action: "set-dead", list')
     expect(html).toContain('id="egress-movedead-btn"')   // IP 池「→ 转移不可用」
     expect(html).toContain('id="limited-movedead-btn"')  // 限流池「→ 转移不可用」
+    // 一键整理（pruneEgress）：429→限流池、不可用→不可用池，主池只留健康项
+    expect(html).toContain('id="egress-prune-btn"')
+    expect(html).toContain('onclick="pruneEgress()"')
+    expect(html).toContain("async function pruneEgress()")
+    expect(html).toContain("先点「检查所有 IP 健康度」再整理")
+    expect(html).toContain("全部健康，无需转移")
+    expect(html).toContain("移入限流池")
+    // pruneEgress 函数体同时调 move-to-dead + move-to-limited（两端分类各走一次写锁）
+    const pruneBody = html.slice(html.indexOf("async function pruneEgress()"), html.indexOf("async function moveAllDeadFromLimited()"))
+    expect(pruneBody).toContain('action: "move-to-dead"')
+    expect(pruneBody).toContain('action: "move-to-limited"')
+    expect(pruneBody).toContain("renderDeadList(")
+    expect(pruneBody).toContain("renderLimitedList(")
     expect(html).toContain("没有探测为「不可用」的出口")
     expect(html).toContain("不可用池为空")
     // IP 轮换总开关（关闭走本地直连）
@@ -2404,5 +2464,63 @@ describe("go + zen 双套餐模型动态查看（WEB_HTML 内嵌 + 路由降级�
     const j = await res.json()
     expect(j.ok).toBe(false)
     expect(typeof j.error).toBe("string")
+  })
+})
+
+/* ================= 用量趋势可视化（2026-08-19，Team B：趋势卡 + Canvas 折线图 + 代理路由） ================= */
+
+describe("用量趋势（gw-usage-trend-card：WEB_HTML + 代理路由降级）", () => {
+  test("WEB_HTML 含用量趋势卡：标题 / 天数 select / Canvas / 摘要 / 刷新函数 / 代理路径 / CSS 变量", () => {
+    const html: string = (mod as any).WEB_HTML
+    // 卡片容器与标题（id 用 gw-usage-trend-card 而非 gw-usage-card——后者已是「使用方式」卡，避免重复 ID）
+    expect(html).toContain('id="gw-usage-trend-card"')
+    expect(html).toContain("用量趋势")
+    expect(html).toContain('id="gw-usage-card"') // 既有使用方式卡不因新卡破坏
+    // 天数选择（7 默认 / 30），onchange 触发刷新
+    expect(html).toContain('id="trend-days"')
+    expect(html).toContain('<option value="7" selected>7</option>')
+    expect(html).toContain('<option value="30">30</option>')
+    expect(html).toContain('onchange="refreshUsageTrend()"')
+    // Canvas 图表 + 空态覆盖层
+    expect(html).toContain('id="trend-canvas"')
+    expect(html).toContain('id="trend-empty"')
+    // 统计摘要（总请求/成功/失败/轮换）
+    expect(html).toContain('id="tr-total"')
+    expect(html).toContain('id="tr-ok"')
+    expect(html).toContain('id="tr-fail"')
+    expect(html).toContain('id="tr-rot"')
+    // 刷新函数 + 后端代理路径（2s 超时降级由后端 gatewayUsageTrend 负责）
+    expect(html).toContain("async function refreshUsageTrend()")
+    expect(html).toContain("function renderTrend(d)")
+    expect(html).toContain('api("/api/gateway/usage/trend?days=" + days)')
+    expect(html).toContain("var lastTrend = null")
+    expect(html).toContain("function cssVar(name, fb)")
+    expect(html).toContain("function niceCeil(v)")
+    // 随 refreshStats 尾部调用（10s 轮询并入）
+    expect(html).toContain("refreshUsageTrend()")
+    // 双主题 CSS 变量 --ok/--err
+    expect(html).toContain("--ok:")
+    expect(html).toContain("--err:")
+    expect(html).toContain("html[data-theme=\"light\"]")
+  })
+  test("GET /api/gateway/usage/trend 网关不可达 → 降级 {ok:false, error}（200 不抛）", async () => {
+    // GOROTATE_GATEWAY_BASE=127.0.0.1:59999（不可达）已在前置 import 固化
+    const res = await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/usage/trend?days=7"))
+    expect(res.status).toBe(200)
+    const j = await res.json()
+    expect(j.ok).toBe(false)
+    expect(typeof j.error).toBe("string")
+  })
+  test("GET /api/gateway/usage/trend 非法 days 参数 → 回退默认仍走代理降级（不抛）", async () => {
+    const res = await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/usage/trend?days=abc"))
+    expect(res.status).toBe(200)
+    const j = await res.json()
+    expect(j.ok).toBe(false)
+  })
+  test("GET /api/gateway/usage/trend 无 days 参数（默认 7）→ 降级路径正常（不抛）", async () => {
+    const res = await mod.handleWeb(new Request("http://127.0.0.1:8899/api/gateway/usage/trend"))
+    expect(res.status).toBe(200)
+    const j = await res.json()
+    expect(j.ok).toBe(false)
   })
 })

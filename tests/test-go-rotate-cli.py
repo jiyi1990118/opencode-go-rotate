@@ -1336,10 +1336,22 @@ class TestCheckDualEndpoint(_CliCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("没有可检测的 key", r.stdout + r.stderr)
 
-    def test_check写字段走锁(self):
-        """源码结构：main() 中 check 经 _with_lock 包裹（写 go-keys.json 健康字段）"""
+    def test_check不持锁(self):
+        """源码结构（P2-1）：main() 中 check 直调 do_check 不包 _with_lock——
+        探测网络期间不占跨进程锁（last_status 非关键字段，容忍并发写竞态，避免阻塞插件轮换）"""
         src = open(CLI_PATH, encoding="utf-8").read()
-        self.assertIn("_with_lock(lambda: do_check(load(), args[1:]))", src)
+        self.assertIn("do_check(load(), args[1:])", src)
+        # 无单独的锁包裹分支残留（防回退）
+        self.assertNotIn("_with_lock(lambda: do_check(load(), args[1:]))", src)
+
+    def test_check不锁但字段仍写入(self):
+        """行为验证（无锁路径完整闭环已由既有 test_check默认双端点… 覆盖）：
+        源码级确认识别 do_check 直调分支（保证 main dispatch 结构正确）。"""
+        src = open(CLI_PATH, encoding="utf-8").read()
+        idx = src.find("if cmd == \"check\":")
+        self.assertGreater(idx, 0)
+        branch = src[idx:idx + 320]
+        self.assertIn("do_check(load(), args[1:])", branch)
 
     def test_gateway_healthz带token(self):
         """源码结构（T-2）：_gateway_healthz 从 gateway-config 读 tokens[]/token 并带 Bearer——
